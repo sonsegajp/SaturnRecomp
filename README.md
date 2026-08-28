@@ -48,6 +48,7 @@ Place your own dumps outside version control, edit `games\mygame\game.toml`, val
 ```
 
 The full, field-by-field setup procedure is in [Setting up a game](docs/GAME_SETUP.md).
+For a tested title-specific example, see [Sonic 3D Blast setup](docs/SONIC_3D_BLAST.md).
 
 ## Repository map
 
@@ -91,6 +92,7 @@ The renderer regressions include per-character VDP2 foreground priority, VDP1/us
 ## Documentation
 
 - [Setting up a game](docs/GAME_SETUP.md)
+- [Sonic 3D Blast setup](docs/SONIC_3D_BLAST.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Compatibility and limitations](docs/COMPATIBILITY.md)
 - [Testing and diagnostics](docs/TESTING.md)
