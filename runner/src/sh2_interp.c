@@ -1567,6 +1567,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
 {
     saturn *s = c->sys;
     uint64_t done = 0;
+    uint64_t target;
     int fastable;
     static int op_on = -1;
     static int movwtrace_on = -1;
@@ -1580,6 +1581,16 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
         movwtrace_on = getenv("SATURN_MOVWTRACE") != NULL;
     if (!cov_armed) cov_init_env();
     s->cur = c;
+
+    /* Scheduler slices are SH-2 CLOCK budgets, not instruction budgets.
+     * Carry the absolute target between calls so an instruction which crosses
+     * a slice boundary pays its extra cycles in the following slice. The old
+     * `done < n` loop treated every instruction as one clock even though all
+     * execution paths already add their real 1/2/3/... cycle cost to
+     * c->cycles. During 3-D gameplay that overclocked both guest CPUs and made
+     * the host execute far more geometry work per field than Saturn hardware. */
+    c->run_target += n;
+    target = c->run_target;
 
     /* Inline fast path for the opcodes that dominate real instruction
      * streams, including delayed branches whose slot is itself simple.
@@ -1602,7 +1613,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
      * A correct version, re-checking whenever interrupt state changes, would
      * gain less than that. The interpreter is near the limit of this design;
      * real speed needs the emitter, not another tweak here. */
-    while (done < n && !c->halted) {
+    while (c->cycles < target && !c->halted) {
         if (c->sleeping) {
             uint64_t idle;
             take_interrupt(c);
@@ -1611,7 +1622,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                  * other devices at the end of this (at most 128-cycle) slice.
                  * Retiring SLEEP one pseudo-instruction at a time is both slow
                  * and less faithful than advancing the idle core in bulk. */
-                idle = n - done;
+                idle = target - c->cycles;
                 c->cycles += idle;
                 done += idle;
                 break;

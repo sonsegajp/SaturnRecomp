@@ -124,6 +124,7 @@ typedef struct {
     uint32_t pc;
 
     uint64_t cycles;
+    uint64_t run_target;       /* cumulative scheduler clocks owed to core */
     int      sleeping;
     int      halted;          /* set on an unrecoverable fault */
     int      is_slave;
