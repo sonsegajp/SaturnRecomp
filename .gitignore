@@ -1,0 +1,37 @@
+# Private firmware, media, and per-title declarations/data
+bios/
+discs/
+games/*
+!games/_template/
+!games/_template/game.toml
+
+# Generated, captured, and local workspaces
+out/
+shots/
+.claude/
+CodexLite/
+CodexLite.Smoke/
+external/openai-codex/
+HANDOFF.md
+
+# Build/runtime output and guest persistence
+*.exe
+*.dll
+*.o
+*.obj
+*.pdb
+*.bin
+*.cue
+*.iso
+*.chd
+*.raw
+*.wav
+*.state
+*.dmp
+*.png
+!assets/saturnrecomp-logo.png
+gmon.out
+
+# Regenerated decoder-oracle artifacts
+tests/oracle_sh2.txt
+tests/ours_sh2.txt

@@ -1,0 +1,27 @@
+# Template game declaration. Copy to games/<name>/game.toml and edit.
+# The recompiler contains no game-specific code; this file is the whole
+# interface. tests/run_all.ps1 picks up any games/*/game.toml automatically
+# and SKIPs it when the disc image is absent.
+
+[game]
+name       = "Some Saturn Game"
+prefix     = "somegame"          # output filename prefix
+product_no = "MK-8XXXX"          # checked against IP.BIN, "" to skip
+disc       = "../../discs/Some Saturn Game.cue"
+bios       = "../../bios/saturn.bin" # user-supplied 512 KiB BIOS dump
+
+# One [[module]] per binary the game loads. Find them with:
+#   saturnrecomp inspect <disc>
+# The IPL-loaded binary is named in IP.BIN (1st-read address).
+
+[[module]]
+name        = "main"
+file        = "/0SOMEGAME"       # ISO9660 path, exactly as inspect prints it
+cpu         = "sh2"              # sh2 | m68k
+compression = "none"             # none | prs
+load_addr   = 0x06004000
+entry       = 0x06004000
+first_read  = true
+
+# Manually declared function entry points (evidence), optional:
+# entries = [0x06004000, 0x06004120]
