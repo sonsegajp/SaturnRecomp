@@ -33,6 +33,7 @@ void sound_init(saturn *s)
     s->m68k_acc = 0;
     s->m68k_target = 0;
     s->scsp_acc = 0;
+    s->sound_deferred = 0;
     s->snd_wp = 0;
     s->snd_rp = 0;
 }
@@ -40,6 +41,8 @@ void sound_init(saturn *s)
 /* Called by the SMPC on SNDON / SNDOFF. */
 void sound_set_on(saturn *s, int on)
 {
+    /* Finish clocks accrued under the old reset state before changing it. */
+    sound_sync(s);
     if (on && !s->sound_on) {
         m68k_reset(&s->sound_cpu, s);
         s->m68k_acc = 0;
@@ -57,6 +60,7 @@ void sound_set_on(saturn *s, int on)
  * the 68000, all slots/registers/DSP state and disables the sound CPU. */
 void sound_clock_change_reset(saturn *s)
 {
+    sound_sync(s);
     memset(s->sound_ram, 0, sizeof s->sound_ram);
     scsp_reset(s);
     m68k_reset(&s->sound_cpu, s);
@@ -64,6 +68,7 @@ void sound_clock_change_reset(saturn *s)
     s->m68k_acc = 0;
     s->m68k_target = 0;
     s->scsp_acc = 0;
+    s->sound_deferred = 0;
     s->snd_wp = s->snd_rp = 0;
     s->cdda_wp = s->cdda_rp = 0;
     s->cdda_ready = 0;
@@ -98,7 +103,10 @@ static void wav_finish(void)
     wav = NULL;
 }
 
-void sound_run(saturn *s, uint32_t sh2_cycles)
+/* Advance the sound domain by an exact span. The public sound_run() below
+ * batches scheduler quanta, while sound_sync() uses this directly before an
+ * SH-2 observes shared sound RAM. */
+static void sound_run_exact(saturn *s, uint32_t sh2_cycles)
 {
     static int disabled = -1, snddbg = -1;
     if (disabled < 0) {
@@ -209,6 +217,40 @@ void sound_run(saturn *s, uint32_t sh2_cycles)
             s->snd_wp = next;
         }
     }
+}
+
+/* The two SH-2s need the scheduler's 128-clock interleave for their hardware
+ * handshakes. The sound domain's periodic boundary is an SCSP sample roughly
+ * every 649 SH-2 clocks, so entering the MC68000 runner every 128 clocks only
+ * adds host overhead. Accumulate four quanta and advance them together.
+ *
+ * bus.c calls sound_sync() before every SH-2 sound-RAM access. A command,
+ * upload or acknowledgement therefore observes exactly the sound state due
+ * at that machine-clock boundary; batching never moves the sound CPU past an
+ * externally visible access. SATURN_SOUNDBATCH=128 restores the old cadence
+ * for deterministic A/B testing. */
+void sound_run(saturn *s, uint32_t sh2_cycles)
+{
+    static uint32_t batch;
+    if (!batch) {
+        const char *e = getenv("SATURN_SOUNDBATCH");
+        batch = e ? (uint32_t)strtoul(e, NULL, 0) : 512u;
+        if (batch < 128u) batch = 128u;
+    }
+
+    s->sound_deferred += sh2_cycles;
+    if (s->sound_deferred < batch) return;
+    sh2_cycles = s->sound_deferred;
+    s->sound_deferred = 0;
+    sound_run_exact(s, sh2_cycles);
+}
+
+void sound_sync(saturn *s)
+{
+    uint32_t due = s->sound_deferred;
+    if (!due) return;
+    s->sound_deferred = 0;
+    sound_run_exact(s, due);
 }
 
 /* Drain up to `frames` stereo frames into `out`; returns how many were

@@ -340,11 +340,15 @@ void smpc_command(saturn *s, uint8_t cmd)
                    ireg0, ireg1, (unsigned long long)s->master.cycles);
         if (ireg0 & 0x01) {
             intback_status(s);
-            /* Status SR: bit7 clear, PDL set, NPE set iff a peripheral
-             * phase follows, low nibble 0xF (Mednafen sets SR |= 0x0F). */
+            /* Status SR follows the latched INTBACK request exactly: bit7 is
+             * clear, PDL is set, NPE is set iff a peripheral phase follows,
+             * and the low nibble is the two requested port modes.  For the
+             * BIOS's 01/02 request both modes are zero; forcing 0x0F here
+             * reports a different protocol mode and changes the IPL path. */
             s->smpc_reg[SR & 0x7F] = (uint8_t)(0x40
                                     | (s->ib_active ? 0x20 : 0x00)
-                                    | 0x0F);
+                                    | (s->ib_p1md << 0)
+                                    | (s->ib_p2md << 2));
         } else if (s->ib_active) {
             intback_peripheral(s);
         }
@@ -655,8 +659,17 @@ void smpc_reset(saturn *s)
 {
     memset(s->smpc_reg, 0, sizeof(s->smpc_reg));
     s->smpc_reg[SF & 0x7F] = 0;
-    s->smpc_reg[SR & 0x7F] = 0;
+    /* Hard-reset register state, matching Ymir's SMPC::Reset exactly.  Do
+     * not synthesize a peripheral report here: doing so overwrote SR with
+     * 0xC0 and OREG31 with 0xFF before the BIOS had requested INTBACK.  Real
+     * reset state is SR=0x80 and OREG31=0xF0; the first report is produced
+     * only after an INTBACK command. */
+    s->smpc_reg[SR & 0x7F] = 0x80;
+    ow(s, 31, 0xF0);
+    s->ib_active = 0;
+    s->ib_first = 0;
+    s->ib_p1md = 0;
+    s->ib_p2md = 0;
     s->pad1_lo = 0;
     s->pad1_hi = 0;
-    intback_peripheral(s);
 }

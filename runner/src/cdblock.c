@@ -260,15 +260,14 @@ void cdb_init(saturn *s, void *disc_handle, void *iso_handle)
     cd->index  = 0xFF;
     cd->fad    = (uint32_t)(getenv("SATURN_CDFAD")
                             ? strtoul(getenv("SATURN_CDFAD"), NULL, 0) : 0xFFFFFFu);
-    /* Frames of power-on init before we replace the signature with a real
-     * status response. Long enough that the BIOS observes the signature,
-     * short enough that the game's own commands are not all discarded. */
-    /* The drive is ready early enough for the IPL's boot-animation probe.
-     * Sixty fields made the US 1.01a BIOS decide the drive was absent, skip
-     * its SCU-DSP animation, and enter the CD player. Twenty preserves the
-     * reset settling interval while matching the successful hardware path. */
+    /* Ymir keeps the power-on CDBLOCK signature until the BIOS reads CR4 of
+     * its first command response, then enables periodic status reports
+     * immediately.  A former 60-field delay held those reports until after
+     * the boot animation; the IPL therefore entered the CD-player program
+     * before it noticed the disc.  Keep the delay as an opt-in diagnostic,
+     * but the hardware-faithful/default path has no artificial spin-up. */
     cd->boot_delay = getenv("SATURN_BOOTDELAY")
-                   ? atoi(getenv("SATURN_BOOTDELAY")) : 20;
+                   ? atoi(getenv("SATURN_BOOTDELAY")) : 0;
 
     /* Power-on signature, read by the BIOS while it waits for us. */
     /* Read straight out of the BIOS ROM: the IPL memcmps CR1..CR4 against the
@@ -284,15 +283,11 @@ void cdb_init(saturn *s, void *disc_handle, void *iso_handle)
      * CD driver at 0x060682DA tests HIRQ bit 0 and returns -2 without sending
      * anything when it is clear. It has to be set from reset, and re-raised
      * whenever a command completes -- which respond() does. */
-    /* Ymir Reset(hard): m_HIRQ = 0x0BE1 = CMOK|DCHG|ESEL|EHST|EFLS|MPED.
-     * We powered on with CMOK alone, so every bit the host expects to
-     * find already asserted -- notably MPED, "MPEG processing finished",
-     * which nothing in our block ever raises -- read as still pending.
-     * DCHG (0x20) is deliberately withheld: measured here, asserting it
-     * at power-on wedges the IPL permanently and nothing clears it. */
+    /* Hard-reset HIRQ state.  The BIOS acknowledges DCHG during its startup
+     * handshake; omitting it diverges before disc classification begins. */
     s->cdb_reg[R_HIRQ] = (uint16_t)(HIRQ_CMOK | HIRQ_DCHG | HIRQ_ESEL |
                                     HIRQ_EHST | HIRQ_ECPY | HIRQ_EFLS |
-                                    HIRQ_MPED);   /* = 0x0BE1 exactly */
+                                    HIRQ_MPED);   /* = 0x0BE1 */
 }
 
 /* Called once per emulated frame. Completes power-on init, after which the
@@ -325,6 +320,19 @@ void cdb_periodic_maybe(saturn *s)
      * drive-status block, which is a garbage 24-bit length or file id. */
     if (cd->processing_cmd) return;
     now = s->master.cycles;
+    /* Reading CR4 completes a command pickup.  The BIOS then reads the whole
+     * response a second time and requires the two snapshots to agree.  Ymir's
+     * periodic report is a scheduled drive event; it cannot synchronously land
+     * on the very next CR1 read.  Our report is driven from register reads, so
+     * without this guard the first post-CR4 read replaced GetHardwareInfo with
+     * 21FF/FFFF/FFFF/FFFF between those two snapshots.  The IPL consequently
+     * rejected every disc and entered the CD player.  Start a fresh sector
+     * period after command pickup before allowing an unsolicited report. */
+    if (cd->resp_fresh) {
+        cd->resp_fresh = 0;
+        cd->last_peri_cy = now;
+        return;
+    }
     iv  = getenv("SATURN_PERICY")
           ? strtoull(getenv("SATURN_PERICY"), NULL, 0) : CDB_SECTOR_CYCLES;
     if (now - cd->last_peri_cy < iv) return;
@@ -368,6 +376,12 @@ void cdb_tick(saturn *s)
              * never issues a command. */
             cd->status = ST_PAUSE;
             cd->ready  = 1;
+            /* Match Ymir's reset/media-ready state exactly: the position stays
+             * UNKNOWN until PlayDisc actually lands on its first sector.  The
+             * US IPL uses the TOC/session commands to classify the inserted
+             * disc. Publishing track 1/FAD 150 here leaks a settled position
+             * into InitializeCDSystem and makes the IPL reject the otherwise
+             * valid IP read, exposing the CD-player menu. */
             respond_status(s);
             /* NOT HIRQ_DCHG. Bit 0x20 means "disc changed", and the IPL
              * refuses to proceed while it is set: 0x000032DC returns 1 when
@@ -887,11 +901,10 @@ void cdb_execute(saturn *s)
         respond_status(s);
         break;
 
-    case 0x01:  /* GetHardwareInfo. CR4 is the MPEG capability word; claiming
-                 * 0x0400 tells the BIOS an MPEG card is fitted. Tunable while
-                 * we work out what the IPL wants: "cr2,cr3,cr4". */
+    case 0x01:  /* GetHardwareInfo. Keep the BIOS-proven drive word as the
+                 * default; the override remains available for protocol work. */
         {
-            unsigned h2 = 0x0002, h3 = 0x0000, h4 = 0x0600;  /* DRIVE version (Ymir trace #0: ...0600), not MPEG */
+            unsigned h2 = 0x0002, h3 = 0x0000, h4 = 0x0600;
             const char *e = getenv("SATURN_HWINFO");
             if (e) sscanf(e, "%x,%x,%x", &h2, &h3, &h4);
             respond(s, (uint16_t)((uint16_t)cd->status << 8), (uint16_t)h2,
@@ -1319,8 +1332,18 @@ void cdb_execute(saturn *s)
         if (tgt == 0xFFFFFFu) {
             cd->status = ST_PAUSE;
         } else if (tgt == 0) {
+            /* Ymir CmdSeekDisc(0) reports a stopped drive with an UNKNOWN
+             * position: 02FF FFFF FFFF FFFF.  Keeping the previous data-track
+             * position (0280 4101 0100 0096) makes the US IPL poll GetStatus
+             * forever and ultimately expose the CD-player menu. */
             cd->status = ST_STANDBY;
-            cd_set_position(s, FAD_BASE);
+            cd->fad = 0xFFFFFFu;
+            cd->flag = 0xF0u;
+            cd->play_rptcnt = 0x0Fu;
+            cd->ctrl = 0xFFu;
+            cd->track = 0xFFu;
+            cd->index = 0xFFu;
+            cd->drive_next = 0;
         } else {
             cd->status = ST_PAUSE;
             cd_set_position(s, tgt & 0x7FFFFFu);

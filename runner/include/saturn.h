@@ -159,6 +159,11 @@ typedef struct {
      * the 4KB page PC last executed from. Tag 1 never matches an address. */
     const uint8_t *if_page;
     uint32_t if_tag;
+    /* Most instruction fetches stay in the same 16-byte SH-2 cache line.
+     * Remember its way so sequential code does not scan all four ways for
+     * every opcode; metadata is still validated before every use. */
+    uint32_t if_cache_base;
+    uint8_t  if_cache_way;
     uint16_t frc;             /* free-running counter                        */
     uint32_t frt_pre;         /* prescaler remainder, in machine cycles      */
 
@@ -336,6 +341,7 @@ struct saturn {
     uint64_t  m68k_acc;           /* fractional sound-CPU clock        */
     uint64_t  m68k_target;        /* cumulative cycles owed since reset */
     uint64_t  scsp_acc;           /* sample-clock accumulator          */
+    uint32_t  sound_deferred;     /* SH-2 clocks waiting for sound sync */
     int16_t   snd_buf[SND_RING * 2];  /* stereo ring, written by the core */
     uint32_t  snd_wp, snd_rp;
 #define COVER_BLOCKS 65536u   /* 32-byte blocks -> 2MB of code */
@@ -775,6 +781,7 @@ void     scsp_render(saturn *s, int16_t *left, int16_t *right);
 void     scsp_reset (saturn *s);
 void     sound_init (saturn *s);
 void     sound_run  (saturn *s, uint32_t sh2_cycles);
+void     sound_sync (saturn *s);
 void     sound_set_on(saturn *s, int on);
 void     sound_clock_change_reset(saturn *s);
 uint32_t sound_drain(saturn *s, int16_t *out, uint32_t frames);

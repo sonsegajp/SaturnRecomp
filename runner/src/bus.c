@@ -630,6 +630,7 @@ uint8_t bus_r8(saturn *s, uint32_t a)
         return cc->onchip[OC(off)];
     }
     b = a & 0x07FFFFFFu;
+    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 1);
     if (p) return *p;
@@ -694,6 +695,7 @@ uint16_t bus_r16(saturn *s, uint32_t a)
         return (uint16_t)((cc->onchip[OC(off)] << 8) | cc->onchip[OC(off)+1]);
     }
     b = a & 0x07FFFFFEu;
+    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 2);
     if (p) return (uint16_t)((p[0] << 8) | p[1]);
@@ -814,6 +816,7 @@ uint32_t bus_r32(saturn *s, uint32_t a)
     }
     if (is_onchip(a)) return oc_r32(s, a & 0xFFFCu);
     b = a & 0x07FFFFFCu;
+    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 4);
     if (p)
@@ -873,6 +876,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
         return;
     }
     b = a & 0x07FFFFFFu;
+    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
     /* MINIT/SINIT doorbell. The ADDRESS selects the target CPU and the data is
      * irrelevant -- any write in the region rings it. This path used to fire
      * only on an ODD address, while the 16- and 32-bit paths below fire
@@ -960,6 +964,7 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
         return;
     }
     b = a & 0x07FFFFFEu;
+    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
 
     /* MINIT/SINIT: the doorbell is named for who RINGS it, not who hears it.
      * Writes to MINIT (0x01000000-0x017FFFFF) pulse the SLAVE's FRT
@@ -1131,6 +1136,7 @@ void bus_w32(saturn *s, uint32_t a, uint32_t v)
         return;
     }
     b = a & 0x07FFFFFCu;
+    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
     if (b >= 0x01000000u && b < 0x02000000u) {
         frt_capture(b < 0x01800000u ? &s->slave : &s->master);
         return;

@@ -277,6 +277,7 @@ int main(int argc, char **argv)
     uint64_t perf_freq = 1, prev_tick = 0, fps_mark = 0, fps_count = 0, prof_mark = 0;
     double   accum = 0.0, field_secs = 1.0 / 59.94, cur_fps = 0.0;
     int      have_frame = 0, uncapped = 0, headless = 0, profile = 0;
+    uint64_t max_frames = 0;
 
     if (argc < 2) {
         fprintf(stderr,
@@ -508,6 +509,8 @@ int main(int argc, char **argv)
     uncapped  = getenv("SATURN_UNCAP") != NULL;
     headless  = getenv("SATURN_HEADLESS") != NULL;
     profile   = getenv("SATURN_PROF") != NULL;
+    if (getenv("SATURN_MAX_FRAMES"))
+        max_frames = strtoull(getenv("SATURN_MAX_FRAMES"), NULL, 0);
     { const char *fpsenv = getenv("SATURN_FPS");
       if (fpsenv) { double v = atof(fpsenv); if (v > 1.0) field_secs = 1.0 / v; } }
 
@@ -711,6 +714,11 @@ int main(int argc, char **argv)
                      c->halted ? c->fault : "");
             SDL_SetWindowTitle(win, title);
         }
+        /* Clean, deterministic exit for PGO training and automated visual
+         * runs.  Exiting through the normal tail matters: GCC writes its
+         * profile counters at process shutdown, while force-killing a helper
+         * loses the workload data we just collected. */
+        if (max_frames && frame >= max_frames) running = 0;
     }
 
     printf("\nstopped at PC=0x%08X after %llu instructions%s%s\n",

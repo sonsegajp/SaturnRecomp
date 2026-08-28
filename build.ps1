@@ -24,6 +24,22 @@ if (-not $mingwBin -or -not (Test-Path (Join-Path $mingwBin 'gcc.exe'))) {
 $env:Path = "$mingwBin;$env:Path"
 
 $CFLAGS = @('-O3','-flto','-march=native','-mtune=native','-Wall','-Wextra','-std=c11')
+$pgoMode = $env:SATURN_PGO_MODE
+$pgoDir = $env:SATURN_PGO_DIR
+if ($pgoMode) {
+    if (-not $pgoDir) { $pgoDir = 'out\pgo' }
+    New-Item -ItemType Directory -Force -Path $pgoDir | Out-Null
+    $pgoAbs = (Resolve-Path $pgoDir).Path -replace '\\','/'
+    if ($pgoMode -eq 'generate') {
+        $CFLAGS += "-fprofile-generate=$pgoAbs"
+    } elseif ($pgoMode -eq 'use') {
+        $CFLAGS += "-fprofile-use=$pgoAbs"
+        $CFLAGS += '-fprofile-correction'
+        $CFLAGS += '-Wno-missing-profile'
+    } else {
+        throw "SATURN_PGO_MODE must be 'generate' or 'use'"
+    }
+}
 $CORE   = 'external\sh2-recomp-core\common'
 
 New-Item -ItemType Directory -Force -Path 'out' | Out-Null

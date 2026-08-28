@@ -148,6 +148,7 @@ void sh2_reset(sh2 *c, saturn *s, int is_slave, uint32_t pc, uint32_t sp)
      * matters for SSHON: the slave must execute the real reset trampoline. */
     c->vbr      = ((pc & 0x07FFFFFFu) < BIOS_SIZE) ? 0u : 0x06000000u;
     c->if_tag   = 1;             /* never matches: memset left it 0 == page 0 */
+    c->if_cache_base = 1;        /* likewise: cache-line bases are aligned    */
 
     /* SH7604 bus-state-controller reset values. BCR1 bit 15 is hard-wired to
      * the processor identity (0=master, 1=slave); the Saturn BIOS reads it at
@@ -240,9 +241,22 @@ static void cache_lru_touch(sh2 *c, unsigned set, unsigned way)
 static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
 {
     uint32_t tag = (pc >> 10) & 0x7FFFFu;
+    uint32_t base = pc & ~0xFu;
     unsigned set = (pc >> 4) & 63u, way;
     uint8_t ccr = c->onchip[0x92];
     uint8_t *line;
+
+    /* A sequential run fetches eight opcodes from one cache line. The old
+     * path searched four ways and compared four tags for every one of those
+     * fetches. Keep the exact SH7604 LRU touch below, but reuse the way while
+     * its valid/tag metadata still names this line. Cache purges, address-array
+     * writes and replacement all invalidate this check naturally. */
+    if (c->if_cache_base == base) {
+        way = c->if_cache_way;
+        if (way < 4u && c->cache_valid[set][way] &&
+            c->cache_tag[set][way] == tag)
+            goto hit;
+    }
 
     for (way = 0; way < 4; way++) {
         if (c->cache_valid[set][way] && c->cache_tag[set][way] == tag)
@@ -261,7 +275,6 @@ static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
 
     line = &c->cache_data[(way << 10) | (set << 4)];
     {
-        uint32_t base = pc & ~0xFu;
         const uint8_t *page = bus_page(s, base);
         if (page) memcpy(line, page + (base & 0xFFFu), 16u);
         else for (unsigned i = 0; i < 16; i++) line[i] = bus_r8(s, base + i);
@@ -270,6 +283,8 @@ static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
     c->cache_valid[set][way] = 1;
 
 hit:
+    c->if_cache_base = base;
+    c->if_cache_way = (uint8_t)way;
     cache_lru_touch(c, set, way);
     line = &c->cache_data[(way << 10) | (set << 4)];
     return (uint16_t)((line[pc & 0xEu] << 8) | line[(pc & 0xEu) + 1u]);
@@ -1554,9 +1569,15 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
     uint64_t done = 0;
     int fastable;
     static int op_on = -1;
+    static int movwtrace_on = -1;
 
     if (!dbg.init) { dbg_init(); tracewin_init(); }
     if (op_on < 0) op_on = getenv("SATURN_OPHIST") != NULL;
+    /* This diagnostic used to call getenv() for every fast-path MOV.W.  The
+     * BIOS animation spends a large share of its time in those instructions,
+     * so the disabled trace still throttled the runtime to a few FPS. */
+    if (movwtrace_on < 0)
+        movwtrace_on = getenv("SATURN_MOVWTRACE") != NULL;
     if (!cov_armed) cov_init_env();
     s->cur = c;
 
@@ -1694,7 +1715,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                         case 0x1: { \
                             uint32_t _a = R[fm], _v = fast_r16(c, _a); \
                             R[fn] = (uint32_t)(int32_t)(int16_t)_v; \
-                            if (getenv("SATURN_MOVWTRACE") && (PCV) == 0x06070D64u) \
+                            if (movwtrace_on && (PCV) == 0x06070D64u) \
                                 fprintf(stderr, "[movw-fast] pc=%08X addr=%08X raw=%04X result=%08X\n", \
                                         (uint32_t)(PCV), _a, (unsigned)_v, R[fn]); \
                         } break; \

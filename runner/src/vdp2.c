@@ -135,6 +135,7 @@ static uint32_t apply_offset(uint32_t argb, int dr, int dg, int db)
 /* Per-layer configuration decoded from the register file. */
 typedef struct {
     int      enabled;
+    int      transparent;   /* BGON TP enable (the register bit is inverted) */
     int      bitmap;
     unsigned colours;     /* 0=16, 1=256, 2=2048, 3=32768, 4=16.7M */
     uint32_t base;        /* VRAM byte offset of the bitmap / pattern data */
@@ -193,6 +194,12 @@ static void decode_nbg(saturn *s, int n, nbg_cfg *c)
 
     memset(c, 0, sizeof(*c));
     c->enabled = (bgon >> n) & 1u;
+    /* BGON bits 8-11 are NBG0-3 transparency DISABLE bits. Ymir stores
+     * enableTransparency = !bit and only treats colour index zero / a clear
+     * RGB MSB as transparent when that flag is enabled. Applying transparency
+     * unconditionally punched the US BIOS logo background's zero-valued dots
+     * through to the black back screen, producing the stray pixels at x=0. */
+    c->transparent = ((bgon >> (8u + (unsigned)n)) & 1u) == 0u;
     if (!c->enabled) return;
 
     /* CHCTLA holds NBG0 in the low byte and NBG1 in the high byte; CHCTLB holds
@@ -451,7 +458,7 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
         off = c->base + (uint32_t)(y * c->pitch + x) / 2u;
         { uint8_t b = s->vdp2_vram[off & (VDP2_VRAM_SZ - 1)];
           uint32_t i = (x & 1) ? (b & 0x0F) : (b >> 4);
-          if (!i) return 0;
+          if (c->transparent && !i) return 0;
           c->sp_code = (int)((i >> 1) & 7u);
           *opaque = 1;
           return cram_colour(s, (c->caos << 8) + (c->palbank << 4) + i); }
@@ -459,7 +466,7 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
     case 1: {   /* 256 colour, 8bpp */
         off = c->base + (uint32_t)(y * c->pitch + x);
         { uint8_t i = s->vdp2_vram[off & (VDP2_VRAM_SZ - 1)];
-          if (!i) return 0;
+          if (c->transparent && !i) return 0;
           c->sp_code = (int)((i >> 1) & 7u);
           *opaque = 1;
           return cram_colour(s, (c->caos << 8) + (c->palbank << 8) + i); }
@@ -467,7 +474,7 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
     case 2: {   /* 2048 colour, 16bpp index */
         off = c->base + (uint32_t)(y * c->pitch + x) * 2u;
         { uint16_t i = vram16(s, off) & 0x07FF;
-          if (!i) return 0;
+          if (c->transparent && !i) return 0;
           c->sp_code = (int)((i >> 1) & 7u);
           *opaque = 1;
           return cram_colour(s, i); }
@@ -475,7 +482,7 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
     case 3: {   /* 32768 colour RGB555; bit 15 is the transparency flag */
         off = c->base + (uint32_t)(y * c->pitch + x) * 2u;
         { uint16_t p = vram16(s, off);
-          if (!(p & 0x8000)) return 0;
+          if (c->transparent && !(p & 0x8000)) return 0;
           *opaque = 1;
           return rgb555(p); }
     }
@@ -485,7 +492,7 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
           uint8_t b1 = s->vdp2_vram[(off + 1) & (VDP2_VRAM_SZ - 1)];
           uint8_t b2 = s->vdp2_vram[(off + 2) & (VDP2_VRAM_SZ - 1)];
           uint8_t b3 = s->vdp2_vram[(off + 3) & (VDP2_VRAM_SZ - 1)];
-          if (!(b0 & 0x80u)) return 0;
+          if (c->transparent && !(b0 & 0x80u)) return 0;
           *opaque = 1;
           return 0xFF000000u | ((uint32_t)b3 << 16) | ((uint32_t)b2 << 8) | b1; }
     }
@@ -510,6 +517,7 @@ static int vdp2_opts_off(void)
 static int bitmap8_visible(saturn *s, const nbg_cfg *c, int w, int h)
 {
     if (vdp2_opts_off()) return 1;
+    if (!c->transparent) return 1;   /* index zero is an opaque palette entry */
     if (!c->bitmap || c->colours != 1 || c->lsc_on ||
         c->zoom_h != 0x100 || c->zoom_v != 0x100)
         return 1;
@@ -683,6 +691,7 @@ void vdp2_display_size(saturn *s, int *w, int *h)
  */
 typedef struct {
     int      enabled;
+    int      transparent;   /* BGON TP enable (the register bit is inverted) */
     unsigned colours;
     uint16_t pnc;          /* pattern name control */
     unsigned caos;         /* colour RAM offset, in units of 256 entries */
@@ -845,13 +854,13 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
             uint8_t b = s->vdp2_vram[(c->bmbase + by * (c->bmw / 2) + bx / 2)
                                      & (VDP2_VRAM_SZ - 1)];
             unsigned i4 = (bx & 1) ? (b & 0x0Fu) : (unsigned)(b >> 4);
-            if (!i4) return 0;
+            if (c->transparent && !i4) return 0;
             *opaque = 1;
             return cram_colour(s, (c->caos << 8) + (c->bmpal << 8) + i4);
         } else if (c->colours == 1) {            /* 256 colours, 8bpp */
             uint8_t i8 = s->vdp2_vram[(c->bmbase + by * c->bmw + bx)
                                       & (VDP2_VRAM_SZ - 1)];
-            if (!i8) return 0;
+            if (c->transparent && !i8) return 0;
             *opaque = 1;
             return cram_colour(s, (c->caos << 8) + (c->bmpal << 8) + i8);
         } else if (c->colours == 2) {            /* 2048 colours, 2 bytes/dot */
@@ -859,7 +868,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
                        & (VDP2_VRAM_SZ - 2);
             uint16_t v = (uint16_t)((s->vdp2_vram[o] << 8) | s->vdp2_vram[o + 1]);
             unsigned i11 = v & 0x7FFu;
-            if (!i11) return 0;
+            if (c->transparent && !i11) return 0;
             *opaque = 1;
             return cram_colour(s, (c->caos << 8) + i11);
         } else if (c->colours == 4) {            /* RGB888, FOUR bytes/dot */
@@ -877,14 +886,14 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
             uint8_t b1 = s->vdp2_vram[(o + 1) & (VDP2_VRAM_SZ - 1)];
             uint8_t b2 = s->vdp2_vram[(o + 2) & (VDP2_VRAM_SZ - 1)];
             uint8_t b3 = s->vdp2_vram[(o + 3) & (VDP2_VRAM_SZ - 1)];
-            if (!(b0 & 0x80u)) return 0;
+            if (c->transparent && !(b0 & 0x80u)) return 0;
             *opaque = 1;
             return 0xFF000000u | ((uint32_t)b3 << 16) | ((uint32_t)b2 << 8) | b1;
         } else {                                 /* RGB555 bitmap */
             uint32_t o = (c->bmbase + (by * c->bmw + bx) * 2u)
                        & (VDP2_VRAM_SZ - 2);
             uint16_t v = (uint16_t)((s->vdp2_vram[o] << 8) | s->vdp2_vram[o + 1]);
-            if (!(v & 0x8000u)) return 0;
+            if (c->transparent && !(v & 0x8000u)) return 0;
             *opaque = 1;
             return rgb555(v);
         }
@@ -984,7 +993,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
                    + (unsigned)(cy & 7) * 4u + (unsigned)((cx & 7) >> 1);
         uint8_t b = s->vdp2_vram[o & (VDP2_VRAM_SZ - 1)];
         idx = (cx & 1) ? (b & 0x0Fu) : (unsigned)(b >> 4);
-        if (!idx) return 0;
+        if (c->transparent && !idx) return 0;
         c->sp_code = (int)((idx >> 1) & 7u);
         *opaque = 1;
         return cram_colour(s, (c->caos << 8) + paladdr + idx);
@@ -992,7 +1001,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
         uint32_t o = charaddr + sub * c->cellbytes
                    + (unsigned)(cy & 7) * 8u + (unsigned)(cx & 7);
         idx = s->vdp2_vram[o & (VDP2_VRAM_SZ - 1)];
-        if (!idx) return 0;
+        if (c->transparent && !idx) return 0;
         c->sp_code = (int)((idx >> 1) & 7u);
         *opaque = 1;
         return cram_colour(s, (c->caos << 8) + paladdr + idx);
@@ -1001,7 +1010,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
                    + (unsigned)(cy & 7) * 16u + (unsigned)(cx & 7) * 2u;
         uint16_t p16 = vram16(s, o);
         idx = p16 & 0x07FFu;
-        if (!idx) return 0;
+        if (c->transparent && !idx) return 0;
         c->sp_code = (int)((idx >> 1) & 7u);
         *opaque = 1;
         return cram_colour(s, idx);
@@ -1009,7 +1018,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
         uint32_t o = charaddr + sub * c->cellbytes
                    + (unsigned)(cy & 7) * 16u + (unsigned)(cx & 7) * 2u;
         uint16_t p16 = vram16(s, o);
-        if (!(p16 & 0x8000u)) return 0;
+        if (c->transparent && !(p16 & 0x8000u)) return 0;
         *opaque = 1;
         return rgb555(p16);
     } else {                                     /* 16.7M colour, RGB888 */
@@ -1023,7 +1032,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
         uint8_t b1 = s->vdp2_vram[(o + 1) & (VDP2_VRAM_SZ - 1)];
         uint8_t b2 = s->vdp2_vram[(o + 2) & (VDP2_VRAM_SZ - 1)];
         uint8_t b3 = s->vdp2_vram[(o + 3) & (VDP2_VRAM_SZ - 1)];
-        if (!(b0 & 0x80u)) return 0;
+        if (c->transparent && !(b0 & 0x80u)) return 0;
         *opaque = 1;
         return 0xFF000000u | ((uint32_t)b3 << 16) | ((uint32_t)b2 << 8) | b1;
     }
@@ -1040,6 +1049,7 @@ static void decode_cell_nbg(saturn *s, int n, cell_cfg *c)
 
     memset(c, 0, sizeof(*c));
     c->enabled = (VR(0x20) >> n) & 1u;
+    c->transparent = ((VR(0x20) >> (8u + (unsigned)n)) & 1u) == 0u;
     if (!c->enabled) return;
 
     ch = (n < 2) ? (uint16_t)(chctla >> (n * 8))
@@ -1217,6 +1227,7 @@ static void decode_cell_rbg0(saturn *s, cell_cfg *c)
 
     memset(c, 0, sizeof(*c));
     c->enabled = (VR(0x20) >> 4) & 1u;
+    c->transparent = ((VR(0x20) >> 12) & 1u) == 0u;
     if (!c->enabled) return;
     if ((chctlb >> 9) & 1u) { c->enabled = 0; return; }   /* bitmap RBG0 */
 
