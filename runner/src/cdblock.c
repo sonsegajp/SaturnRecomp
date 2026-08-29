@@ -169,7 +169,8 @@ static void respond_status(saturn *s)
 /* Hand the host a buffer to read out through the data transfer register. */
 static void cd_set_position(saturn *s, uint32_t fad);
 
-static void begin_transfer(saturn *s, const void *src, uint32_t bytes)
+static void begin_transfer(saturn *s, const void *src, uint32_t bytes,
+                           uint8_t xfer_type)
 {
     cdblock *cd = &s->cd;
     if (bytes > (CD_PART_SECTORS * 2048u)) bytes = (CD_PART_SECTORS * 2048u);
@@ -192,6 +193,7 @@ static void begin_transfer(saturn *s, const void *src, uint32_t bytes)
     s->nstaged++;
     cd->xfer_size = bytes;
     cd->xfer_pos  = 0;
+    cd->xfer_type = xfer_type;
     if (s->nxferlog < 8) {
         s->xferlog[s->nxferlog].bytes = bytes;
         memcpy(s->xferlog[s->nxferlog].head, cd->xfer, bytes < 12 ? bytes : 12);
@@ -660,8 +662,24 @@ uint16_t cdb_read_dtr(saturn *s)
     }
     v = (uint16_t)((cd->xfer[cd->xfer_pos] << 8) | cd->xfer[cd->xfer_pos + 1]);
     cd->xfer_pos += 2;
-    if (cd->xfer_pos >= cd->xfer_size) hirq_set(s, HIRQ_EHST);
+    if (cd->xfer_pos >= cd->xfer_size && cd->xfer_type == 1)
+        hirq_set(s, HIRQ_EHST);
     return v;
+}
+
+void cdb_write_dtr(saturn *s, uint16_t value)
+{
+    cdblock *cd = &s->cd;
+
+    /* DATATRNS is a FIFO port, not ordinary storage. Writes outside an active
+     * PutSector transfer are ignored; importantly, they must not read the FIFO
+     * first (the old byte-write read/modify/write path consumed input data).
+     * The PutSector command path is not complete yet, but keeping the FIFO
+     * operation correct here gives CPU and SCU DMA writes identical behavior
+     * and provides the right primitive for that command implementation. */
+    if (cd->xfer_type != 3 || cd->xfer_pos + 1u >= cd->xfer_size) return;
+    cd->xfer[cd->xfer_pos++] = (uint8_t)(value >> 8);
+    cd->xfer[cd->xfer_pos++] = (uint8_t)value;
 }
 
 /* ---------------------------------------------------- filesystem helpers */
@@ -829,14 +847,15 @@ static int entry_in_cwd(const iso_entry *e)
 static void file_record(const iso_entry *e, int fileno, uint8_t *out)
 {
     uint32_t fad = e->lba + FAD_BASE;
+    (void)fileno; /* public file ID and XA file number are distinct fields */
     out[0] = (uint8_t)(fad >> 24); out[1] = (uint8_t)(fad >> 16);
     out[2] = (uint8_t)(fad >> 8);  out[3] = (uint8_t)fad;
     out[4] = (uint8_t)(e->size >> 24); out[5] = (uint8_t)(e->size >> 16);
     out[6] = (uint8_t)(e->size >> 8);  out[7] = (uint8_t)e->size;
-    out[8]  = 0;
-    out[9]  = 0;
-    out[10] = (uint8_t)fileno;
-    out[11] = e->is_dir ? 0x02 : 0x00;
+    out[8]  = e->unit_size;
+    out[9]  = e->gap_size;
+    out[10] = e->file_num;
+    out[11] = e->attributes;
 }
 
 /* ------------------------------------------------------------- dispatch */
@@ -964,7 +983,7 @@ void cdb_execute(saturn *s)
                         d->tracks[i].mode == TRACK_AUDIO ? 0x01 : 0x41,
                         d->tracks[i].start_lba + FAD_BASE);
         }
-        begin_transfer(s, toc, sizeof(toc));
+        begin_transfer(s, toc, sizeof(toc), 2);
         respond(s, (uint16_t)((uint16_t)cd->status << 8), 0x00CC, 0x0000, 0x0000);
         hirq_set(s, HIRQ_DRDY);
         break;
@@ -1042,6 +1061,7 @@ void cdb_execute(saturn *s)
             cd->status = e ? (uint8_t)strtoul(e, NULL, 0) : ST_PAUSE;
         }
         cd->xfer_size = cd->xfer_pos = 0;
+        cd->xfer_type = 0;
         /* THE DRIVE GOES TO 2x HERE. Ymir resets to 1x
          * (cdblock.cpp:125 `m_readSpeed = 1`) and then, in
          * CmdInitializeCDSystem, sets `m_readSpeed = m_readSpeedFactor` --
@@ -1096,15 +1116,15 @@ void cdb_execute(saturn *s)
         uint32_t count = cd->xfer_pos ? (cd->xfer_pos >> 1) : 0xFFFFFFu;
         respond(s, (uint16_t)((cd->status << 8) | ((count >> 16) & 0xFF)),
                 (uint16_t)(count & 0xFFFF), 0, 0);
-        cd->xfer_size = cd->xfer_pos = 0;
-        /* TRIED TWICE AND REVERTED: Ymir raises EHST here only for a real
-         * sector transfer (EndTransfer() skips TOC/FileInfo/Subcode). Gating
-         * on cd->xfer_size regressed Sonic 3D to the Set Clock screen; gating
-         * on a transfer TYPE left the CD player's status bar empty, because
-         * our TOC path relies on this EHST. Our transfers complete inside the
-         * command handler, so the unconditional raise is load-bearing until
-         * the transfer state machine is modelled over time. */
-        hirq_set(s, HIRQ_EHST);
+        {
+            uint8_t completed_type = cd->xfer_type;
+            cd->xfer_size = cd->xfer_pos = 0;
+            cd->xfer_type = 0;
+            /* Only sector transfers complete with EHST.  TOC, file-info and
+             * subcode replies share the FIFO but have different semantics. */
+            if (completed_type == 1 || completed_type == 3)
+                hirq_set(s, HIRQ_EHST);
+        }
         break;
     }
 
@@ -1502,9 +1522,10 @@ void cdb_execute(saturn *s)
             }
             cd->xfer_size = ok * 2352u;
             cd->xfer_pos  = 0;
+            cd->xfer_type = 1;
             bytes = cnt * 2048u;   /* partition accounting stays cooked */
         } else {
-            begin_transfer(s, cd->part[p] + (size_t)off * 2048u, bytes);
+            begin_transfer(s, cd->part[p] + (size_t)off * 2048u, bytes, 1);
             if (getenv("SATURN_XFERDUMP")) {
                 const uint8_t *q = cd->part[p] + (size_t)off * 2048u;
                 unsigned k;
@@ -1667,6 +1688,8 @@ void cdb_execute(saturn *s)
     case 0x72: { /* GetFileSystemScope: how many entries the directory holds,
                   * and the id of the first one. */
         uint16_t n = 0;
+        /* IDs 0 and 1 are the current and parent directory entries. */
+        if (cd->dir_first < 2) cd->dir_first = 2;
         if (fs) {
             for (int i = 0; i < fs->nentries; i++)
                 if (entry_in_cwd(&fs->entries[i])) n++;
@@ -1830,7 +1853,7 @@ void cdb_execute(saturn *s)
                  * and aborts (17x AbortFile), which is what kept the BIOS from
                  * booting the game. The batch path keeps its NiGHTS-measured
                  * behaviour. */
-                begin_transfer(s, buf, bytes);
+                begin_transfer(s, buf, bytes, 2);
                 respond(s, (uint16_t)((uint16_t)cd->status << 8),
                         (uint16_t)(bytes / 2), 0, 0);
                 hirq_set(s, HIRQ_DRDY);
@@ -1851,7 +1874,7 @@ void cdb_execute(saturn *s)
         if (getenv("SATURN_DIRSTREAM") && (cr3 & 0xFF) == 0xFF) {
             uint32_t chunk = 7u * 12u;
             if (cd->xfer_pos >= cd->xfer_size) {   /* start a fresh walk */
-                begin_transfer(s, buf, bytes);
+                begin_transfer(s, buf, bytes, 2);
             }
             {
                 uint32_t left = cd->xfer_size - cd->xfer_pos;
@@ -1862,7 +1885,7 @@ void cdb_execute(saturn *s)
             }
             break;
         }
-        begin_transfer(s, buf, bytes);
+        begin_transfer(s, buf, bytes, 2);
         /* The records also land in the PARTITION, not just the data-transfer
          * register: the host discovers them by polling GetSectorNumber, and a
          * driver that waits for a non-zero sector count sits at "no data

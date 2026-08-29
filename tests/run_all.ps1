@@ -101,6 +101,29 @@ if (Test-Path 'tests/m68k_core.exe') {
     $skip++
 }
 
+# ------------------------------------------ 0e. shared address bus / CD ----
+Section 'Shared address bus aliases'
+
+if (Test-Path 'tests/bus_alias.exe') {
+    $out = & 'tests/bus_alias.exe' 2>&1
+    $out | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else {
+    Write-Host 'bus_alias.exe not built - run build.ps1' -ForegroundColor Yellow
+    $skip++
+}
+
+Section 'CD/CS2 mirrors, widths, FIFO effects, and trace classification'
+
+if (Test-Path 'tests/cd_bus.exe') {
+    $out = & 'tests/cd_bus.exe' 2>&1
+    $out | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else {
+    Write-Host 'cd_bus.exe not built - run build.ps1' -ForegroundColor Yellow
+    $skip++
+}
+
 # ---------------------------------------------------------------- 1. ISA ----
 Section 'SH-2 decoder conformance (65,536 opcodes vs capstone)'
 

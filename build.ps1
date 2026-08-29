@@ -112,9 +112,30 @@ if ($LASTEXITCODE -ne 0) { throw "vdp1_quad build failed" }
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/cdda_play.exe tests/cdda_play.c runner/src/cdblock.c runner/src/scsp.c runner/src/scsp_dsp.c runner/src/sound.c runner/src/m68k.c runner/src/m68k_bus.c runner/src/bus.c runner/src/scu_dsp.c runner/src/sh2_interp.c runner/src/smpc.c runner/src/vdp1.c runner/src/vdp2.c runner/src/bios.c runner/src/png.c recompiler/src/disc.c external/sh2-recomp-core/common/sh2_decoder.c
 if ($LASTEXITCODE -ne 0) { throw "cdda_play build failed" }
 
+# ---- tests: shared address bus and CD/CS2 decoder --------------------------
+$BUS_TEST_SRCS = @('runner/src/bus.c','runner/src/scu_dsp.c','runner/src/sh2_interp.c',
+    'runner/src/cdblock.c','runner/src/smpc.c','runner/src/vdp1.c','runner/src/vdp2.c',
+    'runner/src/m68k.c','runner/src/m68k_bus.c','runner/src/scsp.c','runner/src/scsp_dsp.c',
+    'runner/src/sound.c','runner/src/bios.c','runner/src/png.c','recompiler/src/disc.c',
+    'external/sh2-recomp-core/common/sh2_decoder.c')
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/bus_alias.exe tests/bus_alias.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "bus_alias build failed" }
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/cd_bus.exe tests/cd_bus.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "cd_bus build failed" }
+
 # ---- runner: SDL2 window ---------------------------------------------------
+$glslc = Join-Path $mingwBin 'glslc.exe'
+if (-not (Test-Path $glslc)) {
+    throw 'glslc.exe not found. Install mingw-w64-x86_64-shaderc.'
+}
+& $glslc runner\shaders\vdp1.comp -O -o runner\shaders\vdp1.comp.spv
+if ($LASTEXITCODE -ne 0) { throw "VDP1 Vulkan shader build failed" }
+& $glslc runner\shaders\vdp2.comp -O -o runner\shaders\vdp2.comp.spv
+if ($LASTEXITCODE -ne 0) { throw "VDP2 Vulkan shader build failed" }
+
 gcc @CFLAGS '-Wl,--stack,67108864' -Irunner\include -Irecompiler\include -o runner\saturnwin.exe `
     runner\src\window.c `
+    runner\src\vulkan_renderer.c `
     runner\src\bus.c `
     runner\src\scu_dsp.c `
     runner\src\sh2_interp.c `
@@ -132,7 +153,7 @@ gcc @CFLAGS '-Wl,--stack,67108864' -Irunner\include -Irecompiler\include -o runn
     recompiler\src\disc.c `
     recompiler\src\game_config.c `
     "$CORE\sh2_decoder.c" `
-    -lmingw32 -lSDL2main -lSDL2
+    -lmingw32 -lSDL2main -lSDL2 -lvulkan-1
 if ($LASTEXITCODE -ne 0) { throw "saturnwin build failed" }
 # SDL2.dll must sit beside the executable when its directory is not on the
 # runtime PATH. The MSYS2 package places it beside gcc.exe.

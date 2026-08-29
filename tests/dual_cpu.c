@@ -318,7 +318,68 @@ static void test_clock_is_shared(void)
     ck("V-Blank-IN edge already asserted", S.vblank_boundary_done, 1u);
 }
 
-/* ------------------------------------------------------------- 6. DIVU */
+/* ------------------------------------------------ 6. slave BIOS wait fold */
+
+static void test_slave_bios_wait_fold(void)
+{
+    memset(&S, 0, sizeof S);
+    /* Retail slave BIOS idle loop: DT R0 / BF 0x240.  BRA/NOP parks once the
+     * final iteration falls through. */
+    S.bios[0x240] = 0x40; S.bios[0x241] = 0x10;
+    S.bios[0x242] = 0x8B; S.bios[0x243] = 0xFD;
+    S.bios[0x244] = 0xAF; S.bios[0x245] = 0xFE;
+    S.bios[0x246] = 0x00; S.bios[0x247] = 0x09;
+    sh2_reset(&S.slave, &S, 1, 0x00000240u, 0x060F0000u);
+    S.cur = &S.slave;
+    S.slave.r[0] = 32;
+
+    sh2_run(&S.slave, 120);
+    ck("BIOS wait fold respects slice cycle budget",
+       (uint32_t)S.slave.cycles, 120u);
+    ck("BIOS wait fold preserves remaining iterations", S.slave.r[0], 2u);
+    ck("BIOS wait fold stays at guarded loop", S.slave.pc, 0x00000240u);
+    ck("BIOS wait fold preserves taken-loop T", S.slave.sr & SR_T, 0u);
+
+    sh2_run(&S.slave, 8);
+    ck("BIOS wait final iteration executes normally", S.slave.r[0], 0u);
+    ck("BIOS wait final iteration sets T", S.slave.sr & SR_T, SR_T);
+    ck("BIOS wait folding counted fast instructions",
+       (S.fastpath_hits >= 60u), 1u);
+}
+
+/* --------------------------------------- 7. clock-change wake from SLEEP */
+
+static void test_clock_change_wakes_sleeping_master(void)
+{
+    const uint32_t vbr = 0x06060000u;
+    const uint32_t handler = 0x06060100u;
+    const uint32_t old_sp = 0x060F0000u;
+    const uint32_t old_pc = 0x00000530u;
+    const uint32_t old_sr = 0x000000F0u;
+
+    memset(&S, 0, sizeof S);
+    sh2_reset(&S.master, &S, 0, old_pc, old_sp);
+    S.cur = &S.master;
+    S.master.vbr = vbr;
+    S.master.sr = old_sr;
+    S.master.sleeping = 1;
+    S.pending_ckchg = 2;
+
+    /* NMI vector 11 and one harmless handler instruction. */
+    w32(vbr + 11u * 4u, handler);
+    w16(handler, 0x0009u);                 /* nop */
+
+    sh2_run(&S.master, 1u);
+
+    ck("clock change completion consumed", S.pending_ckchg, 0u);
+    ck("clock change wakes sleeping master", S.master.sleeping, 0u);
+    ck("clock change entered NMI vector", S.master.pc, handler + 2u);
+    ck("clock change built NMI frame", S.master.r[15], old_sp - 8u);
+    ck("clock change saved sleeping PC", bus_r32(&S, old_sp - 8u), old_pc);
+    ck("clock change saved SR", bus_r32(&S, old_sp - 4u), old_sr);
+}
+
+/* ------------------------------------------------------------- 8. DIVU */
 
 static void test_divu(void)
 {
@@ -400,6 +461,8 @@ int main(void)
     test_scu_is_master_only();
     test_clock_is_shared();
     test_rendezvous();
+    test_slave_bios_wait_fold();
+    test_clock_change_wakes_sleeping_master();
     test_divu();
 
     if (fails) { printf("FAILED: %d check(s)\n", fails); return 1; }

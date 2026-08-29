@@ -588,7 +588,9 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
     static int32_t mix_pre_peak;
     static uint32_t mix_clip, mix_n;
     static int nodsp = -1;
+    static int dspprobe = -1;
     if (mixdbg < 0) mixdbg = getenv("SATURN_MIXDBG") != NULL;
+    if (dspprobe < 0) dspprobe = getenv("SATURN_DSPPROBE") != NULL;
     if (nodsp < 0) {
         /* The DSP is accurate enough to run by default. SATURN_NODSP remains
          * a diagnostic bypass for comparing the dry signal. */
@@ -817,7 +819,7 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
         }
     }
 
-    if (getenv("SATURN_DSPPROBE")) {
+    if (dspprobe) {
         int q;
         for (q = 0; q < 16; q++) {
             int32_t a = s->dsp.efreg[q] < 0 ? -s->dsp.efreg[q] : s->dsp.efreg[q];

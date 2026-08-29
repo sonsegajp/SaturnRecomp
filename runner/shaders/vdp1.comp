@@ -1,0 +1,218 @@
+#version 450
+
+/* One invocation owns one VDP1 framebuffer coordinate. It replays the
+ * resolved command stream in order, so destination reads (shadow and
+ * half-transparency), mesh, erase and framebuffer persistence are race-free. */
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer V1Ram { uint d[]; } v1ram;
+layout(std430, binding = 3) readonly buffer Regs  { uint d[]; } regs;
+layout(std430, binding = 4) readonly buffer Ops   { uint d[]; } ops;
+layout(std430, binding = 5) buffer V1FB           { uint d[]; } fb;
+layout(std430, binding = 6) buffer MeshFB         { uint d[]; } meshfb;
+layout(std430, binding = 8) readonly buffer TileHeaders { uint d[]; } tiles;
+layout(std430, binding = 9) readonly buffer TileRefs    { uint d[]; } refs;
+
+const uint FB_W = 512u;
+const uint FB_H = 256u;
+const uint FB_PIXELS = FB_W * FB_H;
+const uint OP_WORDS = 25u;
+
+uint byte_at(uint a)
+{
+    uint w = v1ram.d[(a & 0x7ffffu) >> 2];
+    return (w >> ((a & 3u) * 8u)) & 255u;
+}
+
+uint be16(uint a) { return (byte_at(a) << 8) | byte_at(a + 1u); }
+
+float cross2(vec2 a, vec2 b) { return a.x * b.y - a.y * b.x; }
+
+bool triangle_uv(vec2 p, vec2 a, vec2 b, vec2 c,
+                 vec2 ta, vec2 tb, vec2 tc, out vec2 uv)
+{
+    vec2 v0 = b - a, v1 = c - a, v2 = p - a;
+    float den = cross2(v0, v1);
+    if (abs(den) < 0.00001) return false;
+    float q = cross2(v2, v1) / den;
+    float r = cross2(v0, v2) / den;
+    float t = 1.0 - q - r;
+    if (q < -0.001 || r < -0.001 || t < -0.001) return false;
+    uv = ta * t + tb * q + tc * r;
+    return true;
+}
+
+bool quad_uv(vec2 p, vec2 a, vec2 b, vec2 c, vec2 d, out vec2 uv)
+{
+    if (triangle_uv(p, a, b, c, vec2(0,0), vec2(1,0), vec2(1,1), uv))
+        return true;
+    return triangle_uv(p, a, c, d, vec2(0,0), vec2(1,1), vec2(0,1), uv);
+}
+
+bool line_hit(ivec2 p, ivec2 a, ivec2 b)
+{
+    vec2 ab = vec2(b - a), ap = vec2(p - a);
+    float l2 = dot(ab, ab);
+    if (l2 < 0.5) return all(equal(p, a));
+    float t = clamp(dot(ap, ab) / l2, 0.0, 1.0);
+    vec2 q = vec2(a) + ab * t;
+    /* Pixel-centre distance approximates the VDP1 integer DDA and keeps a
+     * one-dot line one dot wide in both major-axis orientations. */
+    return dot(vec2(p) - q, vec2(p) - q) <= 0.36;
+}
+
+uint texture_colour(uint chr, uint tw, uint th, uint colr, uint pmod,
+                    uint flip, vec2 uv, out bool transparent)
+{
+    uint mode = (pmod >> 3) & 7u;
+    bool spd = (pmod & 0x40u) != 0u;
+    bool ecd = (pmod & 0x80u) != 0u;
+    uint tx = min(uint(clamp(uv.x, 0.0, 0.999999) * float(tw)), tw - 1u);
+    uint ty = min(uint(clamp(uv.y, 0.0, 0.999999) * float(th)), th - 1u);
+    if ((flip & 1u) != 0u) tx = tw - 1u - tx;
+    if ((flip & 2u) != 0u) ty = th - 1u - ty;
+    uint pos = ty * tw + tx;
+    uint idx = 0u, value = 0u;
+    transparent = false;
+
+    if (mode <= 1u) {
+        uint b = byte_at(chr + (pos >> 1));
+        idx = ((tx & 1u) != 0u) ? (b & 15u) : (b >> 4);
+        if ((!ecd && idx == 15u) || (!spd && idx == 0u)) {
+            transparent = true; return 0u;
+        }
+        value = mode == 1u ? be16((colr << 3) + idx * 2u)
+                           : ((colr & 0xfff0u) | idx);
+    } else if (mode <= 4u) {
+        const uint bankmask[3] = uint[3](0xffc0u, 0xff80u, 0xff00u);
+        const uint idxmask[3]  = uint[3](0x003fu, 0x007fu, 0x00ffu);
+        idx = byte_at(chr + pos);
+        if ((!ecd && idx == 255u) || (!spd && idx == 0u)) {
+            transparent = true; return 0u;
+        }
+        value = (colr & bankmask[mode - 2u]) | (idx & idxmask[mode - 2u]);
+    } else {
+        value = be16(chr + pos * 2u);
+        if ((!ecd && value == 0x7fffu) || (!spd && (value & 0x8000u) == 0u)) {
+            transparent = true; return 0u;
+        }
+    }
+    return value;
+}
+
+uint gouraud(uint base, uint grda, vec2 uv)
+{
+    if (grda == 0u) return base;
+    uint g0 = be16(grda * 8u + 0u), g1 = be16(grda * 8u + 2u);
+    uint g2 = be16(grda * 8u + 4u), g3 = be16(grda * 8u + 6u);
+    ivec3 a = ivec3(int(g0 & 31u), int((g0 >> 5) & 31u), int((g0 >> 10) & 31u));
+    ivec3 b = ivec3(int(g1 & 31u), int((g1 >> 5) & 31u), int((g1 >> 10) & 31u));
+    ivec3 c = ivec3(int(g2 & 31u), int((g2 >> 5) & 31u), int((g2 >> 10) & 31u));
+    ivec3 d = ivec3(int(g3 & 31u), int((g3 >> 5) & 31u), int((g3 >> 10) & 31u));
+    vec3 top = mix(vec3(a), vec3(b), uv.x);
+    vec3 bot = mix(vec3(d), vec3(c), uv.x);
+    ivec3 shade = ivec3(mix(top, bot, uv.y));
+    ivec3 src = ivec3(int(base & 31u), int((base >> 5) & 31u), int((base >> 10) & 31u));
+    ivec3 outc = clamp(src + shade - ivec3(16), ivec3(0), ivec3(31));
+    return 0x8000u | uint(outc.r) | (uint(outc.g) << 5) | (uint(outc.b) << 10);
+}
+
+uint colour_calc(uint src, uint dst, uint pmod, out bool write_pixel)
+{
+    write_pixel = true;
+    uint mode = pmod & 3u;
+    if (mode == 0u) return src;
+    if (mode == 1u) {
+        if ((dst & 0x8000u) == 0u) { write_pixel = false; return dst; }
+        return 0x8000u | ((dst & 31u) >> 1)
+             | ((((dst >> 5) & 31u) >> 1) << 5)
+             | ((((dst >> 10) & 31u) >> 1) << 10);
+    }
+    if (mode == 2u) {
+        return (src & 0x8000u) | ((src & 31u) >> 1)
+             | ((((src >> 5) & 31u) >> 1) << 5)
+             | ((((src >> 10) & 31u) >> 1) << 10);
+    }
+    if ((dst & 0x8000u) == 0u) return src;
+    uint r = ((src & 31u) + (dst & 31u)) >> 1;
+    uint g = (((src >> 5) & 31u) + ((dst >> 5) & 31u)) >> 1;
+    uint b = (((src >> 10) & 31u) + ((dst >> 10) & 31u)) >> 1;
+    return 0x8000u | r | (g << 5) | (b << 10);
+}
+
+void main()
+{
+    uvec2 up = gl_GlobalInvocationID.xy;
+    if (up.x >= FB_W || up.y >= FB_H) return;
+    ivec2 p = ivec2(up);
+    uint pix = up.y * FB_W + up.x;
+    uint c0 = fb.d[pix], c1 = fb.d[FB_PIXELS + pix];
+    uint m0 = meshfb.d[pix], m1 = meshfb.d[FB_PIXELS + pix];
+    uint tile = (up.y >> 4) * 32u + (up.x >> 4);
+    uint first = tiles.d[tile * 2u], count = tiles.d[tile * 2u + 1u];
+
+    for (uint ti = 0u; ti < count; ++ti) {
+        uint oi = refs.d[first + ti];
+        uint z = oi * OP_WORDS;
+        uint kind = ops.d[z + 0u], target = ops.d[z + 1u] & 1u;
+        uint dst = target == 0u ? c0 : c1;
+        uint mdst = target == 0u ? m0 : m1;
+        bool hit = false;
+        uint src = 0u, pmod = ops.d[z + 14u];
+
+        if (kind == 3u) {
+            int x0 = int(ops.d[z + 2u]), y0 = int(ops.d[z + 3u]);
+            int x1 = int(ops.d[z + 4u]), y1 = int(ops.d[z + 5u]);
+            if (p.x >= x0 && p.x < x1 && p.y >= y0 && p.y <= y1) {
+                dst = ops.d[z + 16u]; mdst = 0u; hit = true;
+            }
+        } else {
+            int sysx = int(ops.d[z + 19u]), sysy = int(ops.d[z + 20u]);
+            if (p.x < 0 || p.y < 0 || p.x > sysx || p.y > sysy) continue;
+            if ((pmod & 0x400u) != 0u) {
+                bool outside = p.x < int(ops.d[z + 21u]) || p.y < int(ops.d[z + 22u]) ||
+                               p.x > int(ops.d[z + 23u]) || p.y > int(ops.d[z + 24u]);
+                if (outside != ((pmod & 0x200u) != 0u)) continue;
+            }
+            if (kind == 2u) {
+                hit = line_hit(p, ivec2(int(ops.d[z+2u]), int(ops.d[z+3u])),
+                                  ivec2(int(ops.d[z+4u]), int(ops.d[z+5u])));
+                src = ops.d[z + 13u];
+            } else if (kind == 1u) {
+                vec2 uv;
+                hit = quad_uv(vec2(p),
+                    vec2(int(ops.d[z+2u]), int(ops.d[z+3u])),
+                    vec2(int(ops.d[z+4u]), int(ops.d[z+5u])),
+                    vec2(int(ops.d[z+6u]), int(ops.d[z+7u])),
+                    vec2(int(ops.d[z+8u]), int(ops.d[z+9u])), uv);
+                if (hit) {
+                    if (ops.d[z + 17u] != 0u) {
+                        bool transparent;
+                        src = texture_colour(ops.d[z+10u], ops.d[z+11u], ops.d[z+12u],
+                                             ops.d[z+13u], pmod, ops.d[z+18u], uv,
+                                             transparent);
+                        if (transparent) hit = false;
+                    } else src = ops.d[z + 16u];
+                    if (hit && (pmod & 4u) != 0u)
+                        src = gouraud(src, ops.d[z + 15u], uv);
+                }
+            }
+            if (hit) {
+                bool write_pixel;
+                src = colour_calc(src, dst, pmod, write_pixel);
+                if (write_pixel) {
+                    bool mesh = (pmod & 0x100u) != 0u;
+                    if (mesh) mdst = src;
+                    else { dst = src; mdst = 0u; }
+                }
+            }
+        }
+        if (hit) {
+            if (target == 0u) { c0 = dst; m0 = mdst; }
+            else              { c1 = dst; m1 = mdst; }
+        }
+    }
+
+    fb.d[pix] = c0; fb.d[FB_PIXELS + pix] = c1;
+    meshfb.d[pix] = m0; meshfb.d[FB_PIXELS + pix] = m1;
+}

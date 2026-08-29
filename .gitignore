@@ -29,6 +29,7 @@ HANDOFF.md
 *.state
 *.dmp
 *.png
+*.spv
 !assets/saturnrecomp-logo.png
 gmon.out
 

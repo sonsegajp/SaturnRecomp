@@ -1193,15 +1193,22 @@ static void step(m68k *m)
 uint32_t m68k_run(m68k *m, uint32_t cycles)
 {
     uint64_t start = m->cycles;
+    uint64_t target = start + cycles;
     if (m->halted) return cycles;
-    while (m->cycles - start < cycles) {
-        m->stepping = 1;
+
+    /* `stepping` prevents SCSP register writes made by the current 68000 run
+     * from recursively entering its interrupt path.  Nothing outside the
+     * core can observe the one-instruction gaps where the old loop cleared
+     * and immediately re-set it, so keep it asserted for the whole batch.
+     * This removes two state stores and two subtractions from every sound-CPU
+     * instruction while preserving the interrupt check at each boundary. */
+    m->stepping = 1;
+    while (m->cycles < target) {
         check_irq(m);
-        if (m->halted) { m->stepping = 0; break; }
-        if (m->cycles - start >= cycles) { m->stepping = 0; break; }
+        if (m->halted || m->cycles >= target) break;
         step(m);
-        m->stepping = 0;
     }
+    m->stepping = 0;
     return (uint32_t)(m->cycles - start);
 }
 

@@ -112,7 +112,8 @@ typedef struct {
     uint32_t xfer_size, xfer_pos;
     /* Ymir TransferType. EHST is raised at EndDataTransfer ONLY for real
      * sector transfers (GetSector/GetThenDeleteSector/PutSector), never for
-     * TOC/FileInfo/Subcode. 0 = none, 1 = sector, 2 = other. */
+     * TOC/FileInfo/Subcode. 0 = none, 1 = sector read, 2 = other,
+     * 3 = sector write. */
     uint8_t  xfer_type;
 } cdblock;
 
@@ -439,7 +440,7 @@ struct saturn {
     uint64_t frames;
     uint64_t frt_irqs;        /* interrupts sourced from a core's own FRT */
     /* SATURN_PROF: rdtsc cycle buckets, printed at end of run. */
-    uint64_t prof_master, prof_slave, prof_video, prof_other;
+    uint64_t prof_master, prof_slave, prof_vdp1, prof_video, prof_other;
     uint64_t fastpath_hits, slowpath_hits;
     uint32_t irqall_mach, irqall_macl, irqall_gbr;
     /* SATURN_PCLAST: the LAST 16 times a PC was reached, with registers.
@@ -573,6 +574,12 @@ struct saturn {
     uint32_t   cd_read_pc;   /* PC of the first CD register read */
     uint32_t   cd_read_addr; /* address of that read */
     uint32_t   watch_gbr;    /* GBR at the watch hit */
+    /* COMREG completion is asynchronous.  Software commonly updates its own
+     * queue state immediately after the write and must observe SF clear at a
+     * later scheduler boundary. */
+    int        pending_smpc_cmd;
+    uint8_t    smpc_cmd;
+    uint64_t   smpc_cmd_due;
     /* SMPC clock change state: 0 idle, 1 scheduled, 2 reset complete/NMI
      * ready. The BIOS must reach SLEEP before the command completes. */
     int        pending_ckchg;
@@ -724,6 +731,7 @@ void     cdb_tick(saturn *s);
 void     cdb_periodic_maybe(saturn *s);
 void     cdb_execute(saturn *s);
 uint16_t cdb_read_dtr(saturn *s);
+void     cdb_write_dtr(saturn *s, uint16_t value);
 /* Re-evaluate (HIRQ & HMSK) and assert the CD block's interrupt line if any
  * unmasked flag is set. Ymir calls this on every HIRQ set, every host HIRQ
  * clear and every HIRQMASK write (cdblock.cpp UpdateInterrupts). */
@@ -747,6 +755,7 @@ void sh2_report_ophist(FILE *f);
  * per field. The last ~20% of each line is the horizontal blank. These are the
  * numbers TVSTAT and the FRT input capture were already using ad hoc; they are
  * named here so the scheduler, TVSTAT and the FRT cannot drift apart. */
+#define MASTER_CLOCK_NTSC 28636360u
 #define CYC_PER_LINE  1820u
 #define HBLANK_START  1456u
 #define LINES_TOTAL    263u

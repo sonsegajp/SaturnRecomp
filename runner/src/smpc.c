@@ -273,7 +273,7 @@ void smpc_ireg0_write(saturn *s, uint8_t v)
     }
 }
 
-void smpc_command(saturn *s, uint8_t cmd)
+static void smpc_execute_command(saturn *s, uint8_t cmd)
 {
     if (getenv("SATURN_SMPC_CMDS") && cmd != CMD_INTBACK)
         printf("[smpc-cmd] cmd=%02X pc=%08X pr=%08X cy=%llu\n",
@@ -444,7 +444,9 @@ void smpc_command(saturn *s, uint8_t cmd)
                (unsigned long long)s->master.cycles);
         s->pending_ckchg = 1;
         s->ckchg_cmd = cmd;
-        s->ckchg_due = s->clk + 200000u;
+        /* The public command scheduler already imposed the long CKCHG delay.
+         * Complete the reset at this scheduler boundary. */
+        s->ckchg_due = s->clk;
         ow(s, 31, cmd);
         /* SF is cleared only when smpc_tick completes the command. */
         return;
@@ -508,6 +510,27 @@ void smpc_command(saturn *s, uint8_t cmd)
     s->smpc_reg[SF & 0x7F] = 0;
 }
 
+void smpc_command(saturn *s, uint8_t cmd)
+{
+    /* A COMREG write schedules completion.  Completing it inside bus_w8 races
+     * software that writes COMREG and only then marks its queue as waiting. */
+    if (s->pending_smpc_cmd || s->pending_ckchg == 1) {
+        if (getenv("SATURN_SMPC_CMDS"))
+            printf("[smpc-reject] cmd=%02X pending=%02X clk=%llu\n",
+                   cmd, s->smpc_cmd, (unsigned long long)s->clk);
+        return;
+    }
+
+    s->smpc_reg[COMREG & 0x7F] = cmd;
+    s->pending_smpc_cmd = 1;
+    s->smpc_cmd = cmd;
+    /* SYSRES and clock changes are long commands.  Other commands use the
+     * compatibility-tested 240-cycle event delay. */
+    s->smpc_cmd_due = s->clk +
+        ((cmd == CMD_SYSRES || cmd == CMD_CKCHG352 || cmd == CMD_CKCHG320)
+         ? 200000u : 240u);
+}
+
 /* Complete a scheduled clock change at a scheduler boundary. This follows
  * Ymir SMPC::ClockChange: soft-reset VDP/SCU/SCSP, disable the slave SH-2,
  * raise NMI on the master, then select the new clock. A soft VDP reset keeps
@@ -515,6 +538,12 @@ void smpc_command(saturn *s, uint8_t cmd)
 void smpc_tick(saturn *s)
 {
     uint16_t pal;
+
+    if (s->pending_smpc_cmd && s->clk >= s->smpc_cmd_due) {
+        uint8_t cmd = s->smpc_cmd;
+        s->pending_smpc_cmd = 0;
+        smpc_execute_command(s, cmd);
+    }
 
     if (s->pending_ckchg != 1 || s->clk < s->ckchg_due) return;
 
@@ -659,6 +688,8 @@ void smpc_reset(saturn *s)
 {
     memset(s->smpc_reg, 0, sizeof(s->smpc_reg));
     s->smpc_reg[SF & 0x7F] = 0;
+    s->pending_smpc_cmd = 0;
+    s->pending_ckchg = 0;
     /* Hard-reset register state, matching Ymir's SMPC::Reset exactly.  Do
      * not synthesize a peripheral report here: doing so overwrote SR with
      * 0xC0 and OREG31 with 0xFF before the BIOS had requested INTBACK.  Real

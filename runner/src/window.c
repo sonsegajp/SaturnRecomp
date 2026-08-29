@@ -10,6 +10,7 @@
  * font rendering is needed to know what the machine is doing.
  */
 #include "saturn.h"
+#include "vulkan_renderer.h"
 #include "disc.h"
 #include "game_config.h"
 #include <SDL2/SDL.h>
@@ -214,6 +215,82 @@ static uint32_t snd_target(void)
     return v;
 }
 
+/* Sleep most of a field deadline, then use the performance counter for the
+ * short final phase. The caller supplies an absolute deadline so render cost
+ * is included in the cadence instead of being added on top of it. */
+static void pace_until(uint64_t deadline, uint64_t freq)
+{
+    uint64_t now = SDL_GetPerformanceCounter();
+    if (now >= deadline) return;
+    {
+        double remain = (double)(deadline - now) / (double)freq;
+        if (remain > 0.004) {
+            Uint32 ms = (Uint32)((remain - 0.003) * 1000.0);
+            if (ms) SDL_Delay(ms);
+        }
+    }
+    while (SDL_GetPerformanceCounter() < deadline) {
+#ifdef _WIN32
+        YieldProcessor();
+#endif
+    }
+}
+
+#define FRAMEPROF_CAP 2048u
+static double frameprof_interval_ms[FRAMEPROF_CAP];
+static unsigned frameprof_count;
+static uint64_t frameprof_last_present;
+static double frameprof_emu_ms, frameprof_render_ms, frameprof_wait_ms, frameprof_present_ms;
+static uint64_t frameprof_late;
+
+static int compare_double(const void *aa, const void *bb)
+{
+    double a = *(const double *)aa, b = *(const double *)bb;
+    return (a > b) - (a < b);
+}
+
+static void frameprof_add(uint64_t present_tick, uint64_t freq,
+                          uint64_t emu_begin, uint64_t emu_end,
+                          uint64_t render_end, uint64_t present_begin,
+                          unsigned report_every,
+                          double target_secs)
+{
+    double interval_ms = 0.0;
+    if (frameprof_last_present)
+        interval_ms = 1000.0 * (double)(present_tick - frameprof_last_present) /
+                      (double)freq;
+    frameprof_last_present = present_tick;
+    if (!interval_ms) return;
+
+    if (frameprof_count < FRAMEPROF_CAP)
+        frameprof_interval_ms[frameprof_count++] = interval_ms;
+    frameprof_emu_ms += 1000.0 * (double)(emu_end - emu_begin) / (double)freq;
+    frameprof_render_ms += 1000.0 * (double)(render_end - emu_end) / (double)freq;
+    frameprof_wait_ms += 1000.0 * (double)(present_begin - render_end) / (double)freq;
+    frameprof_present_ms += 1000.0 * (double)(present_tick - present_begin) / (double)freq;
+    if (interval_ms > target_secs * 1500.0) frameprof_late++;
+
+    if (frameprof_count >= report_every) {
+        double sorted[FRAMEPROF_CAP];
+        unsigned n = frameprof_count;
+        memcpy(sorted, frameprof_interval_ms, n * sizeof sorted[0]);
+        qsort(sorted, n, sizeof sorted[0], compare_double);
+        fprintf(stderr,
+                "[frame] %u presented | interval ms p50 %.3f p95 %.3f p99 %.3f worst %.3f late %llu "
+                "| avg emu %.3f render %.3f wait %.3f present %.3f\n",
+                n, sorted[(n - 1u) * 50u / 100u], sorted[(n - 1u) * 95u / 100u],
+                sorted[(n - 1u) * 99u / 100u], sorted[n - 1u],
+                (unsigned long long)frameprof_late,
+                frameprof_emu_ms / n, frameprof_render_ms / n,
+                frameprof_wait_ms / n,
+                frameprof_present_ms / n);
+        frameprof_count = 0;
+        frameprof_emu_ms = frameprof_render_ms = 0.0;
+        frameprof_wait_ms = frameprof_present_ms = 0.0;
+        frameprof_late = 0;
+    }
+}
+
 static void audio_cb(void *user, Uint8 *stream, int len)
 {
     saturn *s = (saturn *)user;
@@ -262,21 +339,29 @@ int main(int argc, char **argv)
     size_t image_size = 0;
     uint32_t load_addr = 0, entry = 0, sp;
 
-    SDL_Window   *win;
-    SDL_Renderer *ren;
-    SDL_Texture  *tex;
+    SDL_Window   *win = NULL;
+    SDL_Renderer *ren = NULL;
+    SDL_Texture  *tex = NULL;
     SDL_Texture  *frametex = NULL;
+    saturn_vk_renderer *vk = NULL;
+    int use_vk = 0;
+    char vk_error[512] = {0};
     int           g_texw = 0, g_texh = 0;
     int running = 1, paused = 0;
     int no_bios = 0;
     int bios_boot = 0;
-    uint64_t frame = 0, prof_next = 180, prof_frame_mark = 0;
+    uint64_t frame = 0, prof_next = 180, prof_interval = 180, prof_frame_mark = 0;
     SDL_AudioDeviceID audio_dev = 0;
 
-    /* Field pacing state. See the comment on the pacer in the main loop. */
-    uint64_t perf_freq = 1, prev_tick = 0, fps_mark = 0, fps_count = 0, prof_mark = 0;
-    double   accum = 0.0, field_secs = 1.0 / 59.94, cur_fps = 0.0;
-    int      have_frame = 0, uncapped = 0, headless = 0, profile = 0;
+    /* Field pacing state. One emulated field is always paired with one host
+     * presentation; the frontend never catches up by silently skipping
+     * intermediate pictures. */
+    uint64_t perf_freq = 1, field_deadline = 0, fps_mark = 0, fps_count = 0, prof_mark = 0;
+    double   field_secs = (double)(CYC_PER_LINE * LINES_TOTAL) /
+                          (double)MASTER_CLOCK_NTSC;
+    double   cur_fps = 0.0, audio_correction = 0.0;
+    int      have_frame = 0, uncapped = 0, headless = 0, profile = 0, frame_profile = 0;
+    unsigned frameprof_interval = 300;
     uint64_t max_frames = 0;
 
     if (argc < 2) {
@@ -293,9 +378,6 @@ int main(int argc, char **argv)
     if (gc_load(&g, argv[1]) != 0) { fprintf(stderr, "error: %s\n", g.err); return 1; }
     if (disc_open(&d, g.disc) != 0) { fprintf(stderr, "error: %s\n", d.err); return 1; }
     if (ip_read(&d, &ip) != 0) { fprintf(stderr, "error: not a Saturn disc\n"); return 1; }
-    s->area_code = getenv("SATURN_AREA")
-                 ? (uint8_t)strtoul(getenv("SATURN_AREA"), NULL, 0)
-                 : saturn_area_from_ip(ip.area);
     if (iso_read(&d, &fs) != 0) { fprintf(stderr, "error: %s\n", d.err); return 1; }
 
     for (int i = 0; i < g.nmodules && !first_read; i++) {
@@ -316,6 +398,11 @@ int main(int argc, char **argv)
     if (!image) { fprintf(stderr, "error: cannot read %s\n", first_read->path); return 1; }
 
     saturn_init(s);
+    /* saturn_init clears the whole machine, including the console-area latch.
+     * Select the region afterwards so the BIOS sees the disc's real region. */
+    s->area_code = getenv("SATURN_AREA")
+                 ? (uint8_t)strtoul(getenv("SATURN_AREA"), NULL, 0)
+                 : saturn_area_from_ip(ip.area);
     cdb_init(s, &d, &fs);
     /* Keep the windowed runner's battery-backed SMPC state in the same
      * per-game location as saturnboot.  The two binaries have separate mains,
@@ -422,10 +509,18 @@ int main(int argc, char **argv)
     }
     /* Open at 4:3. PANEL_W/PANEL_H size the DEBUG panel (784x372, about 2.1:1);
      * using them for the window made every game open stretched wide. */
+    {
+        const char *rd = getenv("SATURN_RENDERER");
+        headless = getenv("SATURN_HEADLESS") != NULL;
+        /* Vulkan is the production renderer. The named SDL backends remain
+         * available as an explicit software oracle/capture fallback. */
+        use_vk = !headless && (!rd || !*rd || !strcmp(rd, "vulkan"));
+    }
     win = SDL_CreateWindow("SaturnRecomp", SDL_WINDOWPOS_CENTERED,
                            SDL_WINDOWPOS_CENTERED, 960, 720,
-                           SDL_WINDOW_RESIZABLE);
-    /* The field pacer below already targets 59.94 Hz. A second host-display
+                           SDL_WINDOW_RESIZABLE | (use_vk ? SDL_WINDOW_VULKAN : 0) |
+                           (getenv("SATURN_VK_HIDDEN") ? SDL_WINDOW_HIDDEN : 0));
+    /* The field pacer below already targets the Saturn field clock. A second host-display
      * vsync wait turns a slightly-late field into a full missed refresh and
      * can quantize 50-55 fps of work down to 30 fps. */
     if (!win) {
@@ -439,32 +534,47 @@ int main(int argc, char **argv)
      * background work. */
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
 #endif
-    /* SATURN_RENDERER=opengl|software|direct3d picks the SDL backend.
+    /* SATURN_RENDERER=vulkan is the default. opengl|software|direct3d selects
+     * the retained software-compositor oracle and an SDL presentation backend.
      *
      * This exists for SCREEN CAPTURE. SDL defaults to Direct3D on Windows, and
      * OBS's plain "Window Capture (BitBlt)" cannot read a D3D-composed window
      * -- it records a black rectangle. An OpenGL or software window is drawn
      * through GDI and captures fine. (The alternative, for anyone who wants to
      * keep D3D, is to set OBS's capture method to "Windows 10 (1903+)".) */
-    {
+    if (use_vk) {
+        vk = saturn_vk_create(win, s, vk_error, sizeof vk_error);
+        if (!vk) {
+            const char *rd = getenv("SATURN_RENDERER");
+            if (rd && !strcmp(rd, "vulkan")) {
+                fprintf(stderr, "Vulkan setup failed: %s\n", vk_error);
+                return 1;
+            }
+            fprintf(stderr, "[video] Vulkan unavailable (%s); using software oracle\n", vk_error);
+            SDL_DestroyWindow(win);
+            use_vk = 0;
+            win = SDL_CreateWindow("SaturnRecomp", SDL_WINDOWPOS_CENTERED,
+                                   SDL_WINDOWPOS_CENTERED, 960, 720,
+                                   SDL_WINDOW_RESIZABLE);
+            if (!win) { fprintf(stderr, "SDL window fallback failed: %s\n", SDL_GetError()); return 1; }
+        }
+    }
+    if (!use_vk) {
         const char *rd = getenv("SATURN_RENDERER");
-        if (rd && *rd) SDL_SetHint(SDL_HINT_RENDER_DRIVER, rd);
-    }
-    ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
-    /* Headless profiling and remote desktops may expose no accelerated
-     * renderer.  Software presentation is slower, but it is a functional
-     * fallback and lets the same production loop be measured unattended. */
-    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    {   /* name it, so a capture problem is diagnosable from the log */
-        SDL_RendererInfo ri;
-        if (ren && SDL_GetRendererInfo(ren, &ri) == 0)
-            fprintf(stderr, "[video] renderer: %s\n", ri.name);
-    }
-    tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                            SDL_TEXTUREACCESS_STREAMING, PANEL_W, PANEL_H);
-    if (!ren || !tex) {
-        fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
-        return 1;
+        if (rd && *rd && strcmp(rd, "vulkan")) SDL_SetHint(SDL_HINT_RENDER_DRIVER, rd);
+        ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+        /* Headless profiling and remote desktops may expose no accelerated
+         * renderer. Software presentation is the oracle fallback. */
+        if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+        { SDL_RendererInfo ri;
+          if (ren && SDL_GetRendererInfo(ren, &ri) == 0)
+              fprintf(stderr, "[video] software oracle / SDL present: %s\n", ri.name); }
+        tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                SDL_TEXTUREACCESS_STREAMING, PANEL_W, PANEL_H);
+        if (!ren || !tex) {
+            fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
+            return 1;
+        }
     }
 
     /* Audio. The core fills a ring from the scheduler and the callback drains
@@ -503,12 +613,20 @@ int main(int argc, char **argv)
 
     perf_freq = SDL_GetPerformanceFrequency();
     if (!perf_freq) perf_freq = 1;
-    prev_tick = SDL_GetPerformanceCounter();
-    fps_mark  = prev_tick;
-    prof_mark = prev_tick;
+    fps_mark  = SDL_GetPerformanceCounter();
+    prof_mark = fps_mark;
     uncapped  = getenv("SATURN_UNCAP") != NULL;
     headless  = getenv("SATURN_HEADLESS") != NULL;
     profile   = getenv("SATURN_PROF") != NULL;
+    frame_profile = getenv("SATURN_FRAMEPROF") != NULL;
+    if (getenv("SATURN_FRAMEPROF_INTERVAL")) {
+        unsigned v = (unsigned)strtoul(getenv("SATURN_FRAMEPROF_INTERVAL"), NULL, 0);
+        if (v) frameprof_interval = v > FRAMEPROF_CAP ? FRAMEPROF_CAP : v;
+    }
+    if (getenv("SATURN_PROF_INTERVAL")) {
+        uint64_t v = strtoull(getenv("SATURN_PROF_INTERVAL"), NULL, 0);
+        if (v) prof_interval = prof_next = v;
+    }
     if (getenv("SATURN_MAX_FRAMES"))
         max_frames = strtoull(getenv("SATURN_MAX_FRAMES"), NULL, 0);
     { const char *fpsenv = getenv("SATURN_FPS");
@@ -517,8 +635,10 @@ int main(int argc, char **argv)
     frt_irq_init();
     while (running) {
         SDL_Event e;
-        int step_one = 0, advanced;   /* fields run this iteration */
+        int step_one = 0, advanced;   /* fields run this iteration (always 0 or 1) */
         double pace_period = field_secs;
+        uint64_t emu_begin = 0, emu_end = 0, render_end = 0;
+        uint64_t present_begin = 0, present_end = 0;
 
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = 0;
@@ -531,7 +651,10 @@ int main(int argc, char **argv)
                 case SDLK_ESCAPE: running = 0; break;
                 case SDLK_SPACE:  paused = !paused; break;
                 case SDLK_f:      step_one = 1; break;
-                case SDLK_F1:     g_debug = !g_debug; break;
+                case SDLK_F1:
+                    if (!use_vk) g_debug = !g_debug;
+                    else fprintf(stderr, "[video] F1 debug panel uses SATURN_RENDERER=software\n");
+                    break;
                 default: break;
                 }
             }
@@ -539,98 +662,58 @@ int main(int argc, char **argv)
 
         poll_pad(s);
 
-        /* Pace the machine off a wall clock, not off the host's vertical
-         * blank. The renderer is created with PRESENTVSYNC, so with no pacer
-         * at all this loop advanced exactly one Saturn field per monitor
-         * refresh -- on a 144 Hz display that is 144 fields/sec, 2.4x too
-         * fast, and it fed the 44.1 kHz ring at the same 2.4x, so the writer
-         * permanently lapped the reader. */
-        {
-            uint64_t now = SDL_GetPerformanceCounter();
-            double   dt  = (double)(now - prev_tick) / (double)perf_freq;
-            prev_tick = now;
-            if (dt > 0.25) dt = 0.25;   /* after a stall, resync, do not sprint */
-            accum += dt;
-        }
-
         advanced = 0;
         if (paused && !step_one) {
-            accum = 0.0;
-        } else if (step_one) {
-            saturn_run_field(s); frame++; advanced++; accum = 0.0;
+            field_deadline = 0;
+            audio_correction = 0.0;
+            frameprof_last_present = 0;
         } else {
-            /* Track the audio device's real clock instead of drifting against
-             * it: nudge the field period by at most 1% to steer the ring
-             * toward a target fill. Without this the host's 44.1 kHz and our
-             * 59.94 Hz are two free-running crystals, and the ring slowly
-             * walks into either a permanent underrun or a permanent drop. */
+            /* The Saturn master clock yields 59.826... fields/s with the
+             * scheduler's 1820x263 field. The host audio device is a separate
+             * crystal, so apply only a smoothed +/-0.1% trim; the former raw
+             * +/-1% correction visibly modulated frame delivery. */
             double period = field_secs;
-            int    budget = 4;
             if (audio_dev) {
                 uint32_t fill = (s->snd_wp + SND_RING - s->snd_rp) % SND_RING;
                 double   tgt  = (double)snd_target();
                 double   err  = ((double)fill - tgt) / tgt;
                 if (err >  1.0) err =  1.0;
                 if (err < -1.0) err = -1.0;
-                period = field_secs * (1.0 + 0.01 * err);
+                {
+                    double wanted = 0.001 * err;
+                    audio_correction += (wanted - audio_correction) * 0.02;
+                }
+                period = field_secs * (1.0 + audio_correction);
             }
             pace_period = period;
-            if (uncapped) { saturn_run_field(s); frame++; advanced++; }
-            else while (accum >= period && budget-- > 0) {
-                saturn_run_field(s);
-                frame++; advanced++;
-                accum -= period;
+
+            emu_begin = SDL_GetPerformanceCounter();
+            saturn_run_field(s);
+            emu_end = SDL_GetPerformanceCounter();
+            frame++;
+            advanced = 1;
+        }
+
+        if (use_vk && (advanced || !have_frame)) {
+            int dw, dh;
+            vdp2_display_size(s, &dw, &dh);
+            if (dw < 1) dw = 320; if (dh < 1) dh = 224;
+            if (dw > 704) dw = 704; if (dh > 512) dh = 512;
+            {
+                uint64_t tv = profile ? __rdtsc() : 0;
+                if (!saturn_vk_render(vk, s, dw, dh, vk_error, sizeof vk_error)) {
+                    fprintf(stderr, "[video] Vulkan frame failed: %s\n", vk_error);
+                    running = 0;
+                }
+                if (profile) s->prof_video += __rdtsc() - tv;
             }
-            /* Too far behind to ever catch up: drop the debt rather than
-             * spiral, so a slow patch plays late but never compounds. */
-            if (accum > period * 4.0) accum = 0.0;
-        }
-
-        {   /* achieved field rate, so "is it keeping up?" is visible */
-            uint64_t now = SDL_GetPerformanceCounter();
-            double   el  = (double)(now - fps_mark) / (double)perf_freq;
-            fps_count += (uint64_t)advanced;
-            if (el >= 0.5) {
-                cur_fps = (double)fps_count / el;
-                fps_count = 0; fps_mark = now;
-            }
-        }
-
-        /* SATURN_PROF in the window: the headless runner can only ever profile
-         * a BIOS menu, because getting a game to gameplay needs input. This
-         * reports the same master/slave/video split against a real playing
-         * frame, which is the only place the answer is interesting. */
-        if (profile && frame >= prof_next && advanced) {
-            uint64_t pnow = SDL_GetPerformanceCounter();
-            double pel = (double)(pnow - prof_mark) / (double)perf_freq;
-            double interval_fps = pel > 0.0
-                ? (double)(frame - prof_frame_mark) / pel : 0.0;
-            double m = (double)s->prof_master, sl = (double)s->prof_slave;
-            double v = (double)s->prof_video, oth = (double)s->prof_other;
-            double tot = m + sl + v + oth;
-            if (tot < 1) tot = 1;
-            fprintf(stderr, "[prof] %.1f fps | master %.1f%% slave %.1f%% video %.1f%% sound/cd %.1f%% "
-                    "| fast %.1f%% | %dx%d\n", interval_fps,
-                    100.0 * m / tot, 100.0 * sl / tot, 100.0 * v / tot,
-                    100.0 * oth / tot,
-                    100.0 * (double)s->fastpath_hits /
-                        (double)(s->fastpath_hits + s->slowpath_hits + 1),
-                    g_texw, g_texh);
-            s->prof_master = s->prof_slave = s->prof_video = s->prof_other = 0;
-            s->fastpath_hits = s->slowpath_hits = 0;
-            if (getenv("SATURN_OPHIST")) sh2_report_ophist(stderr);
-            prof_mark = pnow;
-            prof_frame_mark = frame;
-            do { prof_next += 180; } while (prof_next <= frame);
-        }
-
-        if (g_debug) {
+            g_texw = dw; g_texh = dh; have_frame = 1;
+        } else if (g_debug) {
             debugview_render(s, g_pixels, PANEL_W, PANEL_H);
             SDL_UpdateTexture(tex, NULL, g_pixels, PANEL_W * (int)sizeof(uint32_t));
         } else if (advanced || !have_frame) {
             /* Compositing is the most expensive thing this loop does, so only
-             * do it when a field actually advanced. On a refresh faster than
-             * 59.94 Hz the extra presents below just re-show this texture. */
+             * do it when a field actually advanced. */
             int dw, dh;
             vdp2_display_size(s, &dw, &dh);
             if (dw < 1) dw = 320;
@@ -653,7 +736,7 @@ int main(int argc, char **argv)
             SDL_UpdateTexture(frametex, NULL, g_frame, dw * (int)sizeof(uint32_t));
             have_frame = 1;
         }
-        if (!headless) {
+        if (!headless && !use_vk) {
             SDL_Texture *show = g_debug ? tex : frametex;
             SDL_RenderClear(ren);
             if (show) {
@@ -677,29 +760,80 @@ int main(int argc, char **argv)
                 SDL_RenderCopy(ren, show, NULL, &dst);
             }
         }
-        if (!headless) SDL_RenderPresent(ren);
-        /* One coarse sleep plus a short deadline spin. Repeated Delay(1)
-         * calls accumulated rounding/dispatch overhead and paced a 59.94 Hz
-         * target at 54-57 Hz even with >70 Hz of measured core capacity. */
-        if (!advanced && !uncapped && !paused) {
-            uint64_t now = SDL_GetPerformanceCounter();
-            double effective = accum + (double)(now - prev_tick) / (double)perf_freq;
-            double remain = pace_period - effective;
-            if (remain > 0.0) {
-                uint64_t deadline = now + (uint64_t)(remain * (double)perf_freq);
-                /* Leave 3 ms for the precise phase: SDL's nominal 1 ms sleep
-                 * still overshoots by about 0.7-1.0 ms on this Windows host. */
-                if (remain > 0.004) {
-                    Uint32 ms = (Uint32)((remain - 0.003) * 1000.0);
-                    if (ms) SDL_Delay(ms);
+        render_end = SDL_GetPerformanceCounter();
+
+        /* Hold a completed field until its presentation deadline. Scheduling
+         * starts from the previous ACTUAL present, so sub-deadline emulation
+         * cost cannot turn into visible 15/22 ms jitter. A late field presents
+         * immediately and establishes the next deadline from that late time;
+         * there is never a short catch-up interval. */
+        if (advanced && !uncapped && !step_one && field_deadline)
+            pace_until(field_deadline, perf_freq);
+        present_begin = SDL_GetPerformanceCounter();
+        if (!headless) {
+            if (use_vk) {
+                if (!saturn_vk_present(vk, vk_error, sizeof vk_error)) {
+                    fprintf(stderr, "[video] Vulkan present failed: %s\n", vk_error);
+                    running = 0;
                 }
-                while (SDL_GetPerformanceCounter() < deadline) {
-#ifdef _WIN32
-                    YieldProcessor();
-#endif
-                }
+            } else SDL_RenderPresent(ren);
+            present_end = SDL_GetPerformanceCounter();
+        } else {
+            present_end = present_begin;
+        }
+        if (advanced && !uncapped && !step_one)
+            field_deadline = present_end +
+                (uint64_t)(pace_period * (double)perf_freq + 0.5);
+        else if (advanced)
+            field_deadline = 0;
+
+        /* Achieved PRESENTED field rate. Since advanced is limited to one,
+         * this can no longer report fields that the renderer silently skipped. */
+        {
+            uint64_t now = present_end;
+            double el = (double)(now - fps_mark) / (double)perf_freq;
+            fps_count += (uint64_t)advanced;
+            if (el >= 0.5) {
+                cur_fps = (double)fps_count / el;
+                fps_count = 0;
+                fps_mark = now;
             }
         }
+
+        if (frame_profile && advanced && !headless)
+            frameprof_add(present_end, perf_freq, emu_begin, emu_end,
+                          render_end, present_begin, frameprof_interval,
+                          pace_period);
+
+        /* SATURN_PROF in the window: report after the field's VDP2 composite
+         * and presentation so each interval owns all work for its last field. */
+        if (profile && frame >= prof_next && advanced) {
+            uint64_t pnow = present_end;
+            double pel = (double)(pnow - prof_mark) / (double)perf_freq;
+            double interval_fps = pel > 0.0
+                ? (double)(frame - prof_frame_mark) / pel : 0.0;
+            double m = (double)s->prof_master, sl = (double)s->prof_slave;
+            double v1 = (double)s->prof_vdp1;
+            double v2 = (double)s->prof_video, oth = (double)s->prof_other;
+            double tot = m + sl + v1 + v2 + oth;
+            if (tot < 1) tot = 1;
+            fprintf(stderr, "[prof] %.1f presented fps | master %.1f%% slave %.1f%% VDP1 %.1f%% VDP2 %.1f%% sound/cd %.1f%% "
+                    "| fast %.1f%% | %dx%d\n", interval_fps,
+                    100.0 * m / tot, 100.0 * sl / tot, 100.0 * v1 / tot,
+                    100.0 * v2 / tot, 100.0 * oth / tot,
+                    100.0 * (double)s->fastpath_hits /
+                        (double)(s->fastpath_hits + s->slowpath_hits + 1),
+                    g_texw, g_texh);
+            s->prof_master = s->prof_slave = s->prof_vdp1 = 0;
+            s->prof_video = s->prof_other = 0;
+            s->fastpath_hits = s->slowpath_hits = 0;
+            if (getenv("SATURN_OPHIST")) sh2_report_ophist(stderr);
+            prof_mark = pnow;
+            prof_frame_mark = frame;
+            do { prof_next += prof_interval; } while (prof_next <= frame);
+        }
+
+        if (paused && !step_one) SDL_Delay(8);
 
         if (!headless) {
             sh2 *c = &s->master;
@@ -727,8 +861,10 @@ int main(int argc, char **argv)
            s->master.halted ? s->master.fault : "");
     saturn_report_trace(s, stdout);
 
-    SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
+    saturn_vk_destroy(vk);
+    if (frametex) SDL_DestroyTexture(frametex);
+    if (tex) SDL_DestroyTexture(tex);
+    if (ren) SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();
     iso_free(&fs);

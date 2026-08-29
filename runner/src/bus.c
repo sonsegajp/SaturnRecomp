@@ -94,6 +94,164 @@ static uint8_t *ram_ptr(saturn *s, uint32_t a, uint32_t size)
     return NULL;
 }
 
+/* --------------------------------------------------------- CD/CS2 decode --
+ * Ymir CDBlock::MapMemory and the Saturn address map agree on the physical
+ * decode: the CD register file is present in the first 4 KiB of every 32 KiB
+ * segment throughout A-Bus CS2 (0x05800000-0x058FFFFF). The 64-byte register
+ * file then mirrors throughout each of those blocks.
+ *
+ * Keep this as the ONE predicate used by reads, writes, DMA (which uses the
+ * public bus accessors), unmapped accounting, and trace-region reporting. */
+static int cdb_reg_decode(uint32_t a, uint32_t *off)
+{
+    uint32_t rel;
+    a &= 0x07FFFFFFu;
+    if (a < 0x05800000u || a >= 0x05900000u) return 0;
+    rel = a - 0x05800000u;
+    if ((rel & 0x7FFFu) >= 0x1000u) return 0;
+    if (off) *off = rel & 0x3Fu;
+    return 1;
+}
+
+static void cdb_note_read(saturn *s, uint32_t a, uint32_t off, int size)
+{
+    if (s->rwatch_addr && a == (s->rwatch_addr & 0x07FFFFFFu)) {
+        uint32_t pc = WW_CORE(s)->pr;   /* caller, not the reader */
+        int seen = 0;
+        for (int k = 0; k < s->nrwatch; k++) {
+            if (s->rwatch[k].pc == pc) {
+                s->rwatch[k].count++;
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen && s->nrwatch < 16) {
+            s->rwatch[s->nrwatch].pc = pc;
+            s->rwatch[s->nrwatch].count = 1;
+            s->nrwatch++;
+        }
+    }
+
+    cdb_periodic_maybe(s);
+    trace(s, a, 0, size);
+    s->cd_read_pc = WW_CORE(s)->pc;
+    s->cd_read_addr = a;
+
+    if (off == 0x18u && s->cd.boot_delay == 0) {
+        uint64_t snap = ((uint64_t)s->cdb_reg[0x18 >> 1] << 48) |
+                        ((uint64_t)s->cdb_reg[0x1C >> 1] << 32) |
+                        ((uint64_t)s->cdb_reg[0x20 >> 1] << 16) |
+                        ((uint64_t)s->cdb_reg[0x24 >> 1]);
+        if (s->cr_snap_valid && snap != s->cr_snap) s->cr_changes++;
+        s->cr_snap = snap;
+        s->cr_snap_valid = 1;
+    }
+    if (off == 0x18u) {
+        int k = (int)(s->cr1reads % 12);
+        s->cr2log[k].val = s->cdb_reg[0x18 >> 1];
+        s->cr2log[k].pc  = WW_CORE(s)->pc;
+        s->cr1reads++;
+        if (s->ncr2log < 12) s->ncr2log++;
+    }
+}
+
+static uint16_t cdb_reg_read(saturn *s, uint32_t a, uint32_t off, int size)
+{
+    uint16_t value = 0;
+    cdb_note_read(s, a, off, size);
+
+    switch (off) {
+    case 0x00u:
+    case 0x02u:
+        return cdb_read_dtr(s);
+    case 0x08u:
+    case 0x0Cu:
+    case 0x18u:
+    case 0x1Cu:
+    case 0x20u:
+    case 0x24u:
+        value = s->cdb_reg[off >> 1];
+        break;
+    default:
+        break;
+    }
+
+    /* Reading CR4 completes pickup of the command response. */
+    if (off == 0x24u) {
+        s->cd.resp_pending = 0;
+        s->cd.processing_cmd = 0;
+    }
+    return value;
+}
+
+static void cdb_reg_write(saturn *s, uint32_t a, uint32_t off,
+                          uint16_t value, int size)
+{
+    trace(s, a, 1, size);
+    {   /* ring: keep the LAST 24 CD writes, the early ones are just init */
+        int k = (int)(s->cdwrites % 24);
+        s->cdwlog[k].addr = a;
+        s->cdwlog[k].val = value;
+        s->cdwlog[k].pc = WW_CORE(s)->pc;
+        s->cdwrites++;
+        if (s->ncdwlog < 24) s->ncdwlog++;
+    }
+
+    switch (off) {
+    case 0x00u:
+    case 0x02u:
+        cdb_write_dtr(s, value);
+        return;
+    case 0x08u:                         /* HIRQ: write-to-clear */
+        if (getenv("SATURN_CDSEQ"))
+            printf("[hirq ack] keep=%04X had=%04X pc=%08X\n",
+                   value, s->cdb_reg[0x08 >> 1], WW_CORE(s)->pc);
+        s->cdb_reg[0x08 >> 1] &= value;
+        cdb_update_interrupts(s);
+        return;
+    case 0x0Cu:                         /* HIRQMASK */
+        s->cdb_reg[0x0C >> 1] = value;
+        if (getenv("SATURN_CDIRQ"))
+            printf("[hmsk] = %04X hirq=%04X pc=%08X cy=%llu\n",
+                   value, s->cdb_reg[0x08 >> 1], WW_CORE(s)->pc,
+                   (unsigned long long)s->master.cycles);
+        cdb_update_interrupts(s);
+        return;
+    case 0x18u:
+        s->cd.cmd_stage[0] = value;
+        s->cd.processing_cmd = 1;
+        return;
+    case 0x1Cu:
+        s->cd.cmd_stage[1] = value;
+        return;
+    case 0x20u:
+        s->cd.cmd_stage[2] = value;
+        return;
+    case 0x24u:
+        s->cd.cmd_stage[3] = value;
+        cdb_execute(s);
+        return;
+    default:
+        return;
+    }
+}
+
+static const char *trace_region_name(uint32_t a)
+{
+    uint32_t off;
+    a &= 0x07FFFFFFu;
+    if (cdb_reg_decode(a, &off))                         return "CD block";
+    if (a >= 0x00100000u && a < 0x00180000u)           return "SMPC";
+    if (a >= 0x01000000u && a < 0x01800000u)           return "MINIT";
+    if (a >= 0x01800000u && a < 0x02000000u)           return "SINIT";
+    if (a >= 0x02000000u && a < 0x05000000u)           return "A-Bus/cart";
+    if (a >= 0x05B00000u && a < 0x05C00000u)           return "SCSP";
+    if (a >= 0x05D00000u && a < 0x05D80000u)           return "VDP1 regs";
+    if (a >= 0x05F80000u && a < 0x05FC0000u)           return "VDP2 regs";
+    if (a >= 0x05FE0000u && a < 0x05FF0000u)           return "SCU";
+    return "unmapped";
+}
+
 
 /* ------------------------------------------- SH-2 on-chip peripherals ----
  * Bits 31-29 == 111 select the on-chip register file at 0xFFFFFE00-0xFFFFFFFF.
@@ -589,6 +747,10 @@ static void cache_addr_write(saturn *s, uint32_t a, uint32_t v)
     c->cache_tag[set][way] = (a >> 10) & 0x7FFFFu;
     c->cache_valid[set][way] = (uint8_t)((a >> 2) & 1u);
     c->cache_lru[set] = (uint8_t)((v >> 4) & 63u);
+    /* A sequential instruction fetch may have cached this line/way. Force
+     * its next access through the tag/LRU path so an explicit address-array
+     * write is externally visible before same-line fetches resume. */
+    c->if_cache_base = 1u;
 }
 
 static void cache_purge_all(sh2 *c)
@@ -610,7 +772,7 @@ const uint8_t *bus_page(saturn *s, uint32_t a)
 
 uint8_t bus_r8(saturn *s, uint32_t a)
 {
-    uint32_t b;
+    uint32_t b, cdoff;
     if (is_cache_purge(a)) {
         cache_purge_addr(s, a);
         return (a & 1u) ? 0x23u : 0x12u;
@@ -653,11 +815,17 @@ uint8_t bus_r8(saturn *s, uint32_t a)
         }
         return (uint8_t)(s->scu_reg[o] >> (8 * (3 - (b & 3))));
     }
-    /* Byte access to a 16-bit peripheral register reads the containing word
-     * and selects a half. Without this, every byte read of VDP1/VDP2/CD
-     * registers silently returns zero. */
-    if ((b >= 0x05890000u && b < 0x058A0000u) ||
-        (b >= 0x05D00000u && b < 0x05D80000u) ||
+    if (cdb_reg_decode(b, &cdoff)) {
+        /* The CD block is a 16-bit peripheral bus. Ymir dispatches byte I/O
+         * directly: an even register address returns the low byte of that
+         * register operation, while odd/unimplemented offsets return zero.
+         * Do not turn this into a word read plus byte selection: DATATRNS is a
+         * FIFO and that substitution changes side effects. */
+        return (uint8_t)cdb_reg_read(s, b, cdoff, 1);
+    }
+    /* VDP byte access reads the containing word and selects a half. CD byte
+     * access is handled above because its FIFO semantics are different. */
+    if ((b >= 0x05D00000u && b < 0x05D80000u) ||
         (b >= 0x05F80000u && b < 0x05FC0000u)) {
         uint16_t w = bus_r16(s, b & ~1u);
         return (uint8_t)((b & 1u) ? (w & 0xFF) : (w >> 8));
@@ -678,7 +846,7 @@ uint8_t bus_r8(saturn *s, uint32_t a)
 
 uint16_t bus_r16(saturn *s, uint32_t a)
 {
-    uint32_t b;
+    uint32_t b, cdoff;
     if (is_cache_purge(a)) {
         cache_purge_addr(s, a);
         return (a & 1u) ? 0x1223u : 0x2312u;
@@ -732,58 +900,8 @@ uint16_t bus_r16(saturn *s, uint32_t a)
         }
         return s->vdp2_reg[o];
     }
-    if (b >= 0x05800000u && b < 0x05890000u) {               /* CD, low   */
-        trace(s, b, 0, 2);
-        /* The data transfer window answers at 0x25818000 as well as
-         * 0x25898000; the game's literal pool references both. */
-        if (b >= 0x05818000u && b < 0x05820000u) return cdb_read_dtr(s);
-        return 0;
-    }
-    if (b >= 0x05890000u && b < 0x058A0000u) {               /* CD block  */
-        uint32_t o = ((b - 0x05890000u) & 0x3F) >> 1;
-        /* Read-watch: record which PCs poll a CD register, so a host that
-         * spins on CR1..CR4 can be traced back to its comparison. */
-        if (s->rwatch_addr && b == (s->rwatch_addr & 0x07FFFFFEu)) {
-            uint32_t pc = s->master.pr;   /* caller, not the reader */
-            int seen = 0;
-            for (int k = 0; k < s->nrwatch; k++)
-                if (s->rwatch[k].pc == pc) { s->rwatch[k].count++; seen = 1; break; }
-            if (!seen && s->nrwatch < 16) {
-                s->rwatch[s->nrwatch].pc = pc;
-                s->rwatch[s->nrwatch].count = 1;
-                s->nrwatch++;
-            }
-        }
-        cdb_periodic_maybe(s);
-        trace(s, b, 0, 2);
-        s->cd_read_pc = s->master.pc;   /* last CD read wins: the poll loop */
-        s->cd_read_addr = a;
-        if ((b & 0x3F) < 0x08) return cdb_read_dtr(s);       /* DTR window */
-        if ((b & 0x3F) == 0x18 && s->cd.boot_delay == 0) {
-            uint64_t snap = ((uint64_t)s->cdb_reg[0x18 >> 1] << 48) |
-                            ((uint64_t)s->cdb_reg[0x1C >> 1] << 32) |
-                            ((uint64_t)s->cdb_reg[0x20 >> 1] << 16) |
-                            ((uint64_t)s->cdb_reg[0x24 >> 1]);
-            if (s->cr_snap_valid && snap != s->cr_snap) s->cr_changes++;
-            s->cr_snap = snap; s->cr_snap_valid = 1;
-        }
-        if ((b & 0x3F) == 0x18) {
-            /* ring: keep the LAST 12, the early ones only ever show boot */
-            int k = (int)(s->cr1reads % 12);
-            s->cr2log[k].val = s->cdb_reg[o];
-            s->cr2log[k].pc  = s->master.pc;
-            s->cr1reads++;
-            if (s->ncr2log < 12) s->ncr2log++;
-        }
-        /* Reading CR4 completes the host's pickup of a command reply.
-         * Ymir ReadReg 0x24: this is also what clears processingCommand and
-         * arms the periodic report for the first time. */
-        if ((b & 0x3F) == 0x24) {
-            s->cd.resp_pending   = 0;
-            s->cd.processing_cmd = 0;
-        }
-        return s->cdb_reg[o];
-    }
+    if (cdb_reg_decode(b, &cdoff))
+        return cdb_reg_read(s, b, cdoff, 2);
     if (b >= 0x05FE0000u && b < 0x05FF0000u) {               /* SCU */
         uint32_t off = (b - 0x05FE0000u) & 0xFEu;
         uint32_t v;
@@ -866,7 +984,7 @@ static int prot_block(saturn *s, uint32_t a)
 void bus_w8(saturn *s, uint32_t a, uint8_t v)
 {
     if (prot_block(s, a)) return;
-    uint32_t b;
+    uint32_t b, cdoff;
     if (is_cache_purge(a)) { cache_purge_addr(s, a); return; }
     if (is_cache_addr(a)) { cache_addr_write(s, a, v); return; }
     if (is_cachearr(a)) { *cache_ptr(s, a) = v; return; }
@@ -923,15 +1041,23 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
     if (b >= 0x00100000u && b < 0x00180000u) {               /* SMPC */
         uint32_t o = (b - 0x00100000u) & 0x7F;
         trace(s, b, 1, 1);
-        s->smpc_reg[o] = v;
+        /* Let the command scheduler own COMREG so a rejected write cannot
+         * overwrite the command that is still in flight. */
         if (o == 0x1F) smpc_command(s, v);
+        else s->smpc_reg[o] = v;
         /* IREG0 mid-INTBACK is the continue/break handshake, not a
          * parameter write. */
         if (o == 0x01) smpc_ireg0_write(s, v);
         return;
     }
-    if ((b >= 0x05890000u && b < 0x058A0000u) ||
-        (b >= 0x05D00000u && b < 0x05D80000u) ||
+    if (cdb_reg_decode(b, &cdoff)) {
+        /* Direct byte dispatch is required for side-effectful CD registers.
+         * A read/modify/write consumes DATATRNS and acknowledges CR4 merely to
+         * write one byte, which is not what the peripheral bus does. */
+        cdb_reg_write(s, b, cdoff, v, 1);
+        return;
+    }
+    if ((b >= 0x05D00000u && b < 0x05D80000u) ||
         (b >= 0x05F80000u && b < 0x05FC0000u)) {
         uint32_t wa = b & ~1u;
         uint16_t w  = bus_r16(s, wa);
@@ -948,7 +1074,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
 void bus_w16(saturn *s, uint32_t a, uint16_t v)
 {
     if (prot_block(s, a)) return;
-    uint32_t b;
+    uint32_t b, cdoff;
     if (is_cache_purge(a)) { cache_purge_addr(s, a); return; }
     if (is_cache_addr(a)) { cache_addr_write(s, a, v); return; }
     if (is_cachearr(a)) {
@@ -1020,6 +1146,10 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
         s->vdp2_reg[o] = v;
         return;
     }
+    if (cdb_reg_decode(b, &cdoff)) {
+        cdb_reg_write(s, b, cdoff, v, 2);
+        return;
+    }
     if (b >= 0x05FE0080u && b < 0x05FE0090u) {               /* SCU DSP */
         uint32_t off = (b - 0x05FE0000u) & 0xFEu;
         trace(s, b, 1, 2);
@@ -1035,78 +1165,6 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
             }
         } else if (off == 0x8Au) {
             scu_dsp_write_reg(s, 0x88u, v & 0xFFu);
-        }
-        return;
-    }
-    if (b >= 0x05890000u && b < 0x058A0000u) {               /* CD block  */
-        uint32_t o = ((b - 0x05890000u) & 0x3F) >> 1;
-        trace(s, b, 1, 2);
-        {   /* ring: keep the LAST 24 CD writes, the early ones are just init */
-            int k = (int)(s->cdwrites % 24);
-            s->cdwlog[k].addr = b; s->cdwlog[k].val = v;
-            s->cdwlog[k].pc = s->master.pc;
-            s->cdwrites++;
-            if (s->ncdwlog < 24) s->ncdwlog++;
-        }
-        /* CD host interface, as used by the game's own driver:
-         *   writer 0x06068398 - CR1 at 0x25890018, CR4 at CR1+12 = the trigger
-         *   reader 0x060683B2 - reads CR1..CR4 and stores them at buffer+0/2/4/6
-         *
-         * NiGHTS passes 0x25890018 itself as that buffer, so the reader's
-         * stores land on 0x18/0x1A/0x1C/0x1E and the caller then reads its
-         * response struct straight back out of them. Those stores therefore
-         * have to be kept -- dropping them leaves the struct half empty and the
-         * caller uses the gap as a transfer length. Clobbering CR2 afterwards
-         * is harmless: the command has already executed.
-         *
-         * HIRQ is the exception: it is write-to-CLEAR, not a plain register. */
-        {
-            unsigned off = b & 0x3Fu;
-            if (off == 0x08 || off == 0x0A) {
-                if (getenv("SATURN_CDSEQ"))
-                    printf("[hirq ack] keep=%04X had=%04X pc=%08X\n",
-                           v, s->cdb_reg[0x08 >> 1], s->master.pc);
-                s->cdb_reg[0x08 >> 1] &= v;
-                /* Ymir WriteReg 0x08: clearing flags re-evaluates the line. */
-                cdb_update_interrupts(s);
-                return; }
-
-            /* HIRQMASK. This register had NO write handler at all: it
-             * fell through to the "scratch within the window" default
-             * below, so HMSK read 0 for the whole run and the test in
-             * cdb_update_interrupts() could never be true. The CD block
-             * interrupt (SCU external 00, vector 0x50, level 7) has
-             * therefore never been delivered once, in any title -- a
-             * driver that unmasks and then waits on DRDY/EHST/EFLS is
-             * stuck forever. Ymir WriteReg 0x0C: store, then
-             * UpdateInterrupts(). */
-            if (off == 0x0C || off == 0x0E) {
-                s->cdb_reg[0x0C >> 1] = v;
-                if (getenv("SATURN_CDIRQ"))
-                    printf("[hmsk] = %04X hirq=%04X pc=%08X cy=%llu\n",
-                           v, s->cdb_reg[0x08 >> 1], s->master.pc,
-                           (unsigned long long)s->master.cycles);
-                cdb_update_interrupts(s);
-                return;
-            }
-
-            /* CR1..CR4 behave as response latches: a host write stages a
-             * command word, it does not disturb the response the host is
-             * about to read back. That distinction matters here because the
-             * game's response reader is sometimes handed 0x25890018 as its
-             * destination buffer, so it stores CR values straight back over
-             * the register window -- and a plain register file would let that
-             * overwrite CR2 with CR3 before the caller reads its length. */
-            switch (off) {
-            /* Ymir WriteReg 0x18: writing CR1 marks a command in progress,
-             * which suppresses the unsolicited periodic drive report until
-             * the host has read the reply back out of CR4. */
-            case 0x18: s->cd.cmd_stage[0] = v; s->cd.processing_cmd = 1; return;
-            case 0x1C: s->cd.cmd_stage[1] = v; return;
-            case 0x20: s->cd.cmd_stage[2] = v; return;
-            case 0x24: s->cd.cmd_stage[3] = v; cdb_execute(s); return;
-            default:   return;    /* scratch within the window */
-            }
         }
         return;
     }
@@ -1256,28 +1314,10 @@ void saturn_init(saturn *s)
 
 void saturn_report_trace(saturn *s, FILE *out)
 {
-    static const struct { uint32_t lo, hi; const char *name; } regions[] = {
-        { 0x00100000, 0x00180000, "SMPC"      },
-        { 0x01000000, 0x01000004, "MINIT"     },
-        { 0x01800000, 0x01800004, "SINIT"     },
-        { 0x02000000, 0x04000000, "A-Bus/cart"},
-        { 0x05890000, 0x058A0000, "CD block"  },
-        { 0x05B00000, 0x05C00000, "SCSP"      },
-        { 0x05D00000, 0x05D80000, "VDP1 regs" },
-        { 0x05F80000, 0x05FC0000, "VDP2 regs" },
-        { 0x05FE0000, 0x05FF0000, "SCU"       },
-        { 0, 0, NULL }
-    };
-
     fprintf(out, "\nperipheral accesses (first %d distinct, in order seen)\n", TRACE_SLOTS);
     fprintf(out, "%-10s %-3s %-3s %-9s %s\n", "ADDRESS", "R/W", "SZ", "COUNT", "REGION");
     for (int i = 0; i < s->ntrace; i++) {
-        const char *rn = "unmapped";
-        for (int j = 0; regions[j].name; j++)
-            if (s->trace[i].addr >= regions[j].lo && s->trace[i].addr < regions[j].hi) {
-                rn = regions[j].name;
-                break;
-            }
+        const char *rn = trace_region_name(s->trace[i].addr);
         fprintf(out, "0x%08X %-3s %-3u %-9u %s\n",
                 s->trace[i].addr, s->trace[i].is_write ? "W" : "R",
                 s->trace[i].size, s->trace[i].count, rn);
@@ -1573,6 +1613,12 @@ void frt_write8(sh2 *c, uint32_t off, uint8_t v)
         c->onchip[o] = v;
         return;
     case 0xFE92u: /* CCR: cache enable/mode and write-one cache purge. */
+        if (getenv("SATURN_CACHELOG"))
+            fprintf(stderr,
+                    "[cache-ccr] %s %02X -> %02X pc=%08X pr=%08X clk=%llu\n",
+                    c->is_slave ? "slave" : "master", c->onchip[o], v,
+                    c->pc, c->pr,
+                    (unsigned long long)(c->sys ? c->sys->clk : c->cycles));
         if (v & 0x10u) cache_purge_all(c);
         /* CP self-clears; bit 5 is reserved and reads zero. */
         c->onchip[o] = (uint8_t)(v & 0xCFu);
@@ -1896,7 +1942,13 @@ uint64_t saturn_run_line(saturn *s)
         frt_advance(&s->master, n);
         if (s->slave_started) frt_advance(&s->slave, n);
         scu_dsp_tick(s, n);
-        vdp1_tick(s, n);
+        if (profiling()) {
+            uint64_t tv1 = __rdtsc();
+            vdp1_tick(s, n);
+            s->prof_vdp1 += __rdtsc() - tv1;
+        } else {
+            vdp1_tick(s, n);
+        }
         if (s->line == 0 && !field_change && pos >= 128u) {
             field_change = 1;
             vdp1_field_change(s);

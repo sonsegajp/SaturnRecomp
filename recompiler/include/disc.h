@@ -80,6 +80,10 @@ typedef struct {
     char      path[256];
     uint32_t  lba;
     uint32_t  size;
+    uint8_t   unit_size;     /* ISO9660 file unit size                  */
+    uint8_t   gap_size;      /* ISO9660 interleave gap size             */
+    uint8_t   file_num;      /* XA system-use file number (0 for MODE1) */
+    uint8_t   attributes;    /* CD block file-info attribute byte       */
     int       is_dir;
     int       readable;   /* 1 = MODE1/2 data sectors, 2 = raw audio-track  */
     int       in_audio;   /* stored in a CD-DA track as raw 2352-byte sectors */

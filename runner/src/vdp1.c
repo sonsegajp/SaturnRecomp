@@ -18,6 +18,7 @@
  * a triangle rasteriser would not.
  */
 #include "saturn.h"
+#include "vulkan_renderer.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -67,6 +68,37 @@ static struct {
     uint64_t wait;
     int active;
 } async_v1;
+
+/* Optional window-renderer sink. Keeping the binding here means every core
+ * and raster unit test continues to build without Vulkan. There is one Saturn
+ * per process today, matching async_v1's existing lifetime. */
+static struct {
+    saturn *s;
+    saturn_vdp1_gpu_sink sink;
+} gpu_v1;
+
+void vdp1_gpu_bind(saturn *s, const saturn_vdp1_gpu_sink *sink)
+{
+    if (!sink) {
+        if (!s || gpu_v1.s == s) memset(&gpu_v1, 0, sizeof gpu_v1);
+        return;
+    }
+    gpu_v1.s = s;
+    gpu_v1.sink = *sink;
+}
+
+int vdp1_gpu_is_bound(const saturn *s)
+{
+    return gpu_v1.s == s && gpu_v1.sink.enqueue != NULL;
+}
+
+static int gpu_emit(vctx *c, const saturn_vk_vdp1_op *op)
+{
+    /* Interpolation deliberately renders into private CPU buffers and must
+     * never become a real hardware draw. */
+    if (c->s->vdp1_fb_override || !vdp1_gpu_is_bound(c->s)) return 0;
+    return gpu_v1.sink.enqueue(gpu_v1.sink.userdata, op);
+}
 
 static void vctx_init(vctx *c, saturn *s)
 {
@@ -450,9 +482,28 @@ static void put(vctx *c, int32_t x, int32_t y, uint16_t colour, uint16_t pmod)
     c->pixels++;
 }
 
+/* The overwhelmingly common game path is an ordinary replace-mode pixel:
+ * no user clipping, mesh, shadow, half-luminance or transparency blend. Keep
+ * the exact bounds/system-clip checks and framebuffer effects, but select this
+ * path once per command instead of re-decoding CMDPMOD for every pixel. */
+static inline void put_replace(vctx *c, int32_t x, int32_t y, uint16_t colour)
+{
+    uint32_t o;
+
+    if ((uint32_t)x >= FB_W || (uint32_t)y >= FB_H) return;
+    if (x > c->sys_x1 || y > c->sys_y1) return;
+
+    o = ((uint32_t)y * FB_W + (uint32_t)x) * 2u;
+    pixprobe(c, x, y, colour);
+    c->fb[o]     = (uint8_t)(colour >> 8);
+    c->fb[o + 1] = (uint8_t)colour;
+    c->meshfb[o] = c->meshfb[o + 1] = 0;
+    c->pixels++;
+}
+
 /* Resolve one texel to an RGB555 value. Returns 0 if the texel is transparent. */
-static uint16_t texel(vctx *c, uint32_t chr, uint32_t tx, uint32_t tw,
-                      uint32_t ty, uint16_t colr, uint16_t pmod, int *transparent)
+static uint16_t texel(vctx *c, uint32_t chr, uint32_t texpos, uint32_t tx,
+                      uint16_t colr, uint16_t pmod, int *transparent)
 {
     saturn *s = c->s;
     /* CMDPMOD: colour mode is bits 5-3; bits 2-0 are the colour-calculation
@@ -478,7 +529,7 @@ static uint16_t texel(vctx *c, uint32_t chr, uint32_t tx, uint32_t tw,
                * holds the PALETTE CODE (CMDCOLR + index) untouched; VDP2's
                * sprite-type decode does the rest. */
     case 1: { /* 16 colour, lookup table */
-        uint32_t byte = chr + (ty * tw + tx) / 2u;
+        uint32_t byte = chr + texpos / 2u;
         uint8_t  b    = s->vdp1_vram[byte & (VDP1_VRAM_SZ - 1)];
         idx = (tx & 1) ? (b & 0x0F) : (b >> 4);
         /* END CODE. Per colour mode the all-ones value terminates the texture
@@ -509,7 +560,7 @@ static uint16_t texel(vctx *c, uint32_t chr, uint32_t tx, uint32_t tw,
     case 4: { /* 256 colour */
         static const uint16_t bankmask[3] = { 0xFFC0u, 0xFF80u, 0xFF00u };
         static const uint16_t idxmask[3]  = { 0x003Fu, 0x007Fu, 0x00FFu };
-        uint32_t byte = chr + ty * tw + tx;
+        uint32_t byte = chr + texpos;
         idx = s->vdp1_vram[byte & (VDP1_VRAM_SZ - 1)];
         if (idx == 0xFFu && !ecd) { *transparent = 1; return 0; }   /* end code */
         if (idx == 0 && !spd) { *transparent = 1; return 0; }
@@ -517,7 +568,7 @@ static uint16_t texel(vctx *c, uint32_t chr, uint32_t tx, uint32_t tw,
         break;
     }
     default: { /* 5: RGB555 direct */
-        uint32_t byte = chr + (ty * tw + tx) * 2u;
+        uint32_t byte = chr + texpos * 2u;
         v = vram16(s, byte);
         if (v == 0x7FFFu && !ecd) { *transparent = 1; return 0; }   /* end code */
         if (!(v & 0x8000u) && !spd) { *transparent = 1; return 0; }
@@ -593,12 +644,12 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
     int32_t d1 = abs(se13(xd - xa)), d2 = abs(se13(yd - ya));
     int32_t d3 = abs(se13(xc - xb)), d4 = abs(se13(yc - yb));
     int32_t steps = d1;
-    texstep tu, tv;
     edgestep eL, eR;
     /* Gouraud is CMDPMOD BIT 2, not the value 4: bits 1-0 carry half-luminance
      * and half-transparency alongside it, so 5, 6 and 7 are gouraud too and
      * were all falling through unshaded. */
     int use_g = (pmod & 4u) != 0;
+    int fast_replace = (pmod & 0x0503u) == 0;
 
     if (d2 > steps) steps = d2;
     if (d3 > steps) steps = d3;
@@ -611,11 +662,32 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
     steps &= 0xFFF;
     if (steps <= 0) steps = 1;
 
-    /* Vertical texture DDA runs once down the quad, one step per row. */
-    if (textured && th > 0)
-        ts_setup(&tv, steps + 1,
-                 (flip & 2u) ? (int32_t)th - 1 : 0,
-                 (flip & 2u) ? 0 : (int32_t)th - 1);
+    /* In Vulkan mode the command walker still resolves coordinates and
+     * register state at the hardware-visible instant, but the CPU never
+     * enters the pixel loops below. The compute renderer consumes these in
+     * exact submission order and keeps both Saturn framebuffers persistent. */
+    {
+        saturn_vk_vdp1_op op;
+        memset(&op, 0, sizeof op);
+        op.kind = SATURN_VK_VDP1_QUAD;
+        op.target = (uint32_t)c->s->fb_draw;
+        op.xy[0] = xa; op.xy[1] = ya; op.xy[2] = xb; op.xy[3] = yb;
+        op.xy[4] = xc; op.xy[5] = yc; op.xy[6] = xd; op.xy[7] = yd;
+        op.chr = chr; op.tw = tw; op.th = th;
+        op.colr = colr; op.pmod = pmod; op.grda = grda;
+        op.flat = flat; op.textured = (uint32_t)textured; op.flip = flip;
+        op.sys_x1 = c->sys_x1; op.sys_y1 = c->sys_y1;
+        op.usr_x0 = c->usr_x0; op.usr_y0 = c->usr_y0;
+        op.usr_x1 = c->usr_x1; op.usr_y1 = c->usr_y1;
+        if (gpu_emit(c, &op)) {
+            int32_t top = abs(xb - xa), bottom = abs(xc - xd);
+            int32_t side = abs(yb - ya);
+            if (abs(yc - yd) > side) side = abs(yc - yd);
+            if (bottom > top) top = bottom;
+            c->pixels += (uint32_t)((top + 1) * (side + 1));
+            return;
+        }
+    }
 
     /* Left edge A->D, right edge B->C, both walked over `steps` increments. */
     edge_setup(&eL, xa, ya, xd, yd, steps);
@@ -627,11 +699,6 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
         rx = eR.x; ry = eR.y;
         edge_step(&eL);
         edge_step(&eR);
-        /* Advance the vertical texture DDA AFTER this row has been drawn, so
-         * row 0 samples texel `start`. Advancing first skipped texel 0 and ran
-         * one texel past the end, which showed up as noise on 4bpp textures. */
-        if (textured && th > 0) ts_advance(&tv);
-
         int32_t sd = abs(rx - lx);
         int32_t sv = abs(ry - ly);
         int32_t n  = sd > sv ? sd : sv;
@@ -645,12 +712,22 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
          * pixel; its return value is the anti-alias flag for THAT pixel. */
         int aa = line_step(&ln);
 
-        /* Horizontal texture DDA is set up fresh for every row, because the
-         * span length changes as the quad narrows. */
-        if (textured && tw > 0)
-            ts_setup(&tu, n + 1,
-                     (flip & 1u) ? (int32_t)tw - 1 : 0,
-                     (flip & 1u) ? 0 : (int32_t)tw - 1);
+        /* These are exactly the old integer mappings, expressed as a
+         * quotient/remainder sequence. `ty` is invariant across this row;
+         * `tx_base` advances so iteration j is floor(j*tw/(n+1)). This removes
+         * two 64-bit divides from every textured pixel without changing a
+         * sampled texel or any raster geometry. */
+        uint32_t ty = 0, row_texel = 0;
+        uint32_t tx_base = 0, tx_q = 0, tx_r = 0, tx_acc = 0;
+        uint32_t tx_den = (uint32_t)n + 1u;
+        if (textured) {
+            ty = (uint32_t)((int64_t)i * (int64_t)th / (steps + 1));
+            if (flip & 2u) ty = th - 1u - ty;
+            if (ty >= th) ty = th - 1u;
+            row_texel = ty * tw;
+            tx_q = tw / tx_den;
+            tx_r = tw % tx_den;
+        }
 
         for (int32_t j = 0; j <= n; j++) {
             /* Ymir masks the plotted coordinate to 11 bits (LineStepper::X/Y). */
@@ -664,7 +741,7 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
             uint16_t col = flat;
             aa = line_step(&ln);        /* flag belongs to the NEXT pixel */
             int transparent = 0;
-            uint32_t tx = 0, ty = 0;
+            uint32_t tx = 0;
 
             /* NOTE: the Ymir TextureStepper DDA (ts_setup/ts_advance above) is
              * NOT used here yet. Ported naively it failed tests/vdp1_quad
@@ -675,20 +752,28 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
              * direct mapping, which is less accurate but correct at the
              * endpoints. */
             if (textured) {
-                tx = (uint32_t)((int64_t)j * (int64_t)tw / (n + 1));
-                ty = (uint32_t)((int64_t)i * (int64_t)th / (steps + 1));
+                tx = tx_base;
+                tx_base += tx_q;
+                tx_acc += tx_r;
+                if (tx_acc >= tx_den) {
+                    tx_base++;
+                    tx_acc -= tx_den;
+                }
                 if (flip & 1u) tx = tw - 1 - tx;
-                if (flip & 2u) ty = th - 1 - ty;
                 if (tx >= tw) tx = tw - 1;
-                if (ty >= th) ty = th - 1;
-                col = texel(c, chr, tx, tw, ty, colr, pmod, &transparent);
+                col = texel(c, chr, row_texel + tx, tx,
+                            colr, pmod, &transparent);
                 if (transparent) continue;
             }
             col = shade(c, col, grda, use_g, j, i, n, steps);
-            put(c, px, py, col, pmod);
+            if (fast_replace) put_replace(c, px, py, col);
+            else              put(c, px, py, col, pmod);
             /* Ymir: `if (aa) VDP1PlotPixel(line.AACoord(), ...)` with the same
              * pixel parameters. This is the pixel that fills the staircase. */
-            if (aa_now) put(c, apx, apy, col, pmod);
+            if (aa_now) {
+                if (fast_replace) put_replace(c, apx, apy, col);
+                else              put(c, apx, apy, col, pmod);
+            }
         }
     }
 }
@@ -1025,6 +1110,22 @@ void vdp1_execute(saturn *s)
                     int32_t n = dx > dy ? dx : dy;
                     if (n <= 0) n = 1;
                     if (n > 4096) n = 4096;
+                    {
+                        saturn_vk_vdp1_op op;
+                        memset(&op, 0, sizeof op);
+                        op.kind = SATURN_VK_VDP1_LINE;
+                        op.target = (uint32_t)s->fb_draw;
+                        op.xy[0] = x0; op.xy[1] = y0;
+                        op.xy[2] = x1; op.xy[3] = y1;
+                        op.colr = colr; op.pmod = pmod;
+                        op.sys_x1 = c.sys_x1; op.sys_y1 = c.sys_y1;
+                        op.usr_x0 = c.usr_x0; op.usr_y0 = c.usr_y0;
+                        op.usr_x1 = c.usr_x1; op.usr_y1 = c.usr_y1;
+                        if (gpu_emit(&c, &op)) {
+                            c.pixels += (uint32_t)n + 1u;
+                            continue;
+                        }
+                    }
                     for (int32_t t = 0; t <= n; t++)
                         put(&c, x0 + (x1 - x0) * t / n, y0 + (y1 - y0) * t / n,
                             colr, pmod);
@@ -1270,6 +1371,8 @@ void vdp1_soft_reset(saturn *s)
     s->vdp1_show_interp = 0;
     s->vdp1_interp_ready = 0;
     if (async_v1.s == s) async_v1.active = 0;
+    if (gpu_v1.s == s && gpu_v1.sink.reset)
+        gpu_v1.sink.reset(gpu_v1.sink.userdata);
 }
 
 /* Ymir vdp.cpp VDP1SwapFramebuffer. LOPR/BEF are the previous frame's COPR/CEF
@@ -1331,6 +1434,24 @@ void vdp1_erase(saturn *s)
     uint32_t x1 = s->vdp1_ew_x1, x3 = s->vdp1_ew_x3;
     uint32_t y1 = s->vdp1_ew_y1, y3 = s->vdp1_ew_y3;
     uint32_t x, y;
+
+    if (vdp1_gpu_is_bound(s)) {
+        saturn_vk_vdp1_op op;
+        memset(&op, 0, sizeof op);
+        op.kind = SATURN_VK_VDP1_ERASE;
+        op.target = (uint32_t)(s->fb_draw ^ 1);
+        op.flat = s->vdp1_ew_val;
+        if (x3 <= x1 || y3 < y1) {
+            op.xy[0] = 0; op.xy[1] = 0;
+            op.xy[2] = FB_W; op.xy[3] = FB_H - 1;
+        } else {
+            if (x3 > FB_W) x3 = FB_W;
+            if (y3 > FB_H - 1) y3 = FB_H - 1;
+            op.xy[0] = (int32_t)x1; op.xy[1] = (int32_t)y1;
+            op.xy[2] = (int32_t)x3; op.xy[3] = (int32_t)y3;
+        }
+        if (gpu_v1.sink.enqueue(gpu_v1.sink.userdata, &op)) return;
+    }
 
     /* Nothing latched yet (before the first swap): a full clear is what the
      * machine looks like out of reset. */

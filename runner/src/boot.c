@@ -118,9 +118,6 @@ int main(int argc, char **argv)
     if (gc_load(&g, toml) != 0) { fprintf(stderr, "error: %s\n", g.err); return 1; }
     if (disc_open(&d, g.disc) != 0) { fprintf(stderr, "error: %s\n", d.err); return 1; }
     if (ip_read(&d, &ip) != 0) { fprintf(stderr, "error: not a Saturn disc\n"); return 1; }
-    s->area_code = getenv("SATURN_AREA")
-                 ? (uint8_t)strtoul(getenv("SATURN_AREA"), NULL, 0)
-                 : saturn_area_from_ip(ip.area);
     if (iso_read(&d, &fs) != 0) { fprintf(stderr, "error: %s\n", d.err); return 1; }
 
     printf("=== %s ===\n", g.name);
@@ -165,6 +162,11 @@ int main(int argc, char **argv)
         }
     }
     saturn_init(s);
+    /* saturn_init clears the whole machine, including the console-area latch.
+     * Select the region afterwards so the BIOS sees the disc's real region. */
+    s->area_code = getenv("SATURN_AREA")
+                 ? (uint8_t)strtoul(getenv("SATURN_AREA"), NULL, 0)
+                 : saturn_area_from_ip(ip.area);
     s->irq_clobber_reg = -1;
     cdb_init(s, &d, &fs);
     if (getenv("SATURN_DTRFILL")) s->dtr_fill = 1;
@@ -1085,19 +1087,26 @@ int main(int argc, char **argv)
                        (unsigned long long)g_capture_count[1]);
             }
             if (getenv("SATURN_CACHELOG")) {
-                sh2 *cc = &s->slave;
-                printf("slave instruction cache: CCR=%02X\n", cc->onchip[0x92]);
-                for (unsigned set = 0; set < 64; set++) {
-                    for (unsigned way = 0; way < 4; way++) {
-                        uint32_t a;
-                        uint8_t *line;
-                        if (!cc->cache_valid[set][way]) continue;
-                        a = (cc->cache_tag[set][way] << 10) | (set << 4);
-                        if (a < 0x06060000u || a >= 0x06080000u) continue;
-                        line = &cc->cache_data[(way << 10) | (set << 4)];
-                        printf("  %08X way%u:", a, way);
-                        for (unsigned k = 0; k < 16; k++) printf(" %02X", line[k]);
-                        putchar('\n');
+                for (unsigned core = 0; core < 2; core++) {
+                    sh2 *cc = core ? &s->slave : &s->master;
+                    unsigned valid = 0;
+                    for (unsigned set = 0; set < 64; set++)
+                        for (unsigned way = 0; way < 4; way++)
+                            valid += cc->cache_valid[set][way] != 0;
+                    printf("%s instruction cache: CCR=%02X, %u valid lines\n",
+                           core ? "slave" : "master", cc->onchip[0x92], valid);
+                    for (unsigned set = 0; set < 64; set++) {
+                        for (unsigned way = 0; way < 4; way++) {
+                            uint32_t a;
+                            uint8_t *line;
+                            if (!cc->cache_valid[set][way]) continue;
+                            a = (cc->cache_tag[set][way] << 10) | (set << 4);
+                            if (a < 0x06060000u || a >= 0x06080000u) continue;
+                            line = &cc->cache_data[(way << 10) | (set << 4)];
+                            printf("  %08X way%u:", a, way);
+                            for (unsigned k = 0; k < 16; k++) printf(" %02X", line[k]);
+                            putchar('\n');
+                        }
                     }
                 }
             }

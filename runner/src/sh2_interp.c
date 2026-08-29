@@ -23,6 +23,8 @@
 /* Shared by the reference and optimized interpreter paths so a diagnostic
  * transition between them cannot emit two "first" captures. */
 static int slave_low_reset_reported;
+static int slave_reset_trace = -1;
+static int slave_bios_trace = -1;
 
 static void fault(sh2 *c, const char *why)
 {
@@ -254,8 +256,15 @@ static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
     if (c->if_cache_base == base) {
         way = c->if_cache_way;
         if (way < 4u && c->cache_valid[set][way] &&
-            c->cache_tag[set][way] == tag)
-            goto hit;
+            c->cache_tag[set][way] == tag) {
+            /* Re-touching the same way is idempotent, and no ordinary memory
+             * access mutates the SH-2 cache LRU state. Guest writes through
+             * the cache address array invalidate if_cache_base in bus.c, so
+             * this shortcut still observes explicit LRU/tag changes. */
+            line = &c->cache_data[(way << 10) | (set << 4)];
+            return (uint16_t)((line[pc & 0xEu] << 8) |
+                              line[(pc & 0xEu) + 1u]);
+        }
     }
 
     for (way = 0; way < 4; way++) {
@@ -797,8 +806,10 @@ int sh2_step(sh2 *c)
      * E0000000 BRAF land in the I/O partition.  Capture the control path at
      * that first low-alias re-entry, before the BIOS cache-clear loop washes
      * it out of the rolling ring. */
+    if (slave_reset_trace < 0)
+        slave_reset_trace = getenv("SATURN_SLAVERESET") != NULL;
     if (c->is_slave && pc < BIOS_SIZE && c->cycles > 100000000u &&
-        getenv("SATURN_SLAVERESET")) {
+        slave_reset_trace) {
         if (!slave_low_reset_reported) {
             uint32_t n = s->sring_head < 48u ? s->sring_head : 48u;
             slave_low_reset_reported = 1;
@@ -1579,6 +1590,10 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
      * so the disabled trace still throttled the runtime to a few FPS. */
     if (movwtrace_on < 0)
         movwtrace_on = getenv("SATURN_MOVWTRACE") != NULL;
+    if (slave_reset_trace < 0)
+        slave_reset_trace = getenv("SATURN_SLAVERESET") != NULL;
+    if (slave_bios_trace < 0)
+        slave_bios_trace = getenv("SATURN_SLAVEBIOS") != NULL;
     if (!cov_armed) cov_init_env();
     s->cur = c;
 
@@ -1616,6 +1631,25 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
     while (c->cycles < target && !c->halted) {
         if (c->sleeping) {
             uint64_t idle;
+            /* A completed SMPC clock change is an NMI edge, but it is kept
+             * as an explicit machine event until sh2_step() builds the NMI
+             * frame.  It is therefore not visible to take_interrupt().  The
+             * bulk-idle path used to skip sh2_step forever when the BIOS was
+             * already asleep at 0x52E: the SMPC completed, pending_ckchg
+             * became 2, and the master consumed every later slice as idle.
+             * NiGHTS (and any title changing dot clock) then displayed black
+             * forever even though the completion event had arrived.
+             *
+             * Consume that event before deciding the core has nothing that
+             * can wake it.  sh2_step owns the exact NMI stack/vector sequence
+             * and clears sleeping; keeping it in one place avoids a second,
+             * subtly different interrupt implementation here. */
+            if (c == &s->master && s->pending_ckchg == 2) {
+                int k = sh2_step(c);
+                if (!k) break;
+                done += (uint64_t)k;
+                continue;
+            }
             take_interrupt(c);
             if (c->sleeping) {
                 /* No interrupt can appear until the scheduler advances the
@@ -1632,7 +1666,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
          * ahead of the inline decoder so tracing it does not require turning
          * the optimized interpreter off for the entire boot. */
         if (c->is_slave && c->pc < BIOS_SIZE && c->cycles > 100000000u &&
-            getenv("SATURN_SLAVERESET")) {
+            slave_reset_trace) {
             if (!slave_low_reset_reported) {
                 uint32_t count = s->sring_head < 48u ? s->sring_head : 48u;
                 slave_low_reset_reported = 1;
@@ -1645,7 +1679,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                 mem_dump_at(s, 1);
             }
         }
-        if (c->is_slave && c->pc < BIOS_SIZE && getenv("SATURN_SLAVEBIOS")) {
+        if (c->is_slave && c->pc < BIOS_SIZE && slave_bios_trace) {
             static int reported;
             if (!reported) {
                 uint32_t count = s->sring_head < 24u ? s->sring_head : 24u;
@@ -1677,6 +1711,28 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                            (!(s->scu_ipend >> 16) || (m & 0x10000u));
             }
             if (may_fast) {
+                /* The slave BIOS waits between jobs in this exact guarded
+                 * DT/BF loop.  Fold only taken iterations that fit inside the
+                 * current scheduler slice, after the interrupt gate above has
+                 * proved no event is pending.  Leave the final iteration to
+                 * the normal path so T and the mailbox fall-through remain
+                 * exact.  Disable folding when diagnostics need every PC. */
+                if (c->is_slave && !dbg.rings && cov_armed <= 0 && !op_on &&
+                    c->pc == 0x00000240u && R[0] > 1u &&
+                    ifetch(s, c, 0x00000240u) == 0x4010u &&
+                    ifetch(s, c, 0x00000242u) == 0x8BFDu) {
+                    uint64_t pairs = (target - c->cycles) / 4u;
+                    if (pairs > (uint64_t)R[0] - 1u)
+                        pairs = (uint64_t)R[0] - 1u;
+                    if (pairs) {
+                        R[0] -= (uint32_t)pairs;
+                        c->sr &= ~SR_T;
+                        c->cycles += pairs * 4u;
+                        done += pairs * 2u;
+                        s->fastpath_hits += pairs * 2u;
+                        continue;
+                    }
+                }
                 uint32_t pc = c->pc;
                 uint16_t op = ifetch(s, c, pc);
                 int handled;

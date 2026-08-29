@@ -18,7 +18,7 @@
 
 /* SH-2 cycles per SCSP output sample, in 16.16 fixed point.
  * 28,636,360 / 44,100 = 649.35... */
-#define SH2_PER_SAMPLE_FP  ((uint64_t)(649.351 * 65536.0))
+#define SH2_PER_SAMPLE_FP  (((uint64_t)MASTER_CLOCK_NTSC << 16) / 44100u)
 
 /* The 68000 gets 11.2896/28.63636 of the master's cycles. Reduced by 40 so
  * the accumulator stays compact without throwing away fractional clocks. */

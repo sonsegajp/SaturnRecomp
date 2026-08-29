@@ -422,6 +422,7 @@ static void iso_walk(disc *d, iso_fs *fs, uint32_t lba, uint32_t len, const char
 
         if (!(nlen == 1 && (dir[o + 33] == 0 || dir[o + 33] == 1))) {
             char name[256];
+            uint32_t su_off, su_len;
             size_t cn = nlen < sizeof(name) - 1 ? nlen : sizeof(name) - 1;
             memcpy(name, dir + o + 33, cn);
             name[cn] = 0;
@@ -432,6 +433,20 @@ static void iso_walk(disc *d, iso_fs *fs, uint32_t lba, uint32_t len, const char
             e.lba    = ext;
             e.size   = size;
             e.is_dir = (flags & 2) ? 1 : 0;
+            e.unit_size  = dir[o + 26];
+            e.gap_size   = dir[o + 27];
+            e.attributes = (uint8_t)(flags & 0x02);
+
+            /* The CD block record carries the XA file number, not the ISO
+             * directory index.  Ordinary MODE1 records have no XA system-use
+             * data and therefore retain file_num=0 from the memset above. */
+            su_off = 33u + ((uint32_t)nlen | 1u);
+            su_len = rlen > su_off ? (uint32_t)rlen - su_off : 0;
+            if (su_len >= 14u && dir[o + su_off + 6] == 'X' &&
+                                  dir[o + su_off + 7] == 'A') {
+                e.attributes |= (uint8_t)(dir[o + su_off + 4] & 0xF8);
+                e.file_num = dir[o + su_off + 8];
+            }
             iso_push(fs, &e);
 
             if (e.is_dir)
