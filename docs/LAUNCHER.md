@@ -4,6 +4,15 @@ SaturnRecomp's launcher is a native desktop application built with PySide6 and
 Qt Widgets. The game library, search, import queue, settings, and file pickers
 run directly in the application. No browser or WebView2 installation is needed.
 
+## Screenshots
+
+![SaturnRecomp native game library with selected-game controls](images/launcher-library.png)
+
+[Compact window](images/launcher-compact.png) · [Keyboard and controller controls](images/launcher-controls.png)
+
+Cover art shown belongs to its respective owners. These interface previews do
+not establish game compatibility; game files and assets are supplied locally.
+
 ## Build and open the launcher
 
 The launcher currently targets 64-bit Windows. To build it, install Python 3.10
@@ -140,7 +149,8 @@ reporting the problem. Compatibility testing remains incomplete.
 Optional box art uses IGDB through existing local Odyssey credentials in
 `%APPDATA%/Odyssey/config.json`, with `~/Odyssey/odyssey/customize.py` as a
 fallback. Without those credentials, games still import and play with placeholder
-covers. No credentials or game artwork are distributed with SaturnRecomp.
+covers. Credentials and game artwork are not bundled with the application;
+the documentation screenshots show example covers.
 
 ## Execution status
 

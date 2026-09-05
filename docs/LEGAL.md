@@ -1,6 +1,6 @@
 # Firmware, game data, and release policy
 
-SaturnRecomp's public repository is source-only. It may contain original runtime/recompiler source, generic tests, documentation, configuration templates, and project-created branding.
+SaturnRecomp's public repository distributes source and documentation. It may contain original runtime/recompiler source, generic tests, documentation, configuration templates, project-created branding, and the launcher UI screenshots listed below.
 
 It must not contain:
 
@@ -8,10 +8,20 @@ It must not contain:
 - ROMs, CUE/BIN/ISO/CHD images, CD audio, or extracted files.
 - Generated/recompiled/decompiled game code or game-specific binary modules.
 - Save RAM, SMPC persistence, memory/state dumps, or crash dumps containing guest memory.
-- Game screenshots, video, music, voice, textures, models, or other copyrighted assets.
+- In-game screenshots, video, music, voice, textures, models, or standalone game assets.
 - Private paths, credentials, tokens, or local development workspaces.
 
 The release audit enforces these categories by path and extension. It cannot determine whether an innocently named source file contains copied proprietary code, so contributors must also review content and provenance.
+
+## Launcher documentation screenshots
+
+These launcher UI screenshots are explicitly approved for publication in this repository:
+
+- `docs/images/launcher-library.png`
+- `docs/images/launcher-compact.png`
+- `docs/images/launcher-controls.png`
+
+Cover art visible in these pictures belongs to its respective owners. The pictures illustrate the launcher interface; they do not establish game compatibility or supply playable game data. This documentation exception does not permit publishing firmware, disc images, extracted game assets, or standalone cover-art collections.
 
 ## Local-only workflow
 

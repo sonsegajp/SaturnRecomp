@@ -30,7 +30,12 @@ foreach ($name in $forbiddenExact) {
     }
 }
 
-$allowedPng = 'assets/saturnrecomp-logo.png'
+$allowedPng = @(
+    'assets/saturnrecomp-logo.png',
+    'docs/images/launcher-library.png',
+    'docs/images/launcher-compact.png',
+    'docs/images/launcher-controls.png'
+)
 $forbiddenExtensions = @(
     '.bin', '.cue', '.iso', '.chd', '.raw', '.wav', '.exe', '.dll',
     '.o', '.obj', '.pdb', '.state', '.dmp', '.zip', '.7z'
@@ -42,8 +47,8 @@ Get-ChildItem -LiteralPath $root -Recurse -Force -File | ForEach-Object {
     if ($forbiddenExtensions -contains $ext) {
         $fail.Add("forbidden binary/media extension: $relative")
     }
-    if ($ext -eq '.png' -and $relative -ne $allowedPng) {
-        $fail.Add("unapproved PNG (game imagery is not releasable): $relative")
+    if ($ext -eq '.png' -and $allowedPng -notcontains $relative) {
+        $fail.Add("unapproved PNG (only named branding and launcher screenshots are allowed): $relative")
     }
     if ($relative -match '^games/(?!_template/)') {
         $fail.Add("game-specific directory: $relative")

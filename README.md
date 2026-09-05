@@ -6,11 +6,15 @@
 
 SaturnRecomp is an experimental, clean-room Sega Saturn runtime and static-recompilation research toolkit. It contains a Saturn disc/configuration CLI, an SH-2 execution core, and a Windows SDL2 runner that boots a user-supplied game through a user-supplied Saturn BIOS.
 
+[![SaturnRecomp's native Windows launcher showing the game library with NiGHTS selected](docs/images/launcher-library.png)](docs/images/launcher-library.png)
+
+*The native Windows launcher. [Setup and play guide](docs/LAUNCHER.md).*
+
 The current playable path executes SH-2 code through the interpreter and its optimized fast path. The decoder and module-analysis foundation for ahead-of-time recompilation are present, but a complete public AOT emitter is not. The project name describes the destination; this README describes the current implementation without pretending it is finished.
 
 ## No games or firmware are included
 
-This repository intentionally contains no BIOS ROM, game image, extracted executable, generated game code, save data, audio track, or game screenshot. You must dump the BIOS and game disc from hardware/media you own and keep those files local. Do not open an issue asking where to download copyrighted files.
+This repository intentionally contains no BIOS ROM, game image, extracted executable, generated game code, save data, audio track, or gameplay screenshot. Launcher screenshots show an example personal library; games are not included. You must dump the BIOS and game disc from hardware/media you own and keep those files local. Do not open an issue asking where to download copyrighted files.
 
 SaturnRecomp is not affiliated with or endorsed by Sega. Sega Saturn and game names are trademarks of their respective owners.
 
@@ -31,6 +35,19 @@ This remains experimental. Compatibility is title-dependent, performance is belo
 The native Windows launcher uses Qt Widgets through PySide6. Browse a cover-art
 library, search and sort games, manage imports, and launch games from one window.
 It does not require a browser or WebView2.
+
+<details>
+<summary>More launcher screenshots: compact layout and controls</summary>
+
+**Compact library at 900 × 650**
+
+![Compact native launcher with the selected-game area and a complete row of game covers](docs/images/launcher-compact.png)
+
+**Keyboard and controller reference**
+
+<img src="docs/images/launcher-controls.png" alt="Native console settings showing keyboard, controller, and during-play shortcuts" width="620">
+
+</details>
 
 Start with the [launcher setup and play guide](docs/LAUNCHER.md), including
 Windows build dependencies, NiGHTS setup, keyboard/controller controls, and

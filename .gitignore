@@ -31,6 +31,9 @@ HANDOFF.md
 *.png
 *.spv
 !assets/saturnrecomp-logo.png
+!docs/images/launcher-library.png
+!docs/images/launcher-compact.png
+!docs/images/launcher-controls.png
 gmon.out
 
 # Regenerated decoder-oracle artifacts
