@@ -154,6 +154,7 @@ typedef struct {
     unsigned palbank, caos;   /* BMPNA palette bank; CRAOFA colour-RAM offset */
     int      sp_bit;           /* BMPNA supplementary special-priority flag */
     int      sp_code;          /* palette colour bits 3-1 at the sampled dot */
+    int      color_msb;
 } nbg_cfg;
 
 /* ------------------------------------------------ frame interpolation ----
@@ -413,6 +414,7 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
     uint32_t off;
     *opaque = 0;
     c->sp_code = -1;
+    c->color_msb = 1;
 
     /* bw/bh are 512 or 1024 and 256 or 512, so the mask IS the remainder --
      * and for a negative operand two's complement AND already produces the
@@ -461,7 +463,8 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
           if (c->transparent && !i) return 0;
           c->sp_code = (int)((i >> 1) & 7u);
           *opaque = 1;
-          return cram_colour(s, (c->caos << 8) + (c->palbank << 4) + i); }
+          c->color_msb = cram_msb(s, (c->caos << 8) + (c->palbank << 4) + i);
+        return cram_colour(s, (c->caos << 8) + (c->palbank << 4) + i); }
     }
     case 1: {   /* 256 colour, 8bpp */
         off = c->base + (uint32_t)(y * c->pitch + x);
@@ -469,7 +472,8 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
           if (c->transparent && !i) return 0;
           c->sp_code = (int)((i >> 1) & 7u);
           *opaque = 1;
-          return cram_colour(s, (c->caos << 8) + (c->palbank << 8) + i); }
+          c->color_msb = cram_msb(s, (c->caos << 8) + (c->palbank << 8) + i);
+        return cram_colour(s, (c->caos << 8) + (c->palbank << 8) + i); }
     }
     case 2: {   /* 2048 colour, 16bpp index */
         off = c->base + (uint32_t)(y * c->pitch + x) * 2u;
@@ -477,7 +481,8 @@ static uint32_t bitmap_pixel(saturn *s, nbg_cfg *c, int x, int y, int *opaque)
           if (c->transparent && !i) return 0;
           c->sp_code = (int)((i >> 1) & 7u);
           *opaque = 1;
-          return cram_colour(s, i); }
+          c->color_msb = cram_msb(s, i);
+        return cram_colour(s, i); }
     }
     case 3: {   /* 32768 colour RGB555; bit 15 is the transparency flag */
         off = c->base + (uint32_t)(y * c->pitch + x) * 2u;
@@ -663,6 +668,7 @@ void vdp2_display_size(saturn *s, int *w, int *h)
     static const int vh[4] = { 224, 240, 256, 256 };
     *w = hw[tvmd & 3u];
     *h = vh[(tvmd >> 4) & 3u];
+    if ((tvmd & 0xc0u) == 0xc0u) *h *= 2; /* double-density interlace */
     if (*w <= 0) *w = 320;
     if (*h <= 0) *h = 224;
 }
@@ -684,10 +690,8 @@ void vdp2_display_size(saturn *s, int *w, int *h)
  * 0x2000. Rotation IS applied to RBG0 (rot_decode + the per-line/per-pixel
  * transform further down); this comment used to say it was not, long after it
  * had been implemented, and nearly sent a later reader chasing a phantom.
- * What is still missing is the COEFFICIENT TABLE path (KTCTL 0xB4 / KTAOF
- * 0xB6): we implement Ymir's no-coefficient case only. Measured on NiGHTS,
- * KTCTL is written 40 times and is ALWAYS 0x0000, i.e. coefficient tables
- * are disabled, so the simple path is correct for those screens.
+ * The coefficient table path (KTCTL/KTAOF) supplies perspective scaling and
+ * transparent pixels in Sonic R. Games with KTCTL clear use table kx/ky.
  */
 typedef struct {
     int      enabled;
@@ -705,6 +709,7 @@ typedef struct {
      * priority without threading another parameter through the sampler. */
     int      sp_bit;
     int      sp_code;       /* palette colour bits 3-1 for SFPRMD per-dot */
+    int      color_msb;
     /* Scroll as the hardware keeps it: 11.8 fixed point, plus the per-dot
      * coordinate increment (zoom) in 3.8. Sampling from the INTEGER part only
      * is what made a layer with a fractional scroll drift against an
@@ -717,6 +722,8 @@ typedef struct {
     unsigned bmw, bmh;     /* bitmap dimensions in pixels */
     unsigned bmpal;        /* BMPNA palette number, units of 256 entries */
     uint32_t bmbase;       /* bitmap byte base in VRAM */
+    int      screen_over;  /* RBG: PLSZ.RAOVR, 0 repeat .. 3 fixed 512 */
+    uint16_t over_pattern; /* RBG: OVPNRA one-word pattern name        */
 
     /* ---- derived, filled in by cell_prep ---------------------------------
      * Every divisor in the screen -> plane -> page -> pattern -> character
@@ -740,6 +747,15 @@ typedef struct {
     unsigned cellsz_sh;          /* log2 of cellsz (0 or 1)                */
     unsigned bmw_mask, bmh_mask;
 
+    /* Vertical cell scroll (SCRCTL/VCSTA).  NBG0 and NBG1 can add a separate
+     * 11.8 Y offset for every eight source dots.  This is distinct from the
+     * line-scroll path below; Sonic R's Resort Island capture has VCSC clear
+     * and enables line X, line Y, and line zoom instead. */
+    int      vcell_on, vcell_delay, vcell_repeat;
+    uint32_t vcell_base, vcell_inc, vcell_offset;
+    int      lsc_on;
+    const int32_t *ls_x, *ls_y, *ls_z;
+
     /* One-entry pattern-name cache. The compositor walks x left to right, so
      * without it a pattern name is re-fetched and re-unpacked for all 8 (or
      * 16) dots across its width. Keyed on the pattern's own address, so a hit
@@ -751,6 +767,54 @@ typedef struct {
     int      pn_flip;
     int      pn_sp;        /* cached special-priority bit of that pattern */
 } cell_cfg;
+
+static int cycle_slot_has(saturn *s, unsigned slot, unsigned value)
+{
+    unsigned bank;
+    for (bank = 0; bank < 4; bank++) {
+        unsigned off = 0x10u + bank * 4u + (slot >= 4u ? 2u : 0u);
+        unsigned sh = (3u - (slot & 3u)) * 4u;
+        if (((unsigned)VR(off) >> sh & 0xFu) == value) return 1;
+    }
+    return 0;
+}
+
+/* Derive the shared table stride and the per-layer access offset exactly the
+ * way Ymir's VDP2State::CalcVCellScrollDelay does.  A slot contributes once
+ * even if multiple VRAM banks name the same access. */
+static void cell_vscroll_prep(saturn *s, int n, cell_cfg *c)
+{
+    unsigned scr = VR(0x9A);
+    int enabled[2] = { (scr & 0x0001u) != 0, (scr & 0x0100u) != 0 };
+    uint32_t cursor = 0;
+    unsigned slot;
+
+    c->vcell_on = n < 2 && enabled[n] && !(VR(0x22) & (1u << (unsigned)n));
+    c->vcell_base = ((uint32_t)(VR(0x9C) & 7u) << 17)
+                  | ((uint32_t)((VR(0x9E) >> 1) & 0x7FFFu) << 2);
+    c->vcell_inc = c->vcell_offset = 0;
+    c->vcell_delay = c->vcell_repeat = 0;
+
+    for (slot = 0; slot < 8; slot++) {
+        if (enabled[0] && cycle_slot_has(s, slot, 0xCu)) {
+            if (n == 0) {
+                c->vcell_offset = cursor;
+                c->vcell_delay = slot >= 3u;
+                c->vcell_repeat = slot >= 2u;
+            }
+            cursor += 4;
+        }
+        if (enabled[1] && cycle_slot_has(s, slot, 0xDu)) {
+            if (n == 1) {
+                c->vcell_offset = cursor;
+                c->vcell_delay = slot >= 3u;
+                c->vcell_repeat = 0;
+            }
+            cursor += 4;
+        }
+    }
+    c->vcell_inc = cursor;
+}
 
 /* Fill in the derived power-of-two fields above: once per layer per frame,
  * instead of once per pixel per layer. */
@@ -834,21 +898,79 @@ static uint32_t plane_addr(uint32_t v, int cellsz, int one_word,
     return ((v & 0x7Fu) >> deca) * (multi * 0x1000u);
 }
 
+static void cell_decode_one_word(const cell_cfg *c, uint16_t t1,
+                                 unsigned *charaddr, unsigned *paladdr,
+                                 int *flip, int *sp)
+{
+    unsigned supp = c->supp;
+    *sp = (int)((supp >> 9) & 1u);
+    *paladdr = (c->colours == 0)
+             ? (unsigned)(((t1 & 0xF000u) >> 8) | ((supp & 0xE0u) << 3))
+             : (unsigned)((t1 & 0x7000u) >> 4);
+    *flip = 0;
+    if (c->auxmode == 0) {
+        *flip = (t1 & 0x0C00u) >> 10;
+        *charaddr = (c->cellsz == 1)
+            ? (unsigned)((t1 & 0x3FFu) | ((supp & 0x1Fu) << 10))
+            : (unsigned)(((t1 & 0x3FFu) << 2) | (supp & 0x3u)
+                         | ((supp & 0x1Cu) << 10));
+    } else {
+        *charaddr = (c->cellsz == 1)
+            ? (unsigned)((t1 & 0xFFFu) | ((supp & 0x1Cu) << 10))
+            : (unsigned)(((t1 & 0xFFFu) << 2) | (supp & 0x3u)
+                         | ((supp & 0x10u) << 10));
+    }
+}
+
 static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
                            int *opaque)
 {
     unsigned px, py, pagei;
     unsigned charaddr, paladdr, idx, sub;
     int flip = 0, cx, cy, sp = 0;
+    int use_over_pattern = 0;
     uint32_t pnaddr;
 
     /* RGB dots have no special-function colour code.  Palette paths replace
      * this with bits 3-1 of the raw dot before returning. */
     c->sp_code = -1;
+    c->color_msb = 1;
 
     if (c->bitmap) {
-        unsigned bx = (unsigned)(x + c->scroll_x) & c->bmw_mask;
-        unsigned by = (unsigned)(y + c->scroll_y) & c->bmh_mask;
+        /* Ymir advances normal bitmap coordinates in the same 11.8/3.8
+         * fixed-point domain as cell backgrounds.  The old bitmap fast path
+         * used integer scroll only, silently discarding fractional scroll,
+         * coordinate increments (zoom), line scroll/zoom and vertical-cell
+         * scroll.  Sonic R uses line X/Y/zoom on its scenery bitmap, so that
+         * shortcut sampled an unrelated (often transparent) part of VRAM. */
+        int32_t base_fx = c->scroll_fx;
+        int32_t base_fy = c->scroll_fy;
+        int32_t step_x = c->zoom_h;
+        int line_scrolled = c->lsc_on && y >= 0 && y < LS_MAXLINES;
+        uint32_t vcell_y = 0;
+        int32_t frac_x;
+        unsigned bx, by;
+
+        if (line_scrolled) {
+            base_fx = ls_sext19(c->ls_x[y] + c->scroll_fx);
+            base_fy = ls_sext19(c->ls_y[y] + c->scroll_fy);
+            step_x = c->ls_z[y];
+        }
+        frac_x = base_fx + x * step_x;
+        if (c->vcell_on) {
+            int entry = (frac_x >> 11) - (base_fx >> 11);
+            if (c->vcell_repeat && entry > 0) entry--;
+            if (c->vcell_delay) entry--;
+            if (entry >= 0) {
+                uint32_t a = c->vcell_base + c->vcell_offset
+                           + (uint32_t)entry * c->vcell_inc;
+                vcell_y = (vram32(s, a) >> 8) & 0x7FFFFu;
+            }
+        }
+        bx = (unsigned)(frac_x >> 8) & c->bmw_mask;
+        by = (unsigned)((base_fy + (int32_t)vcell_y
+                       + (line_scrolled ? 0 : y * c->zoom_v)) >> 8)
+           & c->bmh_mask;
         *opaque = 0;
         if (c->colours == 0) {                   /* 16 colours, 4bpp */
             uint8_t b = s->vdp2_vram[(c->bmbase + by * (c->bmw / 2) + bx / 2)
@@ -856,13 +978,15 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
             unsigned i4 = (bx & 1) ? (b & 0x0Fu) : (unsigned)(b >> 4);
             if (c->transparent && !i4) return 0;
             *opaque = 1;
-            return cram_colour(s, (c->caos << 8) + (c->bmpal << 8) + i4);
+            c->color_msb = cram_msb(s, (c->caos << 8) + (c->bmpal << 8) + i4);
+        return cram_colour(s, (c->caos << 8) + (c->bmpal << 8) + i4);
         } else if (c->colours == 1) {            /* 256 colours, 8bpp */
             uint8_t i8 = s->vdp2_vram[(c->bmbase + by * c->bmw + bx)
                                       & (VDP2_VRAM_SZ - 1)];
             if (c->transparent && !i8) return 0;
             *opaque = 1;
-            return cram_colour(s, (c->caos << 8) + (c->bmpal << 8) + i8);
+            c->color_msb = cram_msb(s, (c->caos << 8) + (c->bmpal << 8) + i8);
+        return cram_colour(s, (c->caos << 8) + (c->bmpal << 8) + i8);
         } else if (c->colours == 2) {            /* 2048 colours, 2 bytes/dot */
             uint32_t o = (c->bmbase + (by * c->bmw + bx) * 2u)
                        & (VDP2_VRAM_SZ - 2);
@@ -870,7 +994,8 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
             unsigned i11 = v & 0x7FFu;
             if (c->transparent && !i11) return 0;
             *opaque = 1;
-            return cram_colour(s, (c->caos << 8) + i11);
+            c->color_msb = cram_msb(s, (c->caos << 8) + i11);
+        return cram_colour(s, (c->caos << 8) + i11);
         } else if (c->colours == 4) {            /* RGB888, FOUR bytes/dot */
             /* This is the one NiGHTS' movie layer uses (CHCTLA = 0x0042, so
              * N0CHCN = 4). It was falling through to the RGB555 branch, which
@@ -909,8 +1034,63 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
          * 11.8 and each screen dot advances the source by the 3.8 coordinate
          * increment. Truncating to whole pixels here is what produced the
          * inter-layer wobble. */
-        px = (unsigned)((c->scroll_fx + x * c->zoom_h) >> 8) & c->spanw_mask;
-        py = (unsigned)((c->scroll_fy + y * c->zoom_v) >> 8) & c->spanh_mask;
+        int32_t base_fx = c->scroll_fx;
+        int32_t base_fy = c->scroll_fy;
+        int32_t step_x = c->zoom_h;
+        int line_scrolled = c->lsc_on && y >= 0 && y < LS_MAXLINES;
+        if (line_scrolled) {
+            base_fx = ls_sext19(c->ls_x[y] + c->scroll_fx);
+            base_fy = ls_sext19(c->ls_y[y] + c->scroll_fy);
+            step_x = c->ls_z[y];
+        }
+        int32_t frac_x = base_fx + x * step_x;
+        uint32_t vcell_y = 0;
+        if (c->vcell_on) {
+            /* The first table entry applies to the (possibly partial) cell at
+             * screen X=0. Advance only when the 11.8 X coordinate crosses an
+             * eight-dot boundary, matching Ymir's left-to-right fetcher. */
+            int entry = (frac_x >> 11) - (base_fx >> 11);
+            if (c->vcell_repeat && entry > 0) entry--;
+            if (c->vcell_delay) entry--;
+            if (entry >= 0) {
+                uint32_t a = c->vcell_base + c->vcell_offset
+                           + (uint32_t)entry * c->vcell_inc;
+                vcell_y = (vram32(s, a) >> 8) & 0x7FFFFu;
+            }
+        }
+        {
+            int32_t source_x = frac_x >> 8;
+            int32_t source_y = (base_fy + (int32_t)vcell_y
+                              + (line_scrolled ? 0 : y * c->zoom_v)) >> 8;
+
+            if (c->grid == 4) {
+                int32_t max_x = (int32_t)c->spanw_mask + 1;
+                int32_t max_y = (int32_t)c->spanh_mask + 1;
+                if (c->screen_over == 3) max_x = max_y = 512;
+                if (source_x < 0 || source_y < 0 ||
+                    source_x >= max_x || source_y >= max_y) {
+                    if (c->screen_over == 1) {
+                        /* Ymir VDP2DrawRotationCellBG: outside the rotation
+                         * surface, RAxOVR=1 samples OVPNRA as a one-word
+                         * character using source-coordinate bits 2-0. */
+                        use_over_pattern = 1;
+                        px = (unsigned)source_x & 7u;
+                        py = (unsigned)source_y & 7u;
+                        pnaddr = 0;
+                    } else if (c->screen_over != 0) {
+                        return 0; /* transparent / fixed-512 outside */
+                    }
+                }
+            }
+            if (!use_over_pattern) {
+                /* Repeat mode, and every coordinate within the legal surface,
+                 * uses the actual plane size. For Sonic R's PLSZ=3 that is
+                 * 4096, not the hard-coded 2048 wrap used before. */
+                px = (unsigned)source_x & c->spanw_mask;
+                py = (unsigned)source_y & c->spanh_mask;
+            }
+        }
+        if (use_over_pattern) goto pattern_name_ready;
         plane = (py >> c->ph_sh) * (unsigned)c->grid + (px >> c->pw_sh);
         if (plane >= 16u) plane = 15u;
         inx = px & c->pw_mask;
@@ -925,7 +1105,8 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
 
     pnaddr += (((py >> c->pat_sh) << c->ppp_sh) + (px >> c->pat_sh)) * c->pn_step;
 
-    if (c->pn_valid && c->pn_cached == pnaddr) {
+pattern_name_ready:
+    if (!use_over_pattern && c->pn_valid && c->pn_cached == pnaddr) {
         charaddr = c->pn_charaddr;
         paladdr  = c->pn_paladdr;
         flip     = c->pn_flip;
@@ -937,25 +1118,11 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
          * SUPPLEMENT in PNCNx bit 9 and so applies to every tile of the layer
          * (Ymir: ch.specPriority = bgParams.supplScrollSpecialPriority). */
         sp = (int)((supp >> 9) & 1u);
-        if (c->one_word) {
-            t1 = vram16(s, pnaddr);
+        if (c->one_word || use_over_pattern) {
+            t1 = use_over_pattern ? c->over_pattern : vram16(s, pnaddr);
             c->pn_raw1 = t1;
             c->pn_raw2 = 0;
-            paladdr = (c->colours == 0)
-                      ? (unsigned)(((t1 & 0xF000u) >> 8) | ((supp & 0xE0u) << 3))
-                      : (unsigned)((t1 & 0x7000u) >> 4);
-            if (c->auxmode == 0) {
-                flip = (t1 & 0x0C00u) >> 10;
-                charaddr = (c->cellsz == 1)
-                    ? (unsigned)((t1 & 0x3FFu) | ((supp & 0x1Fu) << 10))
-                    : (unsigned)(((t1 & 0x3FFu) << 2) | (supp & 0x3u)
-                                 | ((supp & 0x1Cu) << 10));
-            } else {
-                charaddr = (c->cellsz == 1)
-                    ? (unsigned)((t1 & 0xFFFu) | ((supp & 0x1Cu) << 10))
-                    : (unsigned)(((t1 & 0xFFFu) << 2) | (supp & 0x3u)
-                                 | ((supp & 0x10u) << 10));
-            }
+            cell_decode_one_word(c, t1, &charaddr, &paladdr, &flip, &sp);
         } else {
             uint16_t t2;
             t1 = vram16(s, pnaddr);
@@ -972,12 +1139,14 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
                                          : (unsigned)((t1 & 0x70u) << 4);
         }
         charaddr *= 0x20u;
-        c->pn_cached   = pnaddr;
-        c->pn_charaddr = charaddr;
-        c->pn_paladdr  = paladdr;
-        c->pn_flip     = flip;
-        c->pn_sp       = sp;
-        c->pn_valid    = 1;
+        if (!use_over_pattern) {
+            c->pn_cached   = pnaddr;
+            c->pn_charaddr = charaddr;
+            c->pn_paladdr  = paladdr;
+            c->pn_flip     = flip;
+            c->pn_sp       = sp;
+            c->pn_valid    = 1;
+        }
     }
 
     c->sp_bit = sp;
@@ -996,6 +1165,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
         if (c->transparent && !idx) return 0;
         c->sp_code = (int)((idx >> 1) & 7u);
         *opaque = 1;
+        c->color_msb = cram_msb(s, (c->caos << 8) + paladdr + idx);
         return cram_colour(s, (c->caos << 8) + paladdr + idx);
     } else if (c->colours == 1) {                /* 256 colour, 8bpp */
         uint32_t o = charaddr + sub * c->cellbytes
@@ -1004,6 +1174,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
         if (c->transparent && !idx) return 0;
         c->sp_code = (int)((idx >> 1) & 7u);
         *opaque = 1;
+        c->color_msb = cram_msb(s, (c->caos << 8) + paladdr + idx);
         return cram_colour(s, (c->caos << 8) + paladdr + idx);
     } else if (c->colours == 2) {                /* 2048 colour, 16bpp index */
         uint32_t o = charaddr + sub * c->cellbytes
@@ -1013,6 +1184,7 @@ static uint32_t cell_pixel(saturn *s, cell_cfg *c, int x, int y,
         if (c->transparent && !idx) return 0;
         c->sp_code = (int)((idx >> 1) & 7u);
         *opaque = 1;
+        c->color_msb = cram_msb(s, idx);
         return cram_colour(s, idx);
     } else if (c->colours == 3) {                /* 32768 colour, RGB555 */
         uint32_t o = charaddr + sub * c->cellbytes
@@ -1051,6 +1223,8 @@ static void decode_cell_nbg(saturn *s, int n, cell_cfg *c)
     c->enabled = (VR(0x20) >> n) & 1u;
     c->transparent = ((VR(0x20) >> (8u + (unsigned)n)) & 1u) == 0u;
     if (!c->enabled) return;
+
+    cell_vscroll_prep(s, n, c);
 
     ch = (n < 2) ? (uint16_t)(chctla >> (n * 8))
                  : (uint16_t)(chctlb >> ((n - 2) * 4));
@@ -1163,6 +1337,9 @@ typedef struct {
     int64_t  kx, ky;               /*  8.16 */
     int32_t  Xp, Yp;
     int32_t  incX, incY;
+    uint32_t KA;
+    int32_t dKAst, dKAx;
+    unsigned coeff_enable, coeff_word, coeff_mode, coeff_cram, coeff_per_dot;
 } rotp;
 
 static int32_t sext(uint32_t v, int lo, int hi)
@@ -1182,7 +1359,10 @@ static uint32_t vram32(saturn *s, uint32_t a)
 
 static void rot_decode(saturn *s, rotp *r)
 {
-    uint32_t base = ((((uint32_t)VR(0xBC) & 7u) << 16) | VR(0xBE)) << 1;
+    /* The table ignores RPTA bit 6 (bit 7 after the address shift), matching
+     * Ymir's commonRotParams.baseAddress & 0xFFF7C. */
+    uint32_t base = (((((uint32_t)VR(0xBC) & 7u) << 16) | VR(0xBE)) << 1)
+                  & 0xFFF7Cu;
     memset(r, 0, sizeof(*r));
     r->present = 1;
     r->Xst  = sext(vram32(s, base + 0x00), 6, 28);
@@ -1201,13 +1381,25 @@ static void rot_decode(saturn *s, rotp *r)
     r->Px   = sext(vram32(s, base + 0x34) >> 16, 0, 13);
     r->Py   = sext(vram32(s, base + 0x34), 0, 13);
     r->Pz   = sext(vram32(s, base + 0x38) >> 16, 0, 13);
-    r->Cx   = sext(vram32(s, base + 0x3C), 0, 13);
-    r->Cy   = sext(vram32(s, base + 0x3E) >> 16, 0, 13);
+    r->Cx   = sext(vram32(s, base + 0x3C) >> 16, 0, 13);
+    r->Cy   = sext(vram16(s, base + 0x3E), 0, 13);
     r->Cz   = sext(vram32(s, base + 0x40) >> 16, 0, 13);
     r->Mx   = sext(vram32(s, base + 0x44), 6, 29);
     r->My   = sext(vram32(s, base + 0x48), 6, 29);
     r->kx   = sext(vram32(s, base + 0x4C), 0, 23);
     r->ky   = sext(vram32(s, base + 0x50), 0, 23);
+    r->KA = (vram32(s, base + 0x54) >> 6) + ((uint32_t)(VR(0xB6) & 7u) << 26);
+    r->dKAst = sext(vram32(s, base + 0x58), 6, 25);
+    r->dKAx = sext(vram32(s, base + 0x5C), 6, 25);
+    r->coeff_enable = VR(0xB4) & 1u;
+    r->coeff_word = (VR(0xB4) >> 1) & 1u;
+    r->coeff_mode = (VR(0xB4) >> 2) & 3u;
+    r->coeff_cram = (VR(0x0E) >> 15) & 1u;
+    r->coeff_per_dot = r->coeff_cram;
+    for (unsigned bank = 0; bank < 4; bank++) {
+        if ((bank & 1u) && !(VR(0x0E) & (1u << (8u + bank / 2u)))) continue;
+        if (((VR(0x0E) >> (bank * 2u)) & 3u) == 1u) r->coeff_per_dot = 1;
+    }
 
     r->Xp = (int32_t)(r->A * (r->Px - r->Cx) + r->B * (r->Py - r->Cy) +
                       r->C * (r->Pz - r->Cz)) + (r->Cx << 10) + r->Mx;
@@ -1215,6 +1407,32 @@ static void rot_decode(saturn *s, rotp *r)
                       r->F * (r->Pz - r->Cz)) + (r->Cy << 10) + r->My;
     r->incX = (int32_t)(((int64_t)r->A * r->dX + (int64_t)r->B * r->dY) >> 10);
     r->incY = (int32_t)(((int64_t)r->D * r->dX + (int64_t)r->E * r->dY) >> 10);
+}
+
+/* Ymir VDP2FetchRotationCoefficient: a coefficient may scale either or both
+ * axes, replace Xp, or make the rotation pixel transparent. A per-line table
+ * is fetched even when no VRAM bank is assigned to per-dot coefficients. */
+static void rot_coefficient(saturn *s, const rotp *r, uint32_t ka,
+                            int32_t *value, uint8_t *transparent)
+{
+    uint32_t addr = (ka >> 10) << (r->coeff_word ? 1u : 2u);
+    if (r->coeff_per_dot && !r->coeff_cram) {
+        unsigned bank = (addr >> 17) & 3u;
+        if (!(VR(0x0E) & (1u << (8u + bank / 2u)))) bank &= ~1u;
+        if (((VR(0x0E) >> (bank * 2u)) & 3u) != 1u) return;
+    }
+    uint32_t data;
+    if (r->coeff_cram) {
+        addr = (addr | 0x800u) & (CRAM_SIZE - 1u);
+        data = ((uint32_t)s->cram[addr] << 8) | s->cram[(addr + 1u) & (CRAM_SIZE - 1u)];
+        if (!r->coeff_word) data = (data << 16) |
+            ((uint32_t)s->cram[(addr + 2u) & (CRAM_SIZE - 1u)] << 8) |
+            s->cram[(addr + 3u) & (CRAM_SIZE - 1u)];
+    } else data = r->coeff_word ? vram16(s, addr) : vram32(s, addr);
+    *transparent = (uint8_t)(data >> (r->coeff_word ? 15u : 31u));
+    *value = r->coeff_word ? sext(data, 0, 14) : sext(data, 0, 23);
+    unsigned shift = r->coeff_mode == 3u ? (r->coeff_word ? 14u : 8u) : (r->coeff_word ? 6u : 0u);
+    *value = (int32_t)((uint32_t)*value << shift);
 }
 
 /* RBG0, drawn from rotation plane A's map registers WITH the rotation
@@ -1236,6 +1454,8 @@ static void decode_cell_rbg0(saturn *s, cell_cfg *c)
     c->caos    = (unsigned)(VR(0xE6) & 7u);      /* CRAOFB: R0CAOS (0xE6, not 0xEC=CCCTL) */
     c->plsz    = (unsigned)((VR(0x3A) >> 8) & 3u);
     c->pnc = VR(0x38);
+    c->screen_over = (int)((VR(0x3A) >> 10) & 3u);
+    c->over_pattern = VR(0xB8);
 
     /* A rotation plane is tiled from SIXTEEN pages (A..P) in a 4x4 grid, held
      * in MPABRA..MPOPRA at 0x50..0x5E -- two per register. Treating it as the
@@ -1444,6 +1664,16 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
     }
     for (int n = 0; n < 4; n++) decode_nbg(s, n, &cfg[n]);
     for (int n = 0; n < 4; n++) decode_cell_nbg(s, n, &ccfg[n]);
+    /* Line screen scroll belongs to the NBG, independent of whether its
+     * source is a bitmap or character cells.  The table was decoded only into
+     * nbg_cfg and therefore silently dropped whenever BMEN=0. Sonic R enables
+     * X, Y and line zoom together on its 16x16-cell sky layer. */
+    for (int n = 0; n < 2; n++) {
+        ccfg[n].lsc_on = cfg[n].lsc_on;
+        ccfg[n].ls_x = cfg[n].ls_x;
+        ccfg[n].ls_y = cfg[n].ls_y;
+        ccfg[n].ls_z = cfg[n].ls_z;
+    }
     decode_cell_rbg0(s, &rbg0);
 
     /* NOT APPLIED: Ymir's VDP2State::UpdateEnabledBGs forces NBG1/2/3 off
@@ -1475,6 +1705,7 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
      * "Start Application" plate. Additive mode is CCCTL bit 8. */
     uint16_t ccctl = VR(0xEC);
     int cc_add = (ccctl >> 8) & 1;
+    int cc_ext = (ccctl >> 10) & 1;
     int cc_en[7];        /* 0-3 NBG, 4 RBG0, 6 sprite */
     unsigned cc_topw[7];
     cc_en[0] = (ccctl >> 0) & 1;  cc_en[1] = (ccctl >> 1) & 1;
@@ -1489,7 +1720,7 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
     cc_topw[5] = 31u;
     cc_topw[6] = 31u - (VR(0x100) & 0x1Fu);   /* CCRSA slot 0 for sprites */
 
-    rotp rp; rp.present = 0;
+    rotp rp = {0};
     if (rbg0.enabled) rot_decode(s, &rp);
 
     /* The list of layers that can contribute a pixel, resolved ONCE per frame.
@@ -1631,6 +1862,7 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
     enum { SP_NORMAL = 0, SP_SHADOW = 1, SP_TRANSPARENT = 2 };
 
     const int sp_xshift = (w > 512) ? 1 : 0;
+    const int sp_yshift = (VR(0) & 0xc0u) == 0xc0u;
 
     /* A window set with nothing enabled suppresses nothing, and that is the
      * common case -- most frames of most games enable no windows at all. Clear
@@ -1674,7 +1906,7 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
 
     for (int y = 0; y < h; y++) {
         uint32_t backc = back_colour(s, y);
-        const int sp_line = sp_on && y < 256;
+        const int sp_line = sp_on && (y >> sp_yshift) < 256;
 
         /* ---- the sprite line, decoded per Ymir VDP2DrawSpritePixel -------- */
         if (wl_sp) win_calc(s, &ws_sp, y, w, NULL, win_sp);
@@ -1703,7 +1935,7 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
              * with no sprites at all. */
             if (!sp_line || (x >> sp_xshift) >= 512 || win_sp[x]) continue;
 
-            o = (uint32_t)(y * 512 + (x >> sp_xshift)) * 2u;
+            o = (uint32_t)((y >> sp_yshift) * 512 + (x >> sp_xshift)) * 2u;
              p = (uint16_t)((fb[o] << 8) | fb[o + 1]);
              mp = (uint16_t)((meshfb[o] << 8) | meshfb[o + 1]);
 
@@ -1818,6 +2050,22 @@ decode_mesh:
                               (int64_t)rp.F * (rp.Zst - (rp.Pz << 10))) >> 10);
         }
 
+        int32_t rcoeff[704] = {0};
+        uint8_t rtransparent[704] = {0};
+        if (rp.coeff_enable) {
+            uint32_t ka = rp.KA + (uint32_t)(rp.dKAst * y);
+            int32_t value = 0;
+            uint8_t transparent = 1;
+            rot_coefficient(s, &rp, ka, &value, &transparent);
+            for (int x = 0; x < w; x++) {
+                rcoeff[x] = value;
+                rtransparent[x] = transparent;
+                if (rp.coeff_per_dot) {
+                    ka += (uint32_t)rp.dKAx;
+                    rot_coefficient(s, &rp, ka, &value, &transparent);
+                }
+            }
+        }
         for (int x = 0; x < w; x++) {
             /* Ymir keeps a sorted stack of the layers covering this pixel and
              * composes only the TOP two: the top is the picture, the second is
@@ -1828,9 +2076,11 @@ decode_mesh:
              * RUIN / ACT 2" title card vanished under the translucent cloud
              * layer instead of showing through it. The stack is seeded with
              * the back screen, which sits at priority 0. */
-            uint8_t k0 = SORT_KEY(5, 0), k1 = SORT_KEY(5, 0);
+            uint8_t k0 = SORT_KEY(5, 0), k1 = SORT_KEY(5, 0), k2 = SORT_KEY(5, 0);
             int      l0 = 5, l1 = 5;
-            uint32_t c0 = backc, c1 = backc;
+            uint32_t c0 = backc, c1 = backc, c2 = backc;
+            int dot_cc[7];
+            for (int q = 0; q < 7; q++) dot_cc[q] = cc_en[q];
             int sp_pushed = 0;
             unsigned outi = (unsigned)y * (unsigned)w + (unsigned)x;
 
@@ -1856,15 +2106,18 @@ decode_mesh:
 
             #define PUSH(lyr, pri, col) do {                                   \
                 uint8_t _k = SORT_KEY((lyr), (pri));                           \
-                if (_k > k0) { k1 = k0; l1 = l0; c1 = c0;                      \
+                if (_k > k0) { k2 = k1; c2 = c1;                              \
+                               k1 = k0; l1 = l0; c1 = c0;                      \
                                k0 = _k; l0 = (lyr); c0 = (col); }              \
-                else if (_k > k1) { k1 = _k; l1 = (lyr); c1 = (col); }         \
+                else if (_k > k1) { k2 = k1; c2 = c1;                          \
+                                    k1 = _k; l1 = (lyr); c1 = (col); }         \
+                else if (_k > k2) { k2 = _k; c2 = (col); }                     \
             } while (0)
 
             for (int k = 0; !bg_cache_hit && k < nord; k++) {
                 int opaque = 0;
                 int n = ord[k].n;
-                int dot_sp = 0, dot_code = -1;
+                int dot_sp = 0, dot_code = -1, dot_msb = 1, dot_ccbit = 0;
                 uint32_t c;
                 if (wl_bg[n] && win_bg[n][x]) continue; /* windowed out */
                 if (!ord[k].rot) {
@@ -1881,28 +2134,46 @@ decode_mesh:
                         c = bitmap_pixel(s, &cfg[n], mx, my, &opaque);
                         dot_sp = cfg[n].sp_bit;
                         dot_code = cfg[n].sp_code;
+                        dot_msb = cfg[n].color_msb;
+                        dot_ccbit = (VR(0x2C) >> (n * 8 + 4)) & 1;
                     } else {
                         c = cell_pixel(s, &ccfg[n], mx, my, &opaque);
                         dot_sp = ccfg[n].sp_bit;
                         dot_code = ccfg[n].sp_code;
+                        dot_msb = ccfg[n].color_msb;
+                        dot_ccbit = ccfg[n].one_word ? ((ccfg[n].supp >> 8) & 1) : ((ccfg[n].pn_raw1 >> 12) & 1);
                     }
                 } else {
                     int rx = x, ry = y;
                     if (rp.present) {
+                        if (rtransparent[x]) continue;
                         int32_t sx = rXsp + rp.incX * x;
                         int32_t sy = rYsp + rp.incY * x;
-                        rx = (int)((((rp.kx * sx) >> 16) + rp.Xp) >> 10);
-                        ry = (int)((((rp.ky * sy) >> 16) + rp.Yp) >> 10);
-                        /* Screen-over: repeat. The rotation surface is
-                         * grid*512 pixels on a side. */
-                        rx &= (rbg0.grid * 512) - 1;
-                        ry &= (rbg0.grid * 512) - 1;
+                        int64_t kx = rp.kx, ky = rp.ky;
+                        int32_t xp = rp.Xp;
+                        if (rp.coeff_enable) {
+                            if (rp.coeff_mode == 0 || rp.coeff_mode == 1) kx = rcoeff[x];
+                            if (rp.coeff_mode == 0 || rp.coeff_mode == 2) ky = rcoeff[x];
+                            if (rp.coeff_mode == 3) xp = (int32_t)((uint32_t)rcoeff[x] << 2);
+                        }
+                        rx = (int)((((kx * sx) >> 16) + xp) >> 10);
+                        ry = (int)((((ky * sy) >> 16) + rp.Yp) >> 10);
+                        /* Keep the signed transformed coordinate intact.
+                         * cell_pixel applies PLSZ.RAOVR against the real
+                         * plane dimensions (including 2x1/2x2 pages). */
                     }
                     c = cell_pixel(s, &rbg0, rx, ry, &opaque);
                     dot_sp = rbg0.sp_bit;
                     dot_code = rbg0.sp_code;
+                    dot_msb = rbg0.color_msb;
+                    dot_ccbit = rbg0.one_word ? ((rbg0.supp >> 8) & 1) : ((rbg0.pn_raw1 >> 12) & 1);
                 }
                  if (opaque) {
+                    unsigned mode = (VR(0xEE) >> (n * 2)) & 3u;
+                    unsigned bank = (VR(0x24) >> n) & 1u;
+                    int code_match = dot_code < 0 || ((VR(0x26) >> (bank * 8u + (unsigned)dot_code)) & 1u);
+                    dot_cc[n] = cc_en[n] && (mode == 0 || (mode == 1 && dot_ccbit) ||
+                                (mode == 2 && dot_ccbit && code_match) || (mode == 3 && dot_msb));
                     /* Per-pixel priority, exactly as VDP2 applies SFPRMD.
                      * Per-character uses the pattern-name special-priority
                      * flag directly.  Per-dot first requires that flag, then
@@ -1970,21 +2241,46 @@ decode_mesh:
             if (mesh_pri[x] > 0 && mesh_spec[x] == SP_NORMAL) {
                 unsigned p0 = (unsigned)(k0 >> 3);
                 unsigned p1 = (unsigned)(k1 >> 3);
+                unsigned p2 = (unsigned)(k2 >> 3);
                 if ((unsigned)mesh_pri[x] >= p0) mesh_pos = 0;
                 else if ((unsigned)mesh_pri[x] >= p1) mesh_pos = 1;
+                else if ((unsigned)mesh_pri[x] >= p2) mesh_pos = 2;
                 if (mesh_pos == 1) c1 = cc_blend(mesh_col[x], c1, 16u, 0);
+                else if (mesh_pos == 2) c2 = cc_blend(mesh_col[x], c2, 16u, 0);
             }
 
             uint32_t colour = c0;
 
+            /* EXCCEN extends colour calculation to the second screen. Ymir
+             * gathers a third sorted layer and averages it with layer 1 when
+             * layer 1 has colour calculation enabled; the ordinary top-layer
+             * ratio/additive operation then consumes that result. Sonic R
+             * enables this throughout its race scene for water and shoreline
+             * blending (CCCTL=0x047C). */
+            if (cc_ext && dot_cc[l1]) {
+                c1 = cc_blend(c1, c2, 16u, 0);
+            }
+
+            /* Ymir inserts the line-color screen below a participating top
+             * layer. With EXCCEN and LCCCEN it averages that color with the
+             * second screen. Sonic R uses this to tint reflected water blue. */
+            int line_color_on = l0 != 5 && ((VR(0xE8) >> l0) & 1u);
+            if (line_color_on) {
+                uint32_t la = (((uint32_t)(VR(0xA8) & 7u) << 16) | VR(0xAA)) * 2u;
+                if (VR(0xA8) & 0x8000u) la += (uint32_t)y * 2u;
+                uint32_t lc = cram_colour(s, vram16(s, la) & 0x7FFu);
+                c1 = (cc_ext && (ccctl & 0x20u)) ? cc_blend(c1, lc, 16u, 0) : lc;
+            }
+
             /* Colour calculation blends the top layer with the SECOND, gated
              * per layer by CCCTL and suppressed inside the colour-calculation
              * window. CCCTL bit 9 says whose ratio to use. */
-            if (cc_en[l0] && (!wl_cc || !win_cc[x])) {
+            if (dot_cc[l0] && (!wl_cc || !win_cc[x])) {
                 int rl = cc_second_ratio ? l1 : l0;
                 unsigned topw = (rl == 6)
                     ? 31u - (unsigned)sp_ccr_tab[sp_ratio[x]]
                     : cc_topw[rl];
+                if (cc_second_ratio && line_color_on) topw = 31u - (VR(0x10E) & 31u);
                 int ok = 1;
                 if (l0 == 6) {
                     /* SPCTL bits 12-13 pick the per-pixel condition against

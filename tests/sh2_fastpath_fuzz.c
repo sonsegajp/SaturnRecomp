@@ -27,6 +27,7 @@
  * arithmetic does to the other registers.
  */
 #include "saturn.h"
+#include "sh2_isa.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,7 +36,6 @@ int  sh2_step(sh2 *c);
 uint64_t sh2_run(sh2 *c, uint64_t n);
 void sh2_reset(sh2 *c, saturn *s, int slave, uint32_t pc, uint32_t sp);
 void saturn_init(saturn *s);
-int  sh2_format(uint16_t op, uint32_t pc, char *out);
 
 static saturn g;
 

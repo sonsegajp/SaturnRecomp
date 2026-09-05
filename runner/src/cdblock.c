@@ -311,7 +311,9 @@ void cdb_init(saturn *s, void *disc_handle, void *iso_handle)
 void cdb_periodic_maybe(saturn *s)
 {
     cdblock *cd = &s->cd;
-    uint64_t now, iv;
+    uint64_t now;
+    static uint64_t interval;
+    static int interval_ready;
     uint8_t saved;
 
     if (cd->boot_delay || !cd->first_cmd_seen) return;
@@ -335,9 +337,16 @@ void cdb_periodic_maybe(saturn *s)
         cd->last_peri_cy = now;
         return;
     }
-    iv  = getenv("SATURN_PERICY")
-          ? strtoull(getenv("SATURN_PERICY"), NULL, 0) : CDB_SECTOR_CYCLES;
-    if (now - cd->last_peri_cy < iv) return;
+    /* BIOS/SDK polling reaches this on every CD register read. Environment
+     * access takes a host CRT lock; doing it millions of times made loading
+     * frames stall even with the default interval. Like the other CD debug
+     * switches, this override is fixed for the process, including explicit 0. */
+    if (!interval_ready) {
+        const char *value = getenv("SATURN_PERICY");
+        interval = value ? strtoull(value, NULL, 0) : CDB_SECTOR_CYCLES;
+        interval_ready = 1;
+    }
+    if (now - cd->last_peri_cy < interval) return;
     cd->last_peri_cy = now;
     cd->periodic_count++;
 
@@ -1142,6 +1151,22 @@ void cdb_execute(saturn *s)
          * asks for 0x8000A6, which is FAD 166 = LBA 16, the ISO volume
          * descriptor. Failing to mask it yields a nonsense LBA and the read
          * silently returns nothing. */
+        /* Ymir SetupGenericPlayback: FFFFFF/FFFFFF/FF means retain the
+         * current range, repeat mode and position (resume if paused).
+         * Decode this before stripping the FAD flag. Sonic R sends it right
+         * after starting the countdown track; seeking to 0x7FFFFF instead
+         * switches CDDA off and loses the countdown and short jingles. */
+        if ((cr1 & 0xFFu) == 0xFFu && cr2 == 0xFFFFu &&
+            cr3 == 0xFFFFu && cr4 == 0xFFFFu) {
+            if (cd->play_end_fad && cd->fad < cd->play_end_fad) {
+                cd->playing = 1;
+                cd->cdda_play = lba_is_audio((disc *)cd->disc,
+                                            cd->fad >= FAD_BASE ? cd->fad - FAD_BASE : 0);
+                cd->status = ST_PLAY;
+            }
+            respond_status(s);
+            break;
+        }
         uint32_t start = ((((uint32_t)cr1 & 0xFF) << 16) | cr2) & 0x7FFFFFu;
         uint32_t nsec  = ((((uint32_t)cr3 & 0xFF) << 16) | cr4) & 0x7FFFFFu;
         uint32_t got   = 0;

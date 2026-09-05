@@ -94,6 +94,27 @@ static uint8_t *ram_ptr(saturn *s, uint32_t a, uint32_t size)
     return NULL;
 }
 
+/* VDP1's framebuffers are also ordinary SH-2/SCU bus targets. Vulkan keeps
+ * its framebuffer persistent on the GPU, so a CPU/DMA store has to enter the
+ * same ordered operation stream as draws and erases. The byte-array copy is
+ * still updated for software mode and guest readback; mesh metadata is cleared
+ * for every directly replaced pixel. */
+static void vdp1_fb_bus_write(saturn *s, uint32_t a,
+                              unsigned size, uint32_t value)
+{
+    uint32_t off, first, end;
+    uint8_t *mesh;
+
+    if (a < 0x05C80000u || a >= 0x05D00000u) return;
+    off = (a - 0x05C80000u) & (VDP1_FB_SZ - 1u);
+    first = off & ~1u;
+    end = (off + size + 1u) & ~1u;
+    if (end > VDP1_FB_SZ) end = VDP1_FB_SZ;
+    mesh = s->vdp1_meshfb[s->fb_draw];
+    memset(mesh + first, 0, end - first);
+    vdp1_gpu_fb_write(s, (unsigned)s->fb_draw, off, size, value);
+}
+
 /* --------------------------------------------------------- CD/CS2 decode --
  * Ymir CDBlock::MapMemory and the Saturn address map agree on the physical
  * decode: the CD register file is present in the first 4 KiB of every 32 KiB
@@ -679,11 +700,27 @@ static void wrange_note(saturn *s, uint32_t b, uint32_t v, int sz)
  * that consumes a buffer is the mirror of finding the code that fills it. */
 static void rrange_note(saturn *s, uint32_t b)
 {
+    sh2 *core;
+    uint32_t pc;
+    uint8_t slave;
     if (!s->rrange_hi || b < s->rrange_lo || b > s->rrange_hi) return;
-    uint32_t pc = s->master.pc;
+    core = s->cur ? s->cur : &s->master;
+    pc = core->pc;
+    if (s->rrpc_hi && (pc < s->rrpc_lo || pc > s->rrpc_hi)) return;
+    slave = (uint8_t)(core == &s->slave);
     for (int k = 0; k < s->nrrlog; k++)
-        if (s->rrlog[k].pc == pc) { s->rrlog[k].n++; return; }
-    if (s->nrrlog < 16) { s->rrlog[s->nrrlog].pc = pc; s->rrlog[s->nrrlog].n = 1; s->nrrlog++; }
+        if (s->rrlog[k].pc == pc && s->rrlog[k].addr == b &&
+            s->rrlog[k].slave == slave) {
+            s->rrlog[k].n++;
+            return;
+        }
+    if (s->nrrlog < (int)(sizeof(s->rrlog) / sizeof(s->rrlog[0]))) {
+        s->rrlog[s->nrrlog].pc = pc;
+        s->rrlog[s->nrrlog].addr = b;
+        s->rrlog[s->nrrlog].n = 1;
+        s->rrlog[s->nrrlog].slave = slave;
+        s->nrrlog++;
+    }
 }
 
 static int is_onchip(uint32_t a) { return (a >> 29) == 7u; }
@@ -792,10 +829,17 @@ uint8_t bus_r8(saturn *s, uint32_t a)
         return cc->onchip[OC(off)];
     }
     b = a & 0x07FFFFFFu;
-    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 1);
     if (p) return *p;
+
+    if (b >= 0x05B00000u && b < 0x05C00000u) {               /* SCSP regs */
+        uint16_t w;
+        trace(s, b, 0, 1);
+        w = scsp_read(s, (b - 0x05B00000u) & 0xFFEu);
+        return (uint8_t)((b & 1u) ? w : (w >> 8));
+    }
 
     if (b >= 0x00100000u && b < 0x00180000u) {               /* SMPC */
         uint32_t o = (b - 0x00100000u) & 0x7F;
@@ -863,10 +907,15 @@ uint16_t bus_r16(saturn *s, uint32_t a)
         return (uint16_t)((cc->onchip[OC(off)] << 8) | cc->onchip[OC(off)+1]);
     }
     b = a & 0x07FFFFFEu;
-    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 2);
     if (p) return (uint16_t)((p[0] << 8) | p[1]);
+
+    if (b >= 0x05B00000u && b < 0x05C00000u) {               /* SCSP regs */
+        trace(s, b, 0, 2);
+        return scsp_read(s, (b - 0x05B00000u) & 0xFFEu);
+    }
 
     if (b >= 0x05D00000u && b < 0x05D80000u) {               /* VDP1 regs */
         trace(s, b, 0, 2);
@@ -934,7 +983,7 @@ uint32_t bus_r32(saturn *s, uint32_t a)
     }
     if (is_onchip(a)) return oc_r32(s, a & 0xFFFCu);
     b = a & 0x07FFFFFCu;
-    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 4);
     if (p)
@@ -994,7 +1043,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
         return;
     }
     b = a & 0x07FFFFFFu;
-    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
     /* MINIT/SINIT doorbell. The ADDRESS selects the target CPU and the data is
      * irrelevant -- any write in the region rings it. This path used to fire
      * only on an ODD address, while the 16- and 32-bit paths below fire
@@ -1033,8 +1082,15 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
     p = ram_ptr(s, b, 1);
     if (p) {
         *p = v;
+        vdp1_fb_bus_write(s, b, 1u, v);
         if (b >= 0x05E00000u && b < 0x05F00000u) s->vdp2_vram_epoch++;
         if (b >= 0x05F00000u && b < 0x05F80000u) s->cram_epoch++;
+        return;
+    }
+
+    if (b >= 0x05B00000u && b < 0x05C00000u) {               /* SCSP regs */
+        trace(s, b, 1, 1);
+        scsp_write8(s, (b - 0x05B00000u) & 0xFFFu, v);
         return;
     }
 
@@ -1090,7 +1146,7 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
         return;
     }
     b = a & 0x07FFFFFEu;
-    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
 
     /* MINIT/SINIT: the doorbell is named for who RINGS it, not who hears it.
      * Writes to MINIT (0x01000000-0x017FFFFF) pulse the SLAVE's FRT
@@ -1130,8 +1186,16 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
     p = ram_ptr(s, b, 2);
     if (p) {
         p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v;
+        vdp1_fb_bus_write(s, b, 2u, v);
         if (b >= 0x05E00000u && b < 0x05F00000u) s->vdp2_vram_epoch++;
         if (b >= 0x05F00000u && b < 0x05F80000u) s->cram_epoch++;
+        return;
+    }
+
+
+    if (b >= 0x05B00000u && b < 0x05C00000u) {               /* SCSP regs */
+        trace(s, b, 1, 2);
+        scsp_write(s, (b - 0x05B00000u) & 0xFFEu, v);
         return;
     }
 
@@ -1194,7 +1258,7 @@ void bus_w32(saturn *s, uint32_t a, uint32_t v)
         return;
     }
     b = a & 0x07FFFFFCu;
-    if (b >= 0x05A00000u && b < 0x05B00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
     if (b >= 0x01000000u && b < 0x02000000u) {
         frt_capture(b < 0x01800000u ? &s->slave : &s->master);
         return;
@@ -1218,6 +1282,7 @@ void bus_w32(saturn *s, uint32_t a, uint32_t v)
     if (p) {
         p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
         p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+        vdp1_fb_bus_write(s, b, 4u, v);
         if (b >= 0x05E00000u && b < 0x05F00000u) s->vdp2_vram_epoch++;
         if (b >= 0x05F00000u && b < 0x05F80000u) s->cram_epoch++;
         return;
@@ -1285,6 +1350,13 @@ void saturn_init(saturn *s)
     s->min_imask = 99;
     /* The SMPC powers up with the front-panel reset button disabled. */
     s->smpc_resd = 1;
+    s->pad1_x = 0x80;
+    s->pad1_y = 0x80;
+    {
+        const char *pad_type = getenv("SATURN_PAD_TYPE");
+        s->pad1_analog = pad_type &&
+            (!strcmp(pad_type, "3d") || !strcmp(pad_type, "analog"));
+    }
     /* CD block spells "CDBLOCK" in CR1-CR4 after reset. */
     s->cdb_reg[0x18 >> 1] = 0x4344;   /* "CD" */
     s->cdb_reg[0x1C >> 1] = 0x424C;   /* "BL" */
@@ -1862,12 +1934,30 @@ static void vdp1_field_change(saturn *s)
     { static int lg = -1; static unsigned long long n;
       if (lg < 0) lg = getenv("SATURN_FBLOG") ? 1 : 0;
       if (lg && ++n <= 100000u)
-          printf("[fbdec] FBCR=%04X FCM=%d FCT=%d written=%d -> "
-                 "erase=%d swap=%d clk=%llu\n",
+          printf("[fbdec] FBCR=%04X FCM=%d FCT=%d written=%d "
+                 "VBE=%d -> erase=%d swap=%d clk=%llu\n",
                  s->vdp1_reg[1], (s->vdp1_reg[1] >> 1) & 1,
-                 s->vdp1_reg[1] & 1, s->vdp1_fbparams, erase, swap,
+                 s->vdp1_reg[1] & 1, s->vdp1_fbparams,
+                 s->vdp1_vblank_erase, erase, swap,
                  (unsigned long long)s->clk); }
     s->vdp1_fbparams = 0;
+
+    /* TVMR.VBE is a second erase path, independent of FCM/FCT.  It is
+     * sampled at V-Blank IN, runs throughout the blanking interval, and must
+     * finish before the line-0 framebuffer swap.  Sonic R uses the documented
+     * VBE=1,FCM=1,FCT=1 combined mode: clear the displayed framebuffer during
+     * V-Blank, then make it the next draw target.  Ignoring VBE left the Load
+     * Data sprites in that buffer, so they reappeared over the title when the
+     * manual swap resumed.
+     *
+     * The renderer completes erase work as one ordered operation rather than
+     * scanline-by-scanline.  It still uses the erase parameters latched by the
+     * preceding swap and targets the current display framebuffer, matching
+     * Ymir's VDP1DoEraseFramebuffer path. */
+    if (s->vdp1_vblank_erase) {
+        s->vdp1_vblank_erase = 0;
+        vdp1_erase(s);
+    }
 
     /* Ymir performs the display erase after VDP2 consumes the field.  With
      * this whole-field compositor, retaining it until the next field change
@@ -2031,6 +2121,10 @@ uint64_t saturn_run_field(saturn *s)
             s->vblank_boundary_done = 1;
         } else if (!s->vblank_boundary_done && s->line == LINE_VBLANK) {
             s->vdp2_reg[0x04 >> 1] |= 0x0008u;              /* TVSTAT VBLANK=1 */
+            /* VDP1 samples TVMR.VBE on the V-Blank-IN edge.  Software may
+             * clear TVMR again immediately after V-Blank OUT, so checking the
+             * live register at the later field-change point loses the erase. */
+            s->vdp1_vblank_erase = (s->vdp1_reg[0] & 0x0008u) != 0;
             /* TVSTAT bit 1 (ODD), the field flag, switched at V-Blank IN --
              * exactly where Ymir does it (vdp.cpp ~803). TVMD bits 7-6 (LSMD)
              * select the interlace mode: when interlaced the flag alternates

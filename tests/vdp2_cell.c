@@ -92,6 +92,22 @@ int main(void)
     /* Next character over is pattern (1,0), which we left as 0 -> char 0. */
     ck("pixel(8,0) clear", fb[8] & 0xFFFFFF, 0x000000);
 
+    /* ---- line scroll on a cell-format NBG (VDP2 manual s4.10) -----------
+     * Resort Island enables line X, line Y, and line zoom on a cell-format
+     * NBG0.  The bitmap sampler consumed the decoded table while the cell
+     * sampler ignored it, exposing unused map cells as repeating columns.
+     * A +1-dot line-X entry must shift pixel zero from blue to red. */
+    wreg(0x9A, 0x0002);              /* SCRCTL: NBG0 line-scroll X */
+    wreg(0xA0, 0x0000);              /* LSTA0U/L: table at 0x10000 */
+    wreg(0xA2, 0x8000);
+    S.vdp2_vram[0x10000] = 0x00;     /* 0x00010000 -> 1.0 in 11.8 */
+    S.vdp2_vram[0x10001] = 0x01;
+    S.vdp2_vram[0x10002] = 0x00;
+    S.vdp2_vram[0x10003] = 0x00;
+    vdp2_render(&S, fb, w, h, 0);
+    ck("cell NBG applies line-scroll X", fb[0] & 0xFFFFFF, 0xFF0000);
+    wreg(0x9A, 0x0000);
+
     /* ---- colour offset (VDP2 manual s10.6) --------------------------------
      * CLOFEN enables it per layer, CLOFSL picks offset set A or B, and
      * COAR/COAG/COAB hold a 9-bit signed value added to each channel after
@@ -165,7 +181,7 @@ int main(void)
     vdp2_render(&S, fb, w, h, 0);
     ck("equal priority lets sprite win", fb[0] & 0xFFFFFF, 0xFF0000);
 
-    if (fails == 0) printf("PASS  vdp2 cell renderer (%d checks)\n", 17);
+    if (fails == 0) printf("PASS  vdp2 cell renderer (%d checks)\n", 18);
     else            printf("FAIL  vdp2 cell renderer: %d\n", fails);
     return fails ? 1 : 0;
 }

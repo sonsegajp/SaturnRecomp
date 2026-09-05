@@ -1,4 +1,4 @@
-﻿# Build script for SaturnRecomp.
+# Build script for SaturnRecomp.
 #
 # A native 64-bit MinGW-w64 GCC and SDL2 development package are required.
 # Set SATURN_MINGW_BIN when they are not installed at the common MSYS2 path.
@@ -26,20 +26,10 @@ $env:Path = "$mingwBin;$env:Path"
 $CFLAGS = @('-O3','-flto','-march=native','-mtune=native','-Wall','-Wextra','-std=c11')
 $pgoMode = $env:SATURN_PGO_MODE
 $pgoDir = $env:SATURN_PGO_DIR
-if ($pgoMode) {
-    if (-not $pgoDir) { $pgoDir = 'out\pgo' }
-    New-Item -ItemType Directory -Force -Path $pgoDir | Out-Null
-    $pgoAbs = (Resolve-Path $pgoDir).Path -replace '\\','/'
-    if ($pgoMode -eq 'generate') {
-        $CFLAGS += "-fprofile-generate=$pgoAbs"
-    } elseif ($pgoMode -eq 'use') {
-        $CFLAGS += "-fprofile-use=$pgoAbs"
-        $CFLAGS += '-fprofile-correction'
-        $CFLAGS += '-Wno-missing-profile'
-    } else {
-        throw "SATURN_PGO_MODE must be 'generate' or 'use'"
-    }
-}
+if (-not $pgoMode) { $pgoMode = 'off' }
+if (-not $pgoDir) { $pgoDir = 'out/runtime-build/profile' }
+$runtimeObjects = $env:SATURN_RUNTIME_OBJECT_DIR
+if (-not $runtimeObjects) { $runtimeObjects = 'out/runtime-build/obj' }
 $CORE   = 'external\sh2-recomp-core\common'
 
 New-Item -ItemType Directory -Force -Path 'out' | Out-Null
@@ -69,30 +59,29 @@ gcc @CFLAGS -Irecompiler\include -o recompiler\saturnrecomp.exe `
 if ($LASTEXITCODE -ne 0) { throw "saturnrecomp build failed" }
 
 # ---- runner: boot harness (interpreter + bus) ------------------------------
-gcc @CFLAGS '-Wl,--stack,67108864' -Irunner\include -Irecompiler\include -o runner\saturnboot.exe `
-    runner\src\boot.c `
-    runner\src\bus.c `
-    runner\src\scu_dsp.c `
-    runner\src\sh2_interp.c `
-    runner\src\bios.c `
-    runner\src\cdblock.c `
-    runner\src\vdp1.c `
-    runner\src\debugview.c `
-    runner\src\vdp2.c `
-    runner\src\m68k.c `
-    runner\src\m68k_bus.c `
-    runner\src\scsp.c runner\src\scsp_dsp.c `
-    runner\src\sound.c `
-    runner\src\png.c `
-    runner\src\smpc.c `
-    recompiler\src\disc.c `
-    recompiler\src\game_config.c `
-    "$CORE\sh2_decoder.c"
-if ($LASTEXITCODE -ne 0) { throw "saturnboot build failed" }
+# Both frontends are linked from the same core objects below.
+
+gcc @CFLAGS -Irunner/include -Irecompiler/include tests/scsp_modulation.c runner/src/scsp.c runner/src/scsp_dsp.c -o tests/scsp_modulation.exe
+if ($LASTEXITCODE -ne 0) { throw 'SCSP modulation build failed' }
+
+gcc @CFLAGS -Irunner/include -Irecompiler/include -o tests/audio_ring.exe tests/audio_ring.c
+if ($LASTEXITCODE -ne 0) { throw "audio_ring build failed" }
+
+gcc @CFLAGS -Irunner/include -o tests/frame_pacing.exe tests/frame_pacing.c
+if ($LASTEXITCODE -ne 0) { throw "frame_pacing build failed" }
+
+gcc @CFLAGS -Irunner/include -o tests/geometry_interp.exe tests/geometry_interp.c
+if ($LASTEXITCODE -ne 0) { throw "geometry_interp build failed" }
 
 # ---- tests: VDP2 cell renderer -------------------------------------------
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/scsp_effects.exe tests/scsp_effects.c runner/src/scsp.c runner/src/scsp_dsp.c
+if ($LASTEXITCODE -ne 0) { throw 'scsp_effects build failed' }
+
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/vdp2_cell.exe tests/vdp2_cell.c runner/src/vdp2.c runner/src/m68k.c runner/src/m68k_bus.c runner/src/scsp.c runner/src/scsp_dsp.c runner/src/sound.c runner/src/bus.c runner/src/scu_dsp.c runner/src/sh2_interp.c runner/src/cdblock.c runner/src/smpc.c runner/src/vdp1.c runner/src/bios.c runner/src/png.c recompiler/src/disc.c external/sh2-recomp-core/common/sh2_decoder.c
 if ($LASTEXITCODE -ne 0) { throw "vdp2_cell build failed" }
+
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/vdp2_effects.exe tests/vdp2_effects.c runner/src/vdp2.c runner/src/m68k.c runner/src/m68k_bus.c runner/src/scsp.c runner/src/scsp_dsp.c runner/src/sound.c runner/src/bus.c runner/src/scu_dsp.c runner/src/sh2_interp.c runner/src/cdblock.c runner/src/smpc.c runner/src/vdp1.c runner/src/bios.c runner/src/png.c recompiler/src/disc.c external/sh2-recomp-core/common/sh2_decoder.c
+if ($LASTEXITCODE -ne 0) { throw 'vdp2_effects build failed' }
 
 # ---- tests: dual-CPU scheduler, per-core on-chip banks, FRT ---------------
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/dual_cpu.exe tests/dual_cpu.c runner/src/sh2_interp.c runner/src/bus.c runner/src/scu_dsp.c runner/src/cdblock.c runner/src/smpc.c runner/src/vdp1.c runner/src/vdp2.c runner/src/m68k.c runner/src/m68k_bus.c runner/src/scsp.c runner/src/scsp_dsp.c runner/src/sound.c runner/src/bios.c runner/src/png.c recompiler/src/disc.c external/sh2-recomp-core/common/sh2_decoder.c
@@ -118,10 +107,15 @@ $BUS_TEST_SRCS = @('runner/src/bus.c','runner/src/scu_dsp.c','runner/src/sh2_int
     'runner/src/m68k.c','runner/src/m68k_bus.c','runner/src/scsp.c','runner/src/scsp_dsp.c',
     'runner/src/sound.c','runner/src/bios.c','runner/src/png.c','recompiler/src/disc.c',
     'external/sh2-recomp-core/common/sh2_decoder.c')
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/sh2_waitloop.exe tests/sh2_waitloop.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "sh2_waitloop build failed" }
+
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/bus_alias.exe tests/bus_alias.c @BUS_TEST_SRCS
 if ($LASTEXITCODE -ne 0) { throw "bus_alias build failed" }
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/cd_bus.exe tests/cd_bus.c @BUS_TEST_SRCS
 if ($LASTEXITCODE -ne 0) { throw "cd_bus build failed" }
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/smpc_pad.exe tests/smpc_pad.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "smpc_pad build failed" }
 
 # ---- runner: SDL2 window ---------------------------------------------------
 $glslc = Join-Path $mingwBin 'glslc.exe'
@@ -133,28 +127,9 @@ if ($LASTEXITCODE -ne 0) { throw "VDP1 Vulkan shader build failed" }
 & $glslc runner\shaders\vdp2.comp -O -o runner\shaders\vdp2.comp.spv
 if ($LASTEXITCODE -ne 0) { throw "VDP2 Vulkan shader build failed" }
 
-gcc @CFLAGS '-Wl,--stack,67108864' -Irunner\include -Irecompiler\include -o runner\saturnwin.exe `
-    runner\src\window.c `
-    runner\src\vulkan_renderer.c `
-    runner\src\bus.c `
-    runner\src\scu_dsp.c `
-    runner\src\sh2_interp.c `
-    runner\src\bios.c `
-    runner\src\cdblock.c `
-    runner\src\vdp1.c `
-    runner\src\debugview.c `
-    runner\src\vdp2.c `
-    runner\src\m68k.c `
-    runner\src\m68k_bus.c `
-    runner\src\scsp.c runner\src\scsp_dsp.c `
-    runner\src\sound.c `
-    runner\src\png.c `
-    runner\src\smpc.c `
-    recompiler\src\disc.c `
-    recompiler\src\game_config.c `
-    "$CORE\sh2_decoder.c" `
-    -lmingw32 -lSDL2main -lSDL2 -lvulkan-1
-if ($LASTEXITCODE -ne 0) { throw "saturnwin build failed" }
+$env:SATURN_MINGW_BIN = $mingwBin
+& powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_runtime.ps1 -Profile $pgoMode -ProfileDir $pgoDir -ObjectDir $runtimeObjects -Output runner/saturnwin.exe -BootOutput runner/saturnboot.exe
+if ($LASTEXITCODE -ne 0) { throw 'shared runtime build failed' }
 # SDL2.dll must sit beside the executable when its directory is not on the
 # runtime PATH. The MSYS2 package places it beside gcc.exe.
 $sdlDll = Join-Path $mingwBin 'SDL2.dll'

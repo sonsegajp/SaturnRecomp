@@ -168,6 +168,36 @@ int main(void)
     ck("trace agrees that CS2 hole is unmapped",
        report_contains("0x05801008 R   2   1         unmapped"), 1);
 
+    /* Reading status must retain the drive's exact report clock and must
+     * never overwrite a command response while the host is picking it up. */
+    reset_state();
+    S.cd.boot_delay = 0;
+    S.cd.first_cmd_seen = 1;
+    S.cd.status = 1;
+    S.cd.last_peri_cy = 100;
+    S.master.cycles = 100 + 381818 - 1;
+    cdb_periodic_maybe(&S);
+    ck("periodic report is not early", (uint32_t)S.cd.periodic_count, 0);
+    S.master.cycles++;
+    cdb_periodic_maybe(&S);
+    ck("periodic report at exact deadline", (uint32_t)S.cd.periodic_count, 1);
+    ck("periodic report asserts SCDQ", S.cdb_reg[0x08 >> 1] & 0x0400u, 0x0400u);
+    S.cd.processing_cmd = 1;
+    S.master.cycles += 381818;
+    cdb_periodic_maybe(&S);
+    ck("periodic report cannot replace command reply", (uint32_t)S.cd.periodic_count, 1);
+    S.cd.processing_cmd = 0;
+    S.cd.resp_fresh = 1;
+    cdb_periodic_maybe(&S);
+    ck("reply pickup starts fresh report period", (uint32_t)S.cd.last_peri_cy, (uint32_t)S.master.cycles);
+    ck("reply pickup does not emit report", (uint32_t)S.cd.periodic_count, 1);
+    S.master.cycles += 381817;
+    cdb_periodic_maybe(&S);
+    ck("fresh reply remains through period", (uint32_t)S.cd.periodic_count, 1);
+    S.master.cycles++;
+    cdb_periodic_maybe(&S);
+    ck("fresh reply expires at exact deadline", (uint32_t)S.cd.periodic_count, 2);
+
     if (fails == 0) printf("PASS  CD/CS2 bus decode (%d checks)\n", checks);
     else            printf("FAIL  CD/CS2 bus decode: %d of %d\n", fails, checks);
     return fails ? 1 : 0;

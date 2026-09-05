@@ -42,11 +42,9 @@ static uint32_t dsp_f2i(uint16_t value)
 
 static int dsp_clz20(uint32_t v)
 {
-    /* std::countl_zero on a 32-bit value. */
-    int n = 0;
-    if (v == 0) return 32;
-    while (!(v & 0x80000000u)) { v <<= 1; n++; }
-    return n;
+    /* GCC lowers this to the host CLZ/LZCNT/BSR instruction. Keep the zero
+     * case explicit because __builtin_clz(0) is undefined. */
+    return v ? __builtin_clz(v) : 32;
 }
 
 static uint32_t dsp_i2f(uint32_t value)

@@ -15,11 +15,12 @@ layout(rgba8, binding = 7) uniform writeonly image2D scanout;
 const uint V2MASK = 0x7ffffu;
 const uint FB_PIXELS = 512u * 256u;
 
-uint vb(uint a) { a &= V2MASK; return (v2ram.d[a >> 2] >> ((a & 3u) * 8u)) & 255u; }
-uint cb(uint a) { a &= 0xfffu; return (cram.d[a >> 2] >> ((a & 3u) * 8u)) & 255u; }
+uint rotation_bank=0u;
+uint vb(uint a) { a &= V2MASK;a+=rotation_bank*0x80000u; return (v2ram.d[a >> 2] >> ((a & 3u) * 8u)) & 255u; }
+uint cb(uint a) { a &= 0xfffu;a+=rotation_bank*0x1000u; return (cram.d[a >> 2] >> ((a & 3u) * 8u)) & 255u; }
 uint v16(uint a) { return (vb(a) << 8) | vb(a + 1u); }
 uint v32(uint a) { return (vb(a)<<24) | (vb(a+1u)<<16) | (vb(a+2u)<<8) | vb(a+3u); }
-uint vr(uint off) { return regs.d[off >> 1] & 0xffffu; }
+uint vr(uint off) { return regs.d[(off >> 1)+(rotation_bank==1u?272u:rotation_bank==2u?528u:0u)] & 0xffffu; }
 
 int sextract(uint v, uint lo, uint width)
 {
@@ -76,7 +77,22 @@ vec3 apply_offset(vec3 c, int layer)
     return clamp(c + vec3(colour_offset(layer)) / 255.0, vec3(0), vec3(1));
 }
 
-struct Dot { vec3 c; int opaque; int sp; int code; };
+struct Dot { vec3 c; int opaque; int sp; int code; int msb; int ccbit; };
+
+uint vcell_scroll_y(int n, int basefx, int fracx)
+{
+    if (n < 0 || n > 1) return 0u;
+    uint scr = vr(0x9a), mzctl = vr(0x22);
+    if ((scr & (1u << uint(n * 8))) == 0u ||
+        (mzctl & (1u << uint(n))) != 0u) return 0u;
+    uint meta = regs.d[264 + n];
+    int entry = (fracx >> 11) - (basefx >> 11);
+    if ((meta & (1u << 21)) != 0u && entry > 0) --entry;
+    if ((meta & (1u << 20)) != 0u) --entry;
+    if (entry < 0) return 0u;
+    uint addr = regs.d[262] + (meta & 0xfffffu) + uint(entry) * regs.d[263];
+    return (v32(addr) >> 8) & 0x7ffffu;
+}
 
 uint plane_addr(uint v, int cellsz, bool one_word, uint planew, uint planeh)
 {
@@ -91,7 +107,7 @@ uint plane_addr(uint v, int cellsz, bool one_word, uint planew, uint planeh)
 
 Dot bitmap_dot(int n, ivec2 screen, uint ch, uint mpofn)
 {
-    Dot o; o.c=vec3(0); o.opaque=0; o.sp=0; o.code=-1;
+    Dot o; o.c=vec3(0); o.opaque=0; o.sp=0; o.code=-1; o.msb=1; o.ccbit=0;
     bool transparent = ((vr(0x20) >> uint(8+n)) & 1u) == 0u;
     uint colours = (ch >> 4) & 7u;
     uint bmsz = (ch >> 2) & 3u;
@@ -102,6 +118,7 @@ Dot bitmap_dot(int n, ivec2 screen, uint ch, uint mpofn)
     uint bmpna = vr(0x2c) >> uint(n*8);
     uint palbank = bmpna & 7u;
     o.sp = int((bmpna >> 5) & 1u);
+    o.ccbit = int((bmpna >> 4) & 1u);
     uint caos = (vr(0xe4) >> uint(n*4)) & 7u;
     const uint scx[2] = uint[2](0x70,0x80), scy[2] = uint[2](0x74,0x84);
     const uint zmx[2] = uint[2](0x78,0x88), zmy[2] = uint[2](0x7c,0x8c);
@@ -134,13 +151,13 @@ Dot bitmap_dot(int n, ivec2 screen, uint ch, uint mpofn)
     uint off, idx, p;
     if (colours==0u) {
         off=base+uint(y*pitch+x)/2u; uint b=vb(off); idx=(x&1)!=0?(b&15u):(b>>4);
-        if(transparent&&idx==0u)return o; o.c=cram_colour((caos<<8)+(palbank<<4)+idx); o.code=int((idx>>1)&7u);
+        if(transparent&&idx==0u)return o; o.c=cram_colour((caos<<8)+(palbank<<4)+idx);o.msb=cram_msb((caos<<8)+(palbank<<4)+idx)?1:0; o.code=int((idx>>1)&7u);
     } else if(colours==1u) {
         idx=vb(base+uint(y*pitch+x)); if(transparent&&idx==0u)return o;
-        o.c=cram_colour((caos<<8)+(palbank<<8)+idx); o.code=int((idx>>1)&7u);
+        o.c=cram_colour((caos<<8)+(palbank<<8)+idx);o.msb=cram_msb((caos<<8)+(palbank<<8)+idx)?1:0; o.code=int((idx>>1)&7u);
     } else if(colours==2u) {
         idx=v16(base+uint(y*pitch+x)*2u)&0x7ffu; if(transparent&&idx==0u)return o;
-        o.c=cram_colour(idx); o.code=int((idx>>1)&7u);
+        o.c=cram_colour(idx);o.msb=cram_msb(idx)?1:0; o.code=int((idx>>1)&7u);
     } else if(colours==3u) {
         p=v16(base+uint(y*pitch+x)*2u); if(transparent&&(p&0x8000u)==0u)return o; o.c=rgb555(p);
     } else {
@@ -152,7 +169,7 @@ Dot bitmap_dot(int n, ivec2 screen, uint ch, uint mpofn)
 
 Dot cell_dot(int n, bool rotation, ivec2 screen)
 {
-    Dot o; o.c=vec3(0); o.opaque=0; o.sp=0; o.code=-1;
+    Dot o; o.c=vec3(0); o.opaque=0; o.sp=0; o.code=-1; o.msb=1; o.ccbit=0;
     uint bgon=vr(0x20), chctla=vr(0x28), chctlb=vr(0x2a), mpofn=vr(0x3c);
     bool transparent=((bgon>>uint(8+(rotation?4:n)))&1u)==0u;
     uint ch = rotation ? chctlb : (n<2 ? (chctla>>uint(n*8)) : (chctlb>>uint((n-2)*4)));
@@ -177,6 +194,25 @@ Dot cell_dot(int n, bool rotation, ivec2 screen)
             if(zoomx==0)zoomx=256;if(zoomy==0)zoomy=256;
         }else{scrollfx=int(vr(sxr[n])&0x7ffu)<<8;scrollfy=int(vr(syr[n])&0x7ffu)<<8;}
     }
+    bool lineScrolled=false;
+    if(!rotation && n<2){
+        uint scr=vr(0x9a),sh=uint(n*8);
+        bool lscx=(scr&(1u<<(sh+1u)))!=0u,lscy=(scr&(1u<<(sh+2u)))!=0u;
+        bool lzmx=(scr&(1u<<(sh+3u)))!=0u;
+        uint lss=(scr>>(sh+4u))&3u;
+        if(lscx||lscy||lzmx){
+            uint u=vr(0xa0u+uint(n*4)),l=vr(0xa2u+uint(n*4));
+            uint addr=((u&7u)<<17)|(((l>>1)&0x7fffu)<<2);
+            uint stride=(lscx?4u:0u)+(lscy?4u:0u)+(lzmx?4u:0u);
+            addr+=(uint(screen.y)>>lss)*stride;
+            int lx=0,ly=screen.y<<8,lz=zoomx;
+            if(lscx){lx=int((v32(addr)>>8)&0x7ffffu);addr+=4u;}
+            if(lscy){ly=int((v32(addr)>>8)&0x7ffffu);addr+=4u;}
+            if(lzmx){lz=int((v32(addr)>>8)&0x7ffu);if(lz==0)lz=256;}
+            scrollfx=sext19(scrollfx+lx);scrollfy=sext19(scrollfy+ly);zoomx=lz;
+            lineScrolled=true;
+        }
+    }
     bool one=(pnc&0x8000u)!=0u, aux=(pnc&0x4000u)!=0u;
     uint supp=pnc&0x3ffu, cshift=cellsz==2?1u:0u, patsh=3u+cshift;
     uint patmask=(1u<<patsh)-1u, pppsh=6u-cshift;
@@ -184,36 +220,63 @@ Dot cell_dot(int n, bool rotation, ivec2 screen)
     uint pwsh=9u+(pw==2u?1u:0u), phsh=9u+(ph==2u?1u:0u);
     uint pwmask=(1u<<pwsh)-1u, phmask=(1u<<phsh)-1u;
     uint spanwmask=(uint(grid)<<pwsh)-1u, spanhmask=(uint(grid)<<phsh)-1u;
-    uint px=uint((scrollfx+screen.x*zoomx)>>8)&spanwmask;
-    uint py=uint((scrollfy+screen.y*zoomy)>>8)&spanhmask;
-    uint plane=(py>>phsh)*uint(grid)+(px>>pwsh); plane=min(plane,15u);
-    uint inx=px&pwmask, iny=py&phmask;
-    uint pagev;
-    if(rotation){uint mr=vr(0x50u+(plane>>1)*2u);pagev=((plane&1u)!=0u?mr>>8:mr)&0x3fu;pagev|=(vr(0x3e)&7u)<<6;}
-    else{uint ab=vr(0x40u+uint(n*4)),cd=vr(0x42u+uint(n*4));uint rr=plane<2u?ab:cd;pagev=((plane&1u)!=0u?rr>>8:rr)&0x3fu;pagev|=((mpofn>>uint(n*4))&7u)<<6;}
-    uint pagebase=plane_addr(pagev,cellsz,one,pw,ph);
-    uint pagestep=(one?0x2000u:0x4000u)>>(cshift*2u);
-    uint pnaddr=pagebase+(((iny>>9)<<(pw==2u?1u:0u))+(inx>>9))*pagestep;
-    px=inx&511u;py=iny&511u;
-    pnaddr+=(((py>>patsh)<<pppsh)+(px>>patsh))*(one?2u:4u);
-    uint t1=v16(pnaddr), charnum, pal, flip=0u;
-    o.sp=int((supp>>9)&1u);
-    if(one){
+    int fracx=scrollfx+screen.x*zoomx;
+    int sourcex=fracx>>8;
+    int sourcey=(scrollfy+int(vcell_scroll_y(n,scrollfx,fracx))+(lineScrolled?0:screen.y*zoomy))>>8;
+    bool overPattern=false;
+    if(rotation){
+        uint over=(vr(0x3a)>>10)&3u;
+        int maxx=int(spanwmask+1u),maxy=int(spanhmask+1u);
+        if(over==3u){maxx=512;maxy=512;}
+        if(sourcex<0||sourcey<0||sourcex>=maxx||sourcey>=maxy){
+            if(over==1u)overPattern=true;
+            else if(over!=0u)return o;
+        }
+    }
+    uint px=uint(sourcex)&(overPattern?7u:spanwmask);
+    uint py=uint(sourcey)&(overPattern?7u:spanhmask);
+    uint pnaddr=0u;
+    if(!overPattern){
+        uint plane=(py>>phsh)*uint(grid)+(px>>pwsh); plane=min(plane,15u);
+        uint inx=px&pwmask, iny=py&phmask;
+        uint pagev;
+        if(rotation){uint mr=vr(0x50u+(plane>>1)*2u);pagev=((plane&1u)!=0u?mr>>8:mr)&0x3fu;pagev|=(vr(0x3e)&7u)<<6;}
+        else{uint ab=vr(0x40u+uint(n*4)),cd=vr(0x42u+uint(n*4));uint rr=plane<2u?ab:cd;pagev=((plane&1u)!=0u?rr>>8:rr)&0x3fu;pagev|=((mpofn>>uint(n*4))&7u)<<6;}
+        uint pagebase=plane_addr(pagev,cellsz,one,pw,ph);
+        uint pagestep=(one?0x2000u:0x4000u)>>(cshift*2u);
+        pnaddr=pagebase+(((iny>>9)<<(pw==2u?1u:0u))+(inx>>9))*pagestep;
+        px=inx&511u;py=iny&511u;
+        pnaddr+=(((py>>patsh)<<pppsh)+(px>>patsh))*(one?2u:4u);
+    }
+    uint t1=overPattern?vr(0xb8):v16(pnaddr), charnum, pal, flip=0u;
+    o.sp=int((supp>>9)&1u);o.ccbit=int((supp>>8)&1u);
+    if(one||overPattern){
         pal=colours==0u?(((t1&0xf000u)>>8)|((supp&0xe0u)<<3)):((t1&0x7000u)>>4);
         if(!aux){flip=(t1&0xc00u)>>10;charnum=cellsz==1?((t1&0x3ffu)|((supp&0x1fu)<<10)):(((t1&0x3ffu)<<2)|(supp&3u)|((supp&0x1cu)<<10));}
         else{charnum=cellsz==1?((t1&0xfffu)|((supp&0x1cu)<<10)):(((t1&0xfffu)<<2)|(supp&3u)|((supp&0x10u)<<10));}
-    }else{uint t2=v16(pnaddr+2u);charnum=t2&0x7fffu;flip=(t1>>14)&3u;o.sp=int((t1>>13)&1u);pal=colours==0u?((t1&0x7fu)<<4):((t1&0x70u)<<4);}
+    }else{uint t2=v16(pnaddr+2u);charnum=t2&0x7fffu;flip=(t1>>14)&3u;o.sp=int((t1>>13)&1u);o.ccbit=int((t1>>12)&1u);pal=colours==0u?((t1&0x7fu)<<4):((t1&0x70u)<<4);}
     uint ca=charnum*0x20u;int cx=int(px&patmask),cy=int(py&patmask);
     if((flip&1u)!=0u)cx=int(patmask)-cx;if((flip&2u)!=0u)cy=int(patmask)-cy;
     uint sub=uint((cy>>3)<<int(cshift))+uint(cx>>3);
     uint cellbytes=colours==0u?0x20u:colours==1u?0x40u:colours<=3u?0x80u:0x100u;
     uint addr,idx,p;
-    if(colours==0u){addr=ca+sub*cellbytes+uint(cy&7)*4u+uint((cx&7)>>1);uint b=vb(addr);idx=(cx&1)!=0?(b&15u):(b>>4);if(transparent&&idx==0u)return o;o.c=cram_colour((caos<<8)+pal+idx);o.code=int((idx>>1)&7u);}
-    else if(colours==1u){addr=ca+sub*cellbytes+uint(cy&7)*8u+uint(cx&7);idx=vb(addr);if(transparent&&idx==0u)return o;o.c=cram_colour((caos<<8)+pal+idx);o.code=int((idx>>1)&7u);}
-    else if(colours==2u){addr=ca+sub*cellbytes+uint(cy&7)*16u+uint(cx&7)*2u;idx=v16(addr)&0x7ffu;if(transparent&&idx==0u)return o;o.c=cram_colour(idx);o.code=int((idx>>1)&7u);}
+    if(colours==0u){addr=ca+sub*cellbytes+uint(cy&7)*4u+uint((cx&7)>>1);uint b=vb(addr);idx=(cx&1)!=0?(b&15u):(b>>4);if(transparent&&idx==0u)return o;o.c=cram_colour((caos<<8)+pal+idx);o.msb=cram_msb((caos<<8)+pal+idx)?1:0;o.code=int((idx>>1)&7u);}
+    else if(colours==1u){addr=ca+sub*cellbytes+uint(cy&7)*8u+uint(cx&7);idx=vb(addr);if(transparent&&idx==0u)return o;o.c=cram_colour((caos<<8)+pal+idx);o.msb=cram_msb((caos<<8)+pal+idx)?1:0;o.code=int((idx>>1)&7u);}
+    else if(colours==2u){addr=ca+sub*cellbytes+uint(cy&7)*16u+uint(cx&7)*2u;idx=v16(addr)&0x7ffu;if(transparent&&idx==0u)return o;o.c=cram_colour(idx);o.msb=cram_msb(idx)?1:0;o.code=int((idx>>1)&7u);}
     else if(colours==3u){addr=ca+sub*cellbytes+uint(cy&7)*16u+uint(cx&7)*2u;p=v16(addr);if(transparent&&(p&0x8000u)==0u)return o;o.c=rgb555(p);}
     else{addr=ca+sub*cellbytes+uint(cy&7)*32u+uint(cx&7)*4u;if(transparent&&(vb(addr)&0x80u)==0u)return o;o.c=vec3(float(vb(addr+3u)),float(vb(addr+2u)),float(vb(addr+1u)))/255.0;}
     o.opaque=1;return o;
+}
+
+// SFCCMD selects whether this particular background dot participates in CC.
+bool dot_color_calc(int n, Dot d)
+{
+    if((vr(0xec)&(1u<<uint(n)))==0u)return false;
+    uint mode=(vr(0xee)>>uint(n*2))&3u;
+    uint bank=(vr(0x24)>>uint(n))&1u;
+    bool code=d.code<0 || ((vr(0x26)>>(bank*8u+uint(d.code)))&1u)!=0u;
+    return mode==0u || (mode==1u&&d.ccbit!=0) ||
+           (mode==2u&&d.ccbit!=0&&code) || (mode==3u&&d.msb!=0);
 }
 
 bool in_window(int x,int y,int which)
@@ -237,9 +300,11 @@ bool suppressed(uint wb,int x,int y,bool spwin,bool allowsp)
     return v;
 }
 
-ivec2 rotate_coord(ivec2 p)
+vec2 rotate_coord_at(ivec2 p,bool previous,out bool visible)
 {
-    uint base=(((vr(0xbc)&7u)<<16)|vr(0xbe))*2u;
+    rotation_bank=previous?1u:(regs.d[268]!=0u?2u:0u);
+    visible=true;
+    uint base=((((vr(0xbc)&7u)<<16)|vr(0xbe))*2u)&0xfff7cu;
     float Xst=float(sextract(v32(base+0x00u),6,23)),Yst=float(sextract(v32(base+0x04u),6,23)),Zst=float(sextract(v32(base+0x08u),6,23));
     float dXst=float(sextract(v32(base+0x0cu),6,13)),dYst=float(sextract(v32(base+0x10u),6,13));
     float dX=float(sextract(v32(base+0x14u),6,13)),dY=float(sextract(v32(base+0x18u),6,13));
@@ -247,22 +312,77 @@ ivec2 rotate_coord(ivec2 p)
     float D=float(sextract(v32(base+0x28u),6,14)),E=float(sextract(v32(base+0x2cu),6,14)),F=float(sextract(v32(base+0x30u),6,14));
     uint pp=v32(base+0x34u);float Px=float(sextract(pp>>16,0,14)),Py=float(sextract(pp,0,14));
     float Pz=float(sextract(v32(base+0x38u)>>16,0,14));
-    float Cx=float(sextract(v32(base+0x3cu),0,14)),Cy=float(sextract(v32(base+0x3eu)>>16,0,14)),Cz=float(sextract(v32(base+0x40u)>>16,0,14));
+    float Cx=float(sextract(v32(base+0x3cu)>>16,0,14)),Cy=float(sextract(v32(base+0x3eu)>>16,0,14)),Cz=float(sextract(v32(base+0x40u)>>16,0,14));
     float Mx=float(sextract(v32(base+0x44u),6,24)),My=float(sextract(v32(base+0x48u),6,24));
     float kx=float(sextract(v32(base+0x4cu),0,24)),ky=float(sextract(v32(base+0x50u),0,24));
     float Xp=A*(Px-Cx)+B*(Py-Cy)+C*(Pz-Cz)+Cx*1024.0+Mx;
     float Yp=D*(Px-Cx)+E*(Py-Cy)+F*(Pz-Cz)+Cy*1024.0+My;
+    uint kt=vr(0xb4),ramctl=vr(0x0e);
+    if((kt&1u)!=0u){
+        bool word=(kt&2u)!=0u,cramCoeff=(ramctl&0x8000u)!=0u;
+        uint mode=(kt>>2)&3u;
+        bool perDot=cramCoeff;
+        for(uint bank=0u;bank<4u;bank++){
+            if((bank&1u)!=0u&&(ramctl&(1u<<(8u+bank/2u)))==0u)continue;
+            if(((ramctl>>(bank*2u))&3u)==1u)perDot=true;
+        }
+        uint ka=(v32(base+0x54u)>>6)+((vr(0xb6)&7u)<<26)
+               +uint(sextract(v32(base+0x58u),6,20)*p.y);
+        int dk=sextract(v32(base+0x5cu),6,20);
+        int px=perDot?p.x:0;
+        uint data=word?0x8000u:0x80000000u;
+        /* An unavailable per-dot fetch retains the preceding coefficient. */
+        for(int q=px;q>=0;q--){
+            uint addr=((ka+uint(dk*q))>>10)<<(word?1u:2u);
+            if(perDot&&!cramCoeff){
+                uint bank=(addr>>17)&3u;
+                if((ramctl&(1u<<(8u+bank/2u)))==0u)bank&=~1u;
+                if(((ramctl>>(bank*2u))&3u)!=1u)continue;
+            }
+            if(cramCoeff){
+                addr=(addr|0x800u)&0xfffu;
+                data=(cb(addr)<<8)|cb(addr+1u);
+                if(!word)data=(data<<16)|(cb(addr+2u)<<8)|cb(addr+3u);
+            }else data=word?v16(addr):v32(addr);
+            break;
+        }
+        visible=(data&(word?0x8000u:0x80000000u))==0u;
+        float coeff=float(sextract(data,0,word?15:24));
+        coeff*=mode==3u?(word?16384.0:256.0):(word?64.0:1.0);
+        if(mode==0u||mode==1u)kx=coeff;
+        if(mode==0u||mode==2u)ky=coeff;
+        if(mode==3u)Xp=coeff*4.0;
+    }
     float xs=Xst+dXst*float(p.y),ys=Yst+dYst*float(p.y);
     float rx=(A*(xs-Px*1024.0)+B*(ys-Py*1024.0)+C*(Zst-Pz*1024.0))/1024.0;
     float ry=(D*(xs-Px*1024.0)+E*(ys-Py*1024.0)+F*(Zst-Pz*1024.0))/1024.0;
     float ix=(A*dX+B*dY)/1024.0,iy=(D*dX+E*dY)/1024.0;
-    return ivec2(int(((kx*(rx+ix*float(p.x))/65536.0)+Xp)/1024.0),int(((ky*(ry+iy*float(p.x))/65536.0)+Yp)/1024.0))&ivec2(2047);
+    rotation_bank=0u;
+    return vec2(((kx*(rx+ix*float(p.x))/65536.0)+Xp)/1024.0,((ky*(ry+iy*float(p.x))/65536.0)+Yp)/1024.0);
 }
 
-void push_layer(int layer,int pri,vec3 col,inout uint k0,inout int l0,inout vec3 c0,inout uint k1,inout int l1,inout vec3 c1)
+/* Interpolate the inverse screen-to-plane mapping using each field's own
+ * coefficient table. Never interpolate texture data, palette entries or
+ * visibility bits. Discontinuous mappings keep the current field. */
+ivec2 rotate_coord(ivec2 p,out bool visible) {
+    vec2 current=rotate_coord_at(p,false,visible);
+    if(regs.d[268]!=0u && visible) {
+        bool oldVisible;vec2 old=rotate_coord_at(p,true,oldVisible);
+        if(oldVisible && all(lessThan(abs(current-old),vec2(256.0))))
+            current=mix(old,current,clamp(uintBitsToFloat(regs.d[267]),0.0,1.0));
+    }
+    return ivec2(current);
+}
+
+void push_layer(int layer,int pri,vec3 col,
+                inout uint k0,inout int l0,inout vec3 c0,
+                inout uint k1,inout int l1,inout vec3 c1,
+                inout uint k2,inout int l2,inout vec3 c2)
 {
     const uint ym[7]=uint[7](2,3,4,5,1,6,0);uint k=(uint(pri)<<3)|(ym[layer]^7u);
-    if(k>k0){k1=k0;l1=l0;c1=c0;k0=k;l0=layer;c0=col;}else if(k>k1){k1=k;l1=layer;c1=col;}
+    if(k>k0){k2=k1;l2=l1;c2=c1;k1=k0;l1=l0;c1=c0;k0=k;l0=layer;c0=col;}
+    else if(k>k1){k2=k1;l2=l1;c2=c1;k1=k;l1=layer;c1=col;}
+    else if(k>k2){k2=k;l2=layer;c2=col;}
 }
 
 void main()
@@ -275,11 +395,12 @@ void main()
         imageStore(scanout,p,vec4(rgb555(raw),1.0));return;
     }
     uint bka=((((vr(0xac)&7u)<<16)|vr(0xae))*2u)+((vr(0xac)&0x8000u)!=0u?uint(p.y)*2u:0u);
-    vec3 back=rgb555(v16(bka));uint k0=1u,lmask=regs.d[260];int l0=5,l1=5;vec3 c0=back,c1=back;uint k1=1u;
+    vec3 back=rgb555(v16(bka));uint k0=1u,lmask=regs.d[260];int l0=5,l1=5,l2=5;vec3 c0=back,c1=back,c2=back;uint k1=1u,k2=1u;
     uint sptype=vr(0xe0)&15u;bool spclmd=(vr(0xe0)&0x20u)!=0u;uint display=regs.d[258]&1u;
     uint spx=uint(W>512?p.x>>1:p.x);
-    uint fi=display*FB_PIXELS+uint(p.y)*512u+spx;
-    uint sp=(spx<512u&&p.y<256)?fb.d[fi]:0u,mp=(spx<512u&&p.y<256)?meshfb.d[fi]:0u;
+    uint spy=uint(p.y)>>(((vr(0)&0xc0u)==0xc0u)?1u:0u);
+    uint fi=display*FB_PIXELS+spy*512u+spx;
+    uint sp=(spx<512u&&spy<256u)?fb.d[fi]:0u,mp=(spx<512u&&spy<256u)?meshfb.d[fi]:0u;
     const uint cmask[16]=uint[16](0x7ff,0x7ff,0x7ff,0x7ff,0x3ff,0x7ff,0x3ff,0x1ff,0x7f,0x3f,0x3f,0x3f,0xff,0xff,0xff,0xff);
     const int pshift[16]=int[16](14,13,14,13,13,12,12,12,7,7,6,-1,7,7,6,-1);
     const uint pbits[16]=uint[16](2,3,1,2,2,3,3,3,1,1,2,0,1,1,2,0);
@@ -298,6 +419,7 @@ void main()
     uint prword=vr(0xf0u+(pi>>1)*2u),sppri=((pi&1u)!=0u?prword>>8:prword)&7u;
     bool spwin=(vr(0xe0)&0x10u)!=0u&&sw;
     uint bgon=vr(0x20),prina=vr(0xf8),prinb=vr(0xfa);
+    bool dotcc[7];for(int q=0;q<7;q++)dotcc[q]=(vr(0xec)&(1u<<uint(q)))!=0u;
     uint mzctl=vr(0x22);
     int mzw=int(((mzctl>>8)&15u)+1u),mzh=int(((mzctl>>12)&15u)+1u);
     for(int n=0;n<4;n++){
@@ -307,19 +429,35 @@ void main()
         ivec2 samplep=p;
         if((mzctl&(1u<<uint(n)))!=0u)samplep-=ivec2(samplep.x%mzw,samplep.y%mzh);
         uint ch=n<2?(vr(0x28)>>uint(n*8)):(vr(0x2a)>>uint((n-2)*4));Dot d=(n<2&&(ch&2u)!=0u)?bitmap_dot(n,samplep,ch,vr(0x3c)):cell_dot(n,false,samplep);
-        if(d.opaque!=0){uint mode=(vr(0xea)>>uint(n*2))&3u;if(mode==1u)pri=(pri&~1)|d.sp;else if(mode==2u&&d.sp!=0&&d.code>=0){uint bank=(vr(0x24)>>uint(n))&1u;pri=(pri&~1)|int((vr(0x26)>>(bank*8u+uint(d.code)))&1u);}push_layer(n,pri,d.c,k0,l0,c0,k1,l1,c1);}
+        if(d.opaque!=0){dotcc[n]=dot_color_calc(n,d);uint mode=(vr(0xea)>>uint(n*2))&3u;if(mode==1u)pri=(pri&~1)|d.sp;else if(mode==2u&&d.sp!=0&&d.code>=0){uint bank=(vr(0x24)>>uint(n))&1u;pri=(pri&~1)|int((vr(0x26)>>(bank*8u+uint(d.code)))&1u);}push_layer(n,pri,d.c,k0,l0,c0,k1,l1,c1,k2,l2,c2);}
     }
     int rpri=int(vr(0xfc)&7u);if((bgon&0x10u)!=0u&&rpri!=0&&(lmask&0x10u)!=0u&&((vr(0x2a)&0x200u)==0u)){
-        uint wb=vr(0xd4)&0xffu;if(!suppressed(wb,p.x,p.y,spwin,true)){ivec2 samplep=p;if((mzctl&0x10u)!=0u)samplep-=ivec2(samplep.x%mzw,samplep.y%mzh);Dot d=cell_dot(4,true,rotate_coord(samplep));if(d.opaque!=0)push_layer(4,rpri,d.c,k0,l0,c0,k1,l1,c1);}
+        uint wb=vr(0xd4)&0xffu;if(!suppressed(wb,p.x,p.y,spwin,true)){ivec2 samplep=p;if((mzctl&0x10u)!=0u)samplep-=ivec2(samplep.x%mzw,samplep.y%mzh);bool visible;ivec2 rp=rotate_coord(samplep,visible);if(visible){Dot d=cell_dot(4,true,rp);if(d.opaque!=0){dotcc[4]=dot_color_calc(4,d);push_layer(4,rpri,d.c,k0,l0,c0,k1,l1,c1,k2,l2,c2);}}}
     }
     bool sprite_masked=suppressed(vr(0xd4)>>8,p.x,p.y,false,false);
-    bool sp_pushed=false;if((lmask&0x20u)!=0u&&spnormal&&sppri!=0u&&!spwin&&!sprite_masked){push_layer(6,int(sppri),spcol,k0,l0,c0,k1,l1,c1);sp_pushed=true;}
-    uint ccctl=vr(0xec);bool ccen=(ccctl&(1u<<uint(l0)))!=0u;vec3 colour=c0;
+    bool sp_pushed=false;if((lmask&0x20u)!=0u&&spnormal&&sppri!=0u&&!spwin&&!sprite_masked){push_layer(6,int(sppri),spcol,k0,l0,c0,k1,l1,c1,k2,l2,c2);sp_pushed=true;}
+    uint ccctl=vr(0xec);bool ccen=dotcc[l0];vec3 colour=c0;
     uint ccwb=vr(0xd6)>>8;if(ccen&&!suppressed(ccwb,p.x,p.y,spwin,true)){
         uint ratios[7]=uint[7](vr(0x108)&31u,(vr(0x108)>>8)&31u,vr(0x10a)&31u,(vr(0x10a)>>8)&31u,vr(0x10c)&31u,0u,vr(0x100)&31u);
         uint use=(ccctl&0x200u)!=0u?uint(l1):uint(l0),tw=31u-ratios[use];if(l0==6)tw=31u-((vr(0x100u+(ri>>1)*2u)>>((ri&1u)*8u))&31u);
         bool ok=true;if(l0==6){uint cond=(vr(0xe0)>>12)&3u,nv=(vr(0xe0)>>8)&7u;ok=cond==0u?sppri<=nv:cond==1u?sppri==nv:cond==2u?sppri>=nv:(sprgb||cram_msb(((vr(0xe6)>>4)&7u)*256u+cd));}
-        if(ok)colour=blend(c0,c1,tw,(ccctl&0x100u)!=0u);
+        if(ok){
+            /* EXCCEN extends colour calculation through the next layer.
+             * Sonic R enables this (CCCTL=0x047C) for its water/shoreline:
+             * first combine layers 1 and 2 equally, then apply layer 0's
+             * normal ratio against that result. */
+            vec3 under=c1;
+            if((ccctl&0x400u)!=0u&&dotcc[l1])
+                under=blend(c1,c2,16u,false);
+            if(l0!=5&&(vr(0xe8)&(1u<<uint(l0)))!=0u){
+                uint la=(((vr(0xa8)&7u)<<16)|vr(0xaa))*2u;
+                if((vr(0xa8)&0x8000u)!=0u)la+=uint(p.y)*2u;
+                vec3 lc=cram_colour(v16(la)&0x7ffu);
+                under=(ccctl&0x420u)==0x420u?blend(under,lc,16u,false):lc;
+                if((ccctl&0x200u)!=0u)tw=31u-(vr(0x10e)&31u);
+            }
+            colour=blend(c0,under,tw,(ccctl&0x100u)!=0u);
+        }
     }
     colour=apply_offset(colour,l0);
     if(mp!=0u){vec3 mc=(spclmd&&(mp&0x8000u)!=0u)?rgb555(mp):cram_colour(((vr(0xe6)>>4)&7u)*256u+(mp&cmask[sptype]));colour=blend(mc,colour,16u,false);}

@@ -34,6 +34,59 @@ static int smpcdbg(void) {
 
 #define OREG(n) (uint32_t)(OREG0 + (n) * 2)
 
+static void padseq_parse(saturn *s, char *text)
+{
+    char *tk = strtok(text, ",\r\n");
+    while (tk && s->npadseq < (int)(sizeof(s->padseq) / sizeof(s->padseq[0]))) {
+        char *col = strchr(tk, ':');
+        if (col) {
+            char *col2 = strchr(col + 1, ':');
+            *col = 0;
+            if (col2) *col2 = 0;
+            s->padseq[s->npadseq].cy = strtoull(tk, NULL, 0);
+            s->padseq[s->npadseq].lo = (uint8_t)strtoul(col + 1, NULL, 0);
+            s->padseq[s->npadseq].hi =
+                col2 ? (uint8_t)strtoul(col2 + 1, NULL, 0) : 0;
+            s->npadseq++;
+        }
+        tk = strtok(NULL, ",\r\n");
+    }
+}
+
+void smpc_padseq_load_env(saturn *s)
+{
+    const char *inline_seq = getenv("SATURN_PADSEQ");
+    const char *path = getenv("SATURN_PADSEQ_FILE");
+    if (inline_seq && *inline_seq) {
+        size_t len = strlen(inline_seq);
+        char *sq = (char *)malloc(len + 1);
+        if (sq) {
+            memcpy(sq, inline_seq, len + 1);
+            padseq_parse(s, sq);
+            free(sq);
+        }
+    }
+    if (path && *path) {
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            fprintf(stderr, "warning: could not open SATURN_PADSEQ_FILE %s\n", path);
+            return;
+        }
+        if (fseek(f, 0, SEEK_END) == 0) {
+            long size = ftell(f);
+            if (size >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+                char *sq = (char *)malloc((size_t)size + 1);
+                if (sq && fread(sq, 1, (size_t)size, f) == (size_t)size) {
+                    sq[size] = 0;
+                    padseq_parse(s, sq);
+                }
+                free(sq);
+            }
+        }
+        fclose(f);
+    }
+}
+
 /* Commands */
 #define CMD_MSHON     0x00
 #define CMD_SSHON     0x02
@@ -144,6 +197,7 @@ static void intback_status(saturn *s)
 static void pad_now(saturn *s, uint8_t *lo, uint8_t *hi)
 {
     static uint8_t trace_lo, trace_hi;
+    static uint8_t trace_x, trace_y, trace_l, trace_r;
     static int trace_valid;
     static uint8_t live_lo, live_hi;
     static uint64_t live_read_cycle;
@@ -209,40 +263,68 @@ static void pad_now(saturn *s, uint8_t *lo, uint8_t *hi)
         }
     }
     if (getenv("SATURN_PADTRACE") &&
-        (!trace_valid || *lo != trace_lo || *hi != trace_hi)) {
-        fprintf(stderr, "[padtrace] pad=%02X %02X mastercy=%llu clk=%llu\n",
-                *lo, *hi, (unsigned long long)s->master.cycles,
+        (!trace_valid || *lo != trace_lo || *hi != trace_hi ||
+         (s->pad1_analog && (s->pad1_x != trace_x || s->pad1_y != trace_y ||
+                            s->pad1_l != trace_l || s->pad1_r != trace_r)))) {
+        fprintf(stderr, "[padtrace] pad=%02X %02X analog=%d x=%02X y=%02X "
+                        "l=%02X r=%02X mastercy=%llu clk=%llu\n",
+                *lo, *hi, s->pad1_analog, s->pad1_x, s->pad1_y,
+                s->pad1_l, s->pad1_r,
+                (unsigned long long)s->master.cycles,
                 (unsigned long long)s->clk);
         trace_lo = *lo;
         trace_hi = *hi;
+        trace_x = s->pad1_x;
+        trace_y = s->pad1_y;
+        trace_l = s->pad1_l;
+        trace_r = s->pad1_r;
         trace_valid = 1;
     }
+}
+
+/* Build the device ID plus data bytes exactly as an INTBACK direct peripheral
+ * report expects. The 3D Control Pad identifies as type 1 with six data bytes
+ * (0x16); a Standard Pad remains type 0 with two bytes (0x02). */
+unsigned smpc_pad_report(saturn *s, uint8_t out[7])
+{
+    uint8_t lo, hi;
+    if (!s || !out) return 0;
+    pad_now(s, &lo, &hi);
+    out[0] = s->pad1_analog ? 0x16u : 0x02u;
+    out[1] = (uint8_t)~lo;
+    /* Bits 2-0 are fixed high on both standard and 3D pad reports. */
+    out[2] = (uint8_t)(~hi | 0x07u);
+    if (!s->pad1_analog) return 3;
+    out[3] = s->pad1_x;
+    out[4] = s->pad1_y;
+    out[5] = s->pad1_r;
+    out[6] = s->pad1_l;
+    return 7;
 }
 
 static void intback_peripheral(saturn *s)
 {
     int i;
+    uint8_t report[7];
+    unsigned report_len;
     ow(s, 0, 0xF1);                  /* port 1: direct, 1 device             */
-    ow(s, 1, 0x02);                  /* peripheral ID: digital pad, 2 bytes  */
+    report_len = smpc_pad_report(s, report);
     {
         /* SATURN_PADAT delays the press until a chosen cycle, so a headless
          * run can present a press EDGE while the menu is live -- a button held
          * from power-on never transitions, and menus act on transitions. */
-        uint8_t lo, hi;
-        pad_now(s, &lo, &hi);
         /* Report what is actually SENT, after SATURN_PADSEQ / SATURN_PADAT
          * have had their say. Printing the raw pad fields BEFORE this
          * resolution showed "no buttons" for every scripted press and made
          * a working sequence look dead. */
         if (smpcdbg())
-            printf("[smpc] PERIPHERAL report, pad=%02X %02X first=%d cy=%llu\n",
-                   lo, hi, s->ib_first,
+            printf("[smpc] PERIPHERAL report, id=%02X data=%02X %02X first=%d cy=%llu\n",
+                   report[0], report[1], report[2], s->ib_first,
                    (unsigned long long)s->master.cycles);
-        ow(s, 2, (uint8_t)~lo);
-        ow(s, 3, (uint8_t)~hi);
     }
-    ow(s, 4, 0xF0);                  /* port 2: direct, no device            */
-    for (i = 5; i < 32; i++) ow(s, i, 0xFF);
+    for (i = 0; i < (int)report_len; ++i) ow(s, 1 + i, report[i]);
+    ow(s, 1 + (int)report_len, 0xF0); /* port 2: direct, no device            */
+    for (i = 2 + (int)report_len; i < 32; i++) ow(s, i, 0xFF);
 
     s->smpc_reg[SR & 0x7F] = (uint8_t)(0x80
                             | (s->ib_first ? 0x40 : 0x00)      /* PDL */
@@ -594,18 +676,57 @@ uint8_t smpc_pdr_read(saturn *s, int port)
 
     pad_now(s, &lo, &hi);
 
-    /* Match Ymir ControlPad::WritePDR exactly. The DDR chooses the protocol;
+    /* Match Ymir's ControlPad/AnalogPad::WritePDR exactly. The DDR chooses
+     * the protocol;
      * looking only at PDR accidentally treated TH-only reads as four-phase
      * TH/TR reads. A title polling in TH mode could therefore decode Start as
      * several face buttons too -- the standard A+B+C+Start soft-reset chord. */
     if (port != 0) return 0x00;          /* NullPeripheral::WritePDR */
     switch (ddr & 0x7Fu) {
     case 0x40:                           /* TH control mode */
+        if (s->pad1_analog)
+            return (pdr & 0x40u) ? 0x71u : 0x31u;
         return (pdr & 0x40u) ? 0x74u : 0x35u;
     case 0x60:                           /* TH/TR control mode */
         break;
     default:
         return 0xFFu;
+    }
+
+    if (s->pad1_analog) {
+        uint8_t tr = (uint8_t)((pdr >> 5) & 1u);
+        uint8_t data;
+
+        /* The 3D pad uses a TH/TR/TL handshake. TH resets the stream; each TR
+         * transition clocks one nibble and TL mirrors TR in response. */
+        if (pdr & 0x40u) {
+            s->pad1_report_pos = 0;
+            s->pad1_tl = 0;
+            return 0xFFu;
+        }
+        if (s->pad1_report_pos != 0 && tr == s->pad1_tl) return 0xFFu;
+
+        s->pad1_tl = tr;
+        switch (s->pad1_report_pos) {
+        case 0:  data = 0x1u; break; /* type 1: 3D Control Pad */
+        case 1:  data = 0x5u; break; /* five following byte pairs */
+        case 2:  data = (uint8_t)(~lo >> 4) & 0xFu; break;
+        case 3:  data = (uint8_t)~lo & 0xFu; break;
+        case 4:  data = (uint8_t)(~hi >> 4) & 0xFu; break;
+        case 5:  data = (uint8_t)((((uint8_t)~hi >> 3) & 1u) << 3) | 0x4u; break;
+        case 6:  data = s->pad1_x >> 4; break;
+        case 7:  data = s->pad1_x & 0xFu; break;
+        case 8:  data = s->pad1_y >> 4; break;
+        case 9:  data = s->pad1_y & 0xFu; break;
+        case 10: data = s->pad1_l >> 4; break;
+        case 11: data = s->pad1_l & 0xFu; break;
+        case 12: data = s->pad1_r >> 4; break;
+        case 13: data = s->pad1_r & 0xFu; break;
+        case 14: data = 0x0u; break;
+        default: data = 0x1u; break;
+        }
+        s->pad1_report_pos = (uint8_t)((s->pad1_report_pos + 1u) & 15u);
+        return (uint8_t)((s->pad1_tl << 4) | data);
     }
 
     /* Ymir ControlPad::WritePDR is the authority here, and the order is NOT
@@ -703,4 +824,6 @@ void smpc_reset(saturn *s)
     s->ib_p2md = 0;
     s->pad1_lo = 0;
     s->pad1_hi = 0;
+    s->pad1_report_pos = 0;
+    s->pad1_tl = 0;
 }

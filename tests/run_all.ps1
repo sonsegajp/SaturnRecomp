@@ -1,4 +1,4 @@
-﻿# run_all.ps1 -- SaturnRecomp test suite.
+# run_all.ps1 -- SaturnRecomp test suite.
 #
 # Two layers, both game-agnostic:
 #
@@ -54,6 +54,53 @@ if (Test-Path 'tests\sh2_fastpath_fuzz.exe') {
 }
 
 # ------------------------------------------------ 0b. VDP2 cell renderer ----
+Section 'SH-2 scheduler-bounded wait loops vs reference interpreter'
+if (Test-Path 'tests/sh2_waitloop.exe') {
+    & 'tests/sh2_waitloop.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'sh2_waitloop.exe not built - run build.ps1'; $skip++ }
+
+Section 'SCSP FM feedback and pitch/amplitude LFO'
+if (Test-Path 'tests/scsp_modulation.exe') {
+    & 'tests/scsp_modulation.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'scsp_modulation.exe not built'; $skip++ }
+
+Section 'Windows frontend audio ring capacity and wraparound'
+if (Test-Path 'tests/audio_ring.exe') {
+    & 'tests/audio_ring.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'audio_ring.exe not built - run build.ps1'; $skip++ }
+
+Section 'Presentation deadlines under variable CPU work and host stalls'
+if (Test-Path 'tests/frame_pacing.exe') {
+    & 'tests/frame_pacing.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'frame_pacing.exe not built - run build.ps1'; $skip++ }
+
+Section 'Experimental geometry matching and presentation budget'
+if (Test-Path 'tests/geometry_interp.exe') {
+    & 'tests/geometry_interp.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'geometry_interp.exe not built'; $skip++ }
+Section 'SCSP live DSP registers and effect playback'
+if (Test-Path 'tests/scsp_effects.exe') {
+    & 'tests/scsp_effects.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else {
+    Write-Host 'scsp_effects.exe not built - run build.ps1'
+    $skip++
+}
+
+Section 'VDP2 rotation coefficients and per-dot color calculation'
+if (Test-Path 'tests/vdp2_effects.exe') {
+    & 'tests/vdp2_effects.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else {
+    Write-Host 'vdp2_effects.exe not built - run build.ps1'
+    $skip++
+}
+
 Section 'VDP2 cell renderer (known layout, vs the VDP2 manual)'
 
 if (Test-Path 'tests/vdp2_cell.exe') {
@@ -121,6 +168,17 @@ if (Test-Path 'tests/cd_bus.exe') {
     if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
 } else {
     Write-Host 'cd_bus.exe not built - run build.ps1' -ForegroundColor Yellow
+    $skip++
+}
+
+Section 'SMPC Standard Pad and 3D Control Pad reports'
+
+if (Test-Path 'tests/smpc_pad.exe') {
+    $out = & 'tests/smpc_pad.exe' 2>&1
+    $out | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else {
+    Write-Host 'smpc_pad.exe not built - run build.ps1' -ForegroundColor Yellow
     $skip++
 }
 

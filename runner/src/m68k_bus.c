@@ -52,11 +52,7 @@ void m68k_w8(m68k *m, uint32_t a, uint8_t v)
     if (!s) return;
     if (a < 0x100000u) { s->sound_ram[sram_off(a)] = v; return; }
     if (a < 0x101000u) {
-        /* Byte writes to a 16-bit register file: merge into the word. */
-        uint32_t ra = (a - 0x100000u) & ~1u;
-        uint16_t w = scsp_read(s, ra);
-        w = (uint16_t)((a & 1u) ? ((w & 0xFF00u) | v) : ((w & 0x00FFu) | ((uint16_t)v << 8)));
-        scsp_write(s, ra, w);
+        scsp_write8(s, a - 0x100000u, v);
     }
 }
 

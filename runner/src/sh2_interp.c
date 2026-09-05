@@ -305,13 +305,15 @@ hit:
 static uint16_t ifetch(saturn *s, sh2 *c, uint32_t pc)
 {
     uint32_t fa = pc & 0x07FFFFFEu;
+    int watch_fetch = s->rrange_hi &&
+        fa <= s->rrange_hi && fa + 1u >= s->rrange_lo;
     /* Only partition 000 is cached. Partition 001 is the cache-through alias. */
-    if ((pc >> 29) == 0u && (c->onchip[0x92] & 0x01u) && !s->rrange_hi)
+    if ((pc >> 29) == 0u && (c->onchip[0x92] & 0x01u) && !watch_fetch)
         return cache_ifetch(s, c, pc);
-    if ((fa & ~0xFFFu) == c->if_tag)
+    if (!watch_fetch && (fa & ~0xFFFu) == c->if_tag)
         return (uint16_t)((c->if_page[fa & 0xFFEu] << 8) |
                            c->if_page[(fa & 0xFFEu) + 1u]);
-    if ((pc >> 29) != 7u && !s->rrange_hi) {
+    if ((pc >> 29) != 7u && !watch_fetch) {
         const uint8_t *pg = bus_page(s, fa);
         if (pg) {
             c->if_page = pg;
@@ -368,7 +370,11 @@ static inline const uint8_t *fast_read_ptr(sh2 *c, uint32_t a, uint32_t size)
     if ((a >> 29) == 2u) return NULL;
     if ((a >> 29) == 3u) return NULL;   /* cache address array */
     if (((a >> 29) & 5u) == 4u) return NULL;
-    if (s->rrange_hi) return NULL;
+    /* A range watch only needs the full bus path for reads which overlap the
+     * watched bytes.  Disabling direct WRAM reads globally made a targeted
+     * 256-byte watch turn a one-minute replay into a several-minute run. */
+    if (s->rrange_hi && b <= s->rrange_hi &&
+        b + size - 1u >= s->rrange_lo) return NULL;
     if (b >= 0x06000000u) {
         o = (b - 0x06000000u) & (WRAM_H_SIZE - 1u);
         return o + size <= WRAM_H_SIZE ? &s->wram_h[o] : NULL;
@@ -387,7 +393,7 @@ static inline const uint8_t *fast_read_ptr(sh2 *c, uint32_t a, uint32_t size)
 static inline uint8_t *fast_write_ptr(sh2 *c, uint32_t a, uint32_t size)
 {
     saturn *s = c->sys;
-    uint32_t b = a & 0x07FFFFFFu, o;
+    uint32_t b = a & 0x07FFFFFFu, o, cb, end;
     if ((a >> 29) == 7u) return NULL;
     /* Cache-purge writes invalidate cache entries internally and never reach
      * external memory.  This must be rejected before the 27-bit bus mask:
@@ -397,7 +403,33 @@ static inline uint8_t *fast_write_ptr(sh2 *c, uint32_t a, uint32_t size)
     if ((a >> 29) == 2u) return NULL;
     if ((a >> 29) == 3u) return NULL;   /* cache address array */
     if (((a >> 29) & 5u) == 4u) return NULL;   /* cache data array */
-    if (s->wrange_hi || s->wwatch_addr) return NULL;
+    /* Like the read-range diagnostic above, write watches only need the full
+     * bus decoder for stores which actually cover a watched byte.  Globally
+     * disabling direct WRAM stores turned a tiny controller-buffer trace into
+     * a multi-minute replay and distorted the very pacing being investigated.
+     * WRAM-H mirrors must be folded the same way as bus.c's canon_addr(). */
+    cb = b >= 0x06000000u
+        ? 0x06000000u | ((b - 0x06000000u) & (WRAM_H_SIZE - 1u))
+        : b;
+    end = cb + size - 1u;
+    if (s->wrange_hi) {
+        uint32_t lo = s->wrange_lo;
+        uint32_t hi = s->wrange_hi;
+        if (lo >= 0x06000000u)
+            lo = 0x06000000u |
+                 ((lo - 0x06000000u) & (WRAM_H_SIZE - 1u));
+        if (hi >= 0x06000000u)
+            hi = 0x06000000u |
+                 ((hi - 0x06000000u) & (WRAM_H_SIZE - 1u));
+        if (cb <= hi && end >= lo) return NULL;
+    }
+    if (s->wwatch_addr) {
+        uint32_t w = s->wwatch_addr & 0x07FFFFFFu;
+        if (w >= 0x06000000u)
+            w = 0x06000000u |
+                ((w - 0x06000000u) & (WRAM_H_SIZE - 1u));
+        if (cb <= w && w <= end) return NULL;
+    }
     if (c == &s->master && c->pc >= 0x000002B0u && c->pc <= 0x000002B6u &&
         s->prot_hi && b >= s->prot_lo && b < s->prot_hi) return NULL;
     if (b >= 0x06000000u) {
@@ -495,7 +527,6 @@ static void dbg_init(void)
                 getenv("SATURN_RING")  != NULL ||
                 getenv("SATURN_RING_ANY") != NULL ||
                 getenv("SATURN_WATCH") != NULL ||
-                getenv("SATURN_DUMPAT") != NULL ||
                 getenv("SATURN_BAL_A") != NULL ||
                 getenv("SATURN_SNAP")  != NULL;
     dbg.rings = dbg.heavy || getenv("SATURN_JSRTRACE") != NULL ||
@@ -1574,12 +1605,185 @@ static int exec_one(sh2 *c, const sh2_insn *i)
     return 1;
 }
 
+/* Keep the ordinary dispatcher inline once. Delay slots share an outlined
+ * copy to avoid six large expansions competing for the host instruction cache. */
+#define FAST_SIMPLE(OP, PCV, HND) \
+do { \
+    uint32_t fn = ((OP) >> 8) & 15u, fm = ((OP) >> 4) & 15u; \
+    HND = 1; \
+    switch ((OP) >> 12) { \
+    case 0x5: R[fn] = fast_r32(c, R[fm] + ((OP) & 15u) * 4u); break; \
+    case 0x1: fast_w32(c, R[fn] + ((OP) & 15u) * 4u, R[fm]); break; \
+    case 0x7: R[fn] += (uint32_t)(int32_t)(int8_t)((OP) & 0xFF); break; \
+    case 0xE: R[fn] = (uint32_t)(int32_t)(int8_t)((OP) & 0xFF); break; \
+    case 0x9: R[fn] = (uint32_t)(int32_t)(int16_t)fast_r16(c, (PCV) + 4 + ((OP) & 0xFFu) * 2u); break; \
+    case 0xD: R[fn] = fast_r32(c, (((PCV) & ~3u) + 4) + ((OP) & 0xFFu) * 4u); break; \
+    case 0x6: \
+        switch ((OP) & 15u) { \
+        case 0x2: R[fn] = fast_r32(c, R[fm]); break; \
+        case 0x3: R[fn] = R[fm]; break; \
+        case 0x4: { uint32_t v = fast_r8(c, R[fm]);  if (fn != fm) R[fm] += 1; R[fn] = (uint32_t)(int32_t)(int8_t)v; } break; \
+        case 0x5: { uint32_t v = fast_r16(c, R[fm]); if (fn != fm) R[fm] += 2; R[fn] = (uint32_t)(int32_t)(int16_t)v; } break; \
+        case 0x6: { uint32_t v = fast_r32(c, R[fm]); if (fn != fm) R[fm] += 4; R[fn] = v; } break; \
+        case 0x7: R[fn] = ~R[fm]; break; \
+        case 0x8: R[fn] = (R[fm] & 0xFFFF0000u) | ((R[fm] & 0xFFu) << 8) | ((R[fm] >> 8) & 0xFFu); break; \
+        case 0x9: R[fn] = (R[fm] << 16) | (R[fm] >> 16); break; \
+        case 0xB: R[fn] = 0u - R[fm]; break; \
+        case 0xC: R[fn] = R[fm] & 0xFFu; break; \
+        case 0xD: R[fn] = R[fm] & 0xFFFFu; break; \
+        case 0xE: R[fn] = (uint32_t)(int32_t)(int8_t)R[fm]; break; \
+        case 0xF: R[fn] = (uint32_t)(int32_t)(int16_t)R[fm]; break; \
+        case 0x0: R[fn] = (uint32_t)(int32_t)(int8_t)fast_r8(c, R[fm]); break; \
+        case 0x1: { \
+            uint32_t _a = R[fm], _v = fast_r16(c, _a); \
+            R[fn] = (uint32_t)(int32_t)(int16_t)_v; \
+            if (movwtrace_on && (PCV) == 0x06070D64u) \
+                fprintf(stderr, "[movw-fast] pc=%08X addr=%08X raw=%04X result=%08X\n", \
+                        (uint32_t)(PCV), _a, (unsigned)_v, R[fn]); \
+        } break; \
+        default: HND = 0; break; \
+        } break; \
+    case 0x2: \
+        switch ((OP) & 15u) { \
+        case 0x2: fast_w32(c, R[fn], R[fm]); break; \
+        /* Write the SOURCE before updating Rn: with m == n the \
+         * stored value is the pre-decrement one (Ymir MOVBM). */ \
+        case 0x4: { uint32_t _a = R[fn] - 1; fast_w8(c, _a, (uint8_t)R[fm]); R[fn] = _a; } break; \
+        case 0x5: { uint32_t _a = R[fn] - 2; fast_w16(c, _a, (uint16_t)R[fm]); R[fn] = _a; } break; \
+        case 0x6: { uint32_t _a = R[fn] - 4; fast_w32(c, _a, R[fm]); R[fn] = _a; } break; \
+        case 0x0: fast_w8(c, R[fn], (uint8_t)R[fm]); break; \
+        case 0x1: fast_w16(c, R[fn], (uint16_t)R[fm]); break; \
+        case 0x8: SET_T((R[fn] & R[fm]) == 0); break; \
+        case 0x9: R[fn] &= R[fm]; break; \
+        case 0xA: R[fn] ^= R[fm]; break; \
+        case 0xB: R[fn] |= R[fm]; break; \
+        case 0xD: R[fn] = (R[fm] << 16) | (R[fn] >> 16); break; \
+        default: HND = 0; break; \
+        } break; \
+    case 0x3: \
+        switch ((OP) & 15u) { \
+        case 0x0: SET_T(R[fn] == R[fm]); break; \
+        case 0x2: SET_T(R[fn] >= R[fm]); break; \
+        case 0x3: SET_T((int32_t)R[fn] >= (int32_t)R[fm]); break; \
+        case 0x6: SET_T(R[fn] > R[fm]); break; \
+        case 0x7: SET_T((int32_t)R[fn] > (int32_t)R[fm]); break; \
+        case 0xC: R[fn] += R[fm]; break; \
+        case 0x8: R[fn] -= R[fm]; break; \
+        case 0x4: { \
+            uint32_t _tmp0, _tmp2 = R[fm]; \
+            uint8_t _oq = (c->sr & SR_Q) != 0, _M = (c->sr & SR_M) != 0; \
+            uint8_t _Q = (R[fn] >> 31) & 1u, _tmp1; \
+            R[fn] = (R[fn] << 1) | ((c->sr & SR_T) != 0); \
+            if (!_oq) { \
+                if (!_M) { _tmp0=R[fn]; R[fn]-=_tmp2; _tmp1=R[fn]>_tmp0; _Q=_Q ? !_tmp1 : _tmp1; } \
+                else     { _tmp0=R[fn]; R[fn]+=_tmp2; _tmp1=R[fn]<_tmp0; _Q=_Q ? _tmp1 : !_tmp1; } \
+            } else { \
+                if (!_M) { _tmp0=R[fn]; R[fn]+=_tmp2; _tmp1=R[fn]<_tmp0; _Q=_Q ? !_tmp1 : _tmp1; } \
+                else     { _tmp0=R[fn]; R[fn]-=_tmp2; _tmp1=R[fn]>_tmp0; _Q=_Q ? _tmp1 : !_tmp1; } \
+            } \
+            if (_Q) c->sr |= SR_Q; else c->sr &= ~SR_Q; \
+            SET_T(_Q == _M); \
+        } break; \
+        case 0x5: { uint64_t _r=(uint64_t)R[fn]*R[fm]; c->mach=(uint32_t)(_r>>32); c->macl=(uint32_t)_r; } break; \
+        case 0xD: { int64_t _r=(int64_t)(int32_t)R[fn]*(int64_t)(int32_t)R[fm]; c->mach=(uint32_t)((uint64_t)_r>>32); c->macl=(uint32_t)_r; } break; \
+        default: HND = 0; break; \
+        } break; \
+    case 0x4: \
+        switch ((OP) & 0xFF) { \
+        case 0x10: R[fn] -= 1; SET_T(R[fn] == 0); break; \
+        case 0x00: SET_T((R[fn] >> 31) & 1u); R[fn] <<= 1; break; \
+        case 0x01: SET_T(R[fn] & 1u); R[fn] >>= 1; break; \
+        case 0x08: R[fn] <<= 2;  break; \
+        case 0x09: R[fn] >>= 2;  break; \
+        case 0x18: R[fn] <<= 8;  break; \
+        case 0x19: R[fn] >>= 8;  break; \
+        case 0x28: R[fn] <<= 16; break; \
+        case 0x29: R[fn] >>= 16; break; \
+        case 0x21: SET_T(R[fn] & 1u); R[fn] = (uint32_t)((int32_t)R[fn] >> 1); break; \
+        case 0x24: { uint32_t _t=(c->sr & SR_T)!=0; SET_T(R[fn] >> 31); R[fn]=(R[fn]<<1)|_t; } break; \
+        case 0x25: { uint32_t _t=(c->sr & SR_T)!=0; SET_T(R[fn] & 1u); R[fn]=(R[fn]>>1)|(_t<<31); } break; \
+        case 0x22: R[fn] -= 4; fast_w32(c, R[fn], c->pr); break; \
+        case 0x26: c->pr = fast_r32(c, R[fn]); R[fn] += 4; break; \
+        case 0x11: SET_T((int32_t)R[fn] >= 0); break; \
+        case 0x15: SET_T((int32_t)R[fn] > 0); break; \
+        case 0x02: R[fn]-=4; fast_w32(c,R[fn],c->mach); break; \
+        case 0x12: R[fn]-=4; fast_w32(c,R[fn],c->macl); break; \
+        case 0x06: c->mach=fast_r32(c,R[fn]); R[fn]+=4; break; \
+        case 0x16: c->macl=fast_r32(c,R[fn]); R[fn]+=4; break; \
+        case 0x0A: c->mach=R[fn]; break; \
+        case 0x1A: c->macl=R[fn]; break; \
+        case 0x2A: c->pr=R[fn]; break; \
+        default: HND = 0; break; \
+        } break; \
+    case 0x8: \
+        switch (((OP) >> 8) & 15u) { \
+        case 0x0: fast_w8(c, R[fm] + ((OP) & 15u), (uint8_t)R[0]); break; \
+        case 0x1: fast_w16(c, R[fm] + (((OP) & 15u) << 1), (uint16_t)R[0]); break; \
+        case 0x4: R[0] = (uint32_t)(int32_t)(int8_t)fast_r8(c, R[fm] + ((OP) & 15u)); break; \
+        case 0x5: R[0] = (uint32_t)(int32_t)(int16_t)fast_r16(c, R[fm] + (((OP) & 15u) << 1)); break; \
+        case 0x8: SET_T(R[0] == (uint32_t)(int32_t)(int8_t)((OP) & 0xFF)); break; \
+        default: HND = 0; break; \
+        } \
+        break; \
+    case 0xC: \
+        switch (((OP) >> 8) & 15u) { \
+        case 0x0: fast_w8(c,c->gbr+((OP)&0xFFu),(uint8_t)R[0]); break; \
+        case 0x1: fast_w16(c,c->gbr+(((OP)&0xFFu)<<1),(uint16_t)R[0]); break; \
+        case 0x2: fast_w32(c,c->gbr+(((OP)&0xFFu)<<2),R[0]); break; \
+        case 0x4: R[0]=(uint32_t)(int32_t)(int8_t)fast_r8(c,c->gbr+((OP)&0xFFu)); break; \
+        case 0x5: R[0]=(uint32_t)(int32_t)(int16_t)fast_r16(c,c->gbr+(((OP)&0xFFu)<<1)); break; \
+        case 0x6: R[0]=fast_r32(c,c->gbr+(((OP)&0xFFu)<<2)); break; \
+        case 0x7: R[0]=(((PCV)&~3u)+4)+(((OP)&0xFFu)<<2); break; \
+        case 0x8: SET_T((R[0] & ((OP) & 0xFFu)) == 0); break; \
+        case 0x9: R[0] &= (OP) & 0xFFu; break; \
+        case 0xA: R[0] ^= (OP) & 0xFFu; break; \
+        case 0xB: R[0] |= (OP) & 0xFFu; break; \
+        default: HND = 0; break; \
+        } break; \
+    case 0x0: \
+        if ((OP) == 0x0009) { } \
+        else if ((OP) == 0x0008) c->sr &= ~SR_T; \
+        else if ((OP) == 0x0018) c->sr |= SR_T; \
+        else if ((OP) == 0x0019) c->sr &= ~(SR_M|SR_Q|SR_T); \
+        else if ((OP) == 0x0028) c->mach = c->macl = 0; \
+        else if (((OP) & 0xF0FFu) == 0x0029u) R[fn] = (c->sr & SR_T) ? 1u : 0u; \
+        else if (((OP) & 0xF0FFu) == 0x0002u) R[fn] = c->sr & SR_MASK; \
+        else if (((OP) & 0xF0FFu) == 0x000Au) R[fn] = c->mach; \
+        else if (((OP) & 0xF0FFu) == 0x001Au) R[fn] = c->macl; \
+        else if (((OP) & 0xF00Fu) == 0x0004u) fast_w8(c,R[0]+R[fn],(uint8_t)R[fm]); \
+        else if (((OP) & 0xF00Fu) == 0x0005u) fast_w16(c,R[0]+R[fn],(uint16_t)R[fm]); \
+        else if (((OP) & 0xF00Fu) == 0x0006u) fast_w32(c,R[0]+R[fn],R[fm]); \
+        else if (((OP) & 0xF00Fu) == 0x000Cu) R[fn]=(uint32_t)(int32_t)(int8_t)fast_r8(c,R[0]+R[fm]); \
+        else if (((OP) & 0xF00Fu) == 0x000Du) R[fn]=(uint32_t)(int32_t)(int16_t)fast_r16(c,R[0]+R[fm]); \
+        else if (((OP) & 0xF00Fu) == 0x000Eu) R[fn]=fast_r32(c,R[0]+R[fm]); \
+        else if (((OP) & 0xF00Fu) == 0x000Fu) { \
+            int64_t _tn=(int32_t)fast_r32(c,R[fn]); R[fn]+=4; \
+            int64_t _tm=(int32_t)fast_r32(c,R[fm]); R[fm]+=4; \
+            int64_t _acc=(int64_t)(((uint64_t)c->mach<<32)|c->macl); \
+            int64_t _r=_acc+_tn*_tm; \
+            if (c->sr & SR_S) { if (_r>0x00007FFFFFFFFFFFLL) _r=0x00007FFFFFFFFFFFLL; if (_r<(-0x00007FFFFFFFFFFFLL-1)) _r=(-0x00007FFFFFFFFFFFLL-1); } \
+            c->mach=(uint32_t)((uint64_t)_r>>32); c->macl=(uint32_t)_r; \
+        } else HND = 0; \
+        break; \
+    default: HND = 0; break; \
+    } \
+} while (0)
+
+static int fast_movwtrace_on;
+static __attribute__((noinline)) int fast_delay_slot(sh2 *c, uint16_t op, uint32_t pc)
+{
+    int handled;
+    int movwtrace_on = fast_movwtrace_on;
+    FAST_SIMPLE(op, pc, handled);
+    return handled;
+}
+
 uint64_t sh2_run(sh2 *c, uint64_t n)
 {
     saturn *s = c->sys;
     uint64_t done = 0;
     uint64_t target;
-    int fastable;
+    int fastable, fold_waits;
     static int op_on = -1;
     static int movwtrace_on = -1;
 
@@ -1595,6 +1799,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
     if (slave_bios_trace < 0)
         slave_bios_trace = getenv("SATURN_SLAVEBIOS") != NULL;
     if (!cov_armed) cov_init_env();
+    fast_movwtrace_on=movwtrace_on;
     s->cur = c;
 
     /* Scheduler slices are SH-2 CLOCK budgets, not instruction budgets.
@@ -1620,6 +1825,8 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
     fastable = !dbg.heavy && !tw.on && !s->hle_active &&
                !(dbg.pclog_pc | dbg.badr0_pc) && !s->pclast_pc &&
                !s->regat_pc;
+    fold_waits = !dbg.rings && cov_armed <= 0 && !op_on &&
+                 !s->dumpat_pc && !s->rrange_hi;
 
     /* MEASURED, do not "optimise" this: hoisting the interrupt gate out of the
      * loop and evaluating it once per call -- which is NOT correct, an
@@ -1692,6 +1899,18 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                 }
             }
         }
+        /* A one-PC memory capture does not need the full per-instruction
+         * diagnostic machinery.  Keeping SATURN_DUMPAT in dbg.heavy forced
+         * an otherwise normal replay through sh2_step for billions of
+         * instructions.  Check the current instruction boundary here so the
+         * inline fast path remains available; sh2_step keeps the equivalent
+         * check for callers that use the reference path directly. */
+        if (s->dumpat_pc && c->pc == s->dumpat_pc && s->dumpat_done >= 0) {
+            if (++s->dumpat_done >= s->dumpat_n) {
+                s->dumpat_done = -1;
+                mem_dump_at(s, 1);
+            }
+        }
         /* Invalid slave PCs must enter sh2_step so its address-error guard can
          * halt at the first bad control transfer and preserve the trace ring. */
         if (fastable && !c->sleeping && s->pending_ckchg != 2 &&
@@ -1711,32 +1930,73 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                            (!(s->scu_ipend >> 16) || (m & 0x10000u));
             }
             if (may_fast) {
-                /* The slave BIOS waits between jobs in this exact guarded
-                 * DT/BF loop.  Fold only taken iterations that fit inside the
-                 * current scheduler slice, after the interrupt gate above has
-                 * proved no event is pending.  Leave the final iteration to
-                 * the normal path so T and the mailbox fall-through remain
-                 * exact.  Disable folding when diagnostics need every PC. */
-                if (c->is_slave && !dbg.rings && cov_armed <= 0 && !op_on &&
-                    c->pc == 0x00000240u && R[0] > 1u &&
-                    ifetch(s, c, 0x00000240u) == 0x4010u &&
-                    ifetch(s, c, 0x00000242u) == 0x8BFDu) {
-                    uint64_t pairs = (target - c->cycles) / 4u;
-                    if (pairs > (uint64_t)R[0] - 1u)
-                        pairs = (uint64_t)R[0] - 1u;
-                    if (pairs) {
-                        R[0] -= (uint32_t)pairs;
-                        c->sr &= ~SR_T;
-                        c->cycles += pairs * 4u;
-                        done += pairs * 2u;
-                        s->fastpath_hits += pairs * 2u;
-                        continue;
-                    }
-                }
                 uint32_t pc = c->pc;
                 uint16_t op = ifetch(s, c, pc);
                 int handled;
                 uint16_t hi4 = (uint16_t)(op >> 12);
+
+                /* Fold only register/ordinary-memory wait loops whose entire
+                 * next iteration is stable within this scheduler slice. No
+                 * device or other CPU advances here; every elapsed clock and
+                 * the last architectural result are retained. Keep the whole
+                 * loop on one instruction-cache line so repeated fetches have
+                 * the same idempotent cache/LRU effects as one iteration. */
+                if (fold_waits) {
+                    if ((op & 0xF0FFu) == 0x4010u && (pc & 15u) <= 12u &&
+                        R[(op >> 8) & 15u] > 1u && fast_read_ptr(c,pc,4) && ifetch(s,c,pc+2)==0x8BFDu) {
+                        unsigned rn=(op >> 8)&15u;
+                        uint64_t repeats=(target-c->cycles)/4u;
+                        if(repeats>(uint64_t)R[rn]-1)repeats=(uint64_t)R[rn]-1;
+                        if(repeats){R[rn]-=(uint32_t)repeats;c->sr&=~SR_T;
+                            c->cycles+=repeats*4u;done+=repeats*2u;
+                            s->fastpath_hits+=repeats*2u;continue;}
+                    }
+                    /* MOV.B @Rm,R0; AND #mask,R0; TST R0,R0; BT loop.
+                     * The SDK waits for its other CPU through FTCSR.ICF.
+                     * FTCSR is a read-only observation here (write-to-clear);
+                     * the scheduler and the other CPU cannot change it within
+                     * this slice. Other MMIO, including FRC, stays on the bus. */
+                    if ((op & 0xFF0Fu) == 0x6000u && (pc & 15u) <= 8u &&
+                        target - c->cycles >= 6u && fast_read_ptr(c, pc, 8)) {
+                        unsigned rm = (op >> 4) & 15u;
+                        uint16_t mask_op = ifetch(s, c, pc + 2);
+                        if (rm && (mask_op & 0xFF00u) == 0xC900u &&
+                            ifetch(s, c, pc + 4) == 0x2008u &&
+                            ifetch(s, c, pc + 6) == 0x89FBu) {
+                            const uint8_t *poll = fast_read_ptr(c, R[rm], 1);
+                            if (!poll && (R[rm] >> 29) == 7u &&
+                                (R[rm] & 0xFFFFu) == 0xFE11u)
+                                poll = &c->onchip[0x11];
+                            if (poll && !(*poll & (mask_op & 0xFFu))) {
+                                uint64_t repeats = (target - c->cycles) / 6u;
+                                R[0] = 0;
+                                c->sr |= SR_T;
+                                c->cycles += repeats * 6u;
+                                done += repeats * 4u;
+                                s->fastpath_hits += repeats * 4u;
+                                continue;
+                            }
+                        }
+                    }
+                    /* MOV.W @Rm,Rn; EXTU.W Rn,Rn; TST Rn,Rn;
+                     * BT/S loop; MOV #0,Rn. Common SDK mailbox polling. */
+                    if ((op & 0xF00Fu)==0x6001u && (pc & 15u)<=6u &&
+                        target-c->cycles>=5u && fast_read_ptr(c,pc,10)) {
+                        unsigned rn=(op>>8)&15u,rm=(op>>4)&15u;
+                        if(rn!=rm && ifetch(s,c,pc+2)==(0x600Du|(rn<<8)|(rn<<4)) &&
+                            ifetch(s,c,pc+4)==(0x2008u|(rn<<8)|(rn<<4)) &&
+                            ifetch(s,c,pc+6)==0x8DFBu &&
+                            ifetch(s,c,pc+8)==(0xE000u|(rn<<8))) {
+                            const uint8_t *poll=fast_read_ptr(c,R[rm]&~1u,2);
+                            if(poll && poll[0]==0 && poll[1]==0) {
+                                uint64_t repeats=(target-c->cycles)/5u;
+                                R[rn]=0;c->sr|=SR_T;c->cycles+=repeats*5u;
+                                done+=repeats*5u;s->fastpath_hits+=repeats*5u;
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 /* The fast path never enters sh2_step, so coverage has to be
                  * stamped here too or a block of all-fast opcodes reads as
@@ -1752,167 +2012,14 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                     }
                 }
 
-                #define FAST_SIMPLE(OP, PCV, HND) \
-                do { \
-                    uint32_t fn = ((OP) >> 8) & 15u, fm = ((OP) >> 4) & 15u; \
-                    HND = 1; \
-                    switch ((OP) >> 12) { \
-                    case 0x5: R[fn] = fast_r32(c, R[fm] + ((OP) & 15u) * 4u); break; \
-                    case 0x1: fast_w32(c, R[fn] + ((OP) & 15u) * 4u, R[fm]); break; \
-                    case 0x7: R[fn] += (uint32_t)(int32_t)(int8_t)((OP) & 0xFF); break; \
-                    case 0xE: R[fn] = (uint32_t)(int32_t)(int8_t)((OP) & 0xFF); break; \
-                    case 0x9: R[fn] = (uint32_t)(int32_t)(int16_t)fast_r16(c, (PCV) + 4 + ((OP) & 0xFFu) * 2u); break; \
-                    case 0xD: R[fn] = fast_r32(c, (((PCV) & ~3u) + 4) + ((OP) & 0xFFu) * 4u); break; \
-                    case 0x6: \
-                        switch ((OP) & 15u) { \
-                        case 0x2: R[fn] = fast_r32(c, R[fm]); break; \
-                        case 0x3: R[fn] = R[fm]; break; \
-                        case 0x4: { uint32_t v = fast_r8(c, R[fm]);  if (fn != fm) R[fm] += 1; R[fn] = (uint32_t)(int32_t)(int8_t)v; } break; \
-                        case 0x5: { uint32_t v = fast_r16(c, R[fm]); if (fn != fm) R[fm] += 2; R[fn] = (uint32_t)(int32_t)(int16_t)v; } break; \
-                        case 0x6: { uint32_t v = fast_r32(c, R[fm]); if (fn != fm) R[fm] += 4; R[fn] = v; } break; \
-                        case 0x7: R[fn] = ~R[fm]; break; \
-                        case 0x8: R[fn] = (R[fm] & 0xFFFF0000u) | ((R[fm] & 0xFFu) << 8) | ((R[fm] >> 8) & 0xFFu); break; \
-                        case 0x9: R[fn] = (R[fm] << 16) | (R[fm] >> 16); break; \
-                        case 0xB: R[fn] = 0u - R[fm]; break; \
-                        case 0xC: R[fn] = R[fm] & 0xFFu; break; \
-                        case 0xD: R[fn] = R[fm] & 0xFFFFu; break; \
-                        case 0xE: R[fn] = (uint32_t)(int32_t)(int8_t)R[fm]; break; \
-                        case 0xF: R[fn] = (uint32_t)(int32_t)(int16_t)R[fm]; break; \
-                        case 0x0: R[fn] = (uint32_t)(int32_t)(int8_t)fast_r8(c, R[fm]); break; \
-                        case 0x1: { \
-                            uint32_t _a = R[fm], _v = fast_r16(c, _a); \
-                            R[fn] = (uint32_t)(int32_t)(int16_t)_v; \
-                            if (movwtrace_on && (PCV) == 0x06070D64u) \
-                                fprintf(stderr, "[movw-fast] pc=%08X addr=%08X raw=%04X result=%08X\n", \
-                                        (uint32_t)(PCV), _a, (unsigned)_v, R[fn]); \
-                        } break; \
-                        default: HND = 0; break; \
-                        } break; \
-                    case 0x2: \
-                        switch ((OP) & 15u) { \
-                        case 0x2: fast_w32(c, R[fn], R[fm]); break; \
-                        /* Write the SOURCE before updating Rn: with m == n the \
-                         * stored value is the pre-decrement one (Ymir MOVBM). */ \
-                        case 0x4: { uint32_t _a = R[fn] - 1; fast_w8(c, _a, (uint8_t)R[fm]); R[fn] = _a; } break; \
-                        case 0x5: { uint32_t _a = R[fn] - 2; fast_w16(c, _a, (uint16_t)R[fm]); R[fn] = _a; } break; \
-                        case 0x6: { uint32_t _a = R[fn] - 4; fast_w32(c, _a, R[fm]); R[fn] = _a; } break; \
-                        case 0x0: fast_w8(c, R[fn], (uint8_t)R[fm]); break; \
-                        case 0x1: fast_w16(c, R[fn], (uint16_t)R[fm]); break; \
-                        case 0x8: SET_T((R[fn] & R[fm]) == 0); break; \
-                        case 0x9: R[fn] &= R[fm]; break; \
-                        case 0xA: R[fn] ^= R[fm]; break; \
-                        case 0xB: R[fn] |= R[fm]; break; \
-                        case 0xD: R[fn] = (R[fm] << 16) | (R[fn] >> 16); break; \
-                        default: HND = 0; break; \
-                        } break; \
-                    case 0x3: \
-                        switch ((OP) & 15u) { \
-                        case 0x0: SET_T(R[fn] == R[fm]); break; \
-                        case 0x2: SET_T(R[fn] >= R[fm]); break; \
-                        case 0x3: SET_T((int32_t)R[fn] >= (int32_t)R[fm]); break; \
-                        case 0x6: SET_T(R[fn] > R[fm]); break; \
-                        case 0x7: SET_T((int32_t)R[fn] > (int32_t)R[fm]); break; \
-                        case 0xC: R[fn] += R[fm]; break; \
-                        case 0x8: R[fn] -= R[fm]; break; \
-                        case 0x4: { \
-                            uint32_t _tmp0, _tmp2 = R[fm]; \
-                            uint8_t _oq = (c->sr & SR_Q) != 0, _M = (c->sr & SR_M) != 0; \
-                            uint8_t _Q = (R[fn] >> 31) & 1u, _tmp1; \
-                            R[fn] = (R[fn] << 1) | ((c->sr & SR_T) != 0); \
-                            if (!_oq) { \
-                                if (!_M) { _tmp0=R[fn]; R[fn]-=_tmp2; _tmp1=R[fn]>_tmp0; _Q=_Q ? !_tmp1 : _tmp1; } \
-                                else     { _tmp0=R[fn]; R[fn]+=_tmp2; _tmp1=R[fn]<_tmp0; _Q=_Q ? _tmp1 : !_tmp1; } \
-                            } else { \
-                                if (!_M) { _tmp0=R[fn]; R[fn]+=_tmp2; _tmp1=R[fn]<_tmp0; _Q=_Q ? !_tmp1 : _tmp1; } \
-                                else     { _tmp0=R[fn]; R[fn]-=_tmp2; _tmp1=R[fn]>_tmp0; _Q=_Q ? _tmp1 : !_tmp1; } \
-                            } \
-                            if (_Q) c->sr |= SR_Q; else c->sr &= ~SR_Q; \
-                            SET_T(_Q == _M); \
-                        } break; \
-                        case 0x5: { uint64_t _r=(uint64_t)R[fn]*R[fm]; c->mach=(uint32_t)(_r>>32); c->macl=(uint32_t)_r; } break; \
-                        case 0xD: { int64_t _r=(int64_t)(int32_t)R[fn]*(int64_t)(int32_t)R[fm]; c->mach=(uint32_t)((uint64_t)_r>>32); c->macl=(uint32_t)_r; } break; \
-                        default: HND = 0; break; \
-                        } break; \
-                    case 0x4: \
-                        switch ((OP) & 0xFF) { \
-                        case 0x10: R[fn] -= 1; SET_T(R[fn] == 0); break; \
-                        case 0x00: SET_T((R[fn] >> 31) & 1u); R[fn] <<= 1; break; \
-                        case 0x01: SET_T(R[fn] & 1u); R[fn] >>= 1; break; \
-                        case 0x08: R[fn] <<= 2;  break; \
-                        case 0x09: R[fn] >>= 2;  break; \
-                        case 0x18: R[fn] <<= 8;  break; \
-                        case 0x19: R[fn] >>= 8;  break; \
-                        case 0x28: R[fn] <<= 16; break; \
-                        case 0x29: R[fn] >>= 16; break; \
-                        case 0x21: SET_T(R[fn] & 1u); R[fn] = (uint32_t)((int32_t)R[fn] >> 1); break; \
-                        case 0x24: { uint32_t _t=(c->sr & SR_T)!=0; SET_T(R[fn] >> 31); R[fn]=(R[fn]<<1)|_t; } break; \
-                        case 0x25: { uint32_t _t=(c->sr & SR_T)!=0; SET_T(R[fn] & 1u); R[fn]=(R[fn]>>1)|(_t<<31); } break; \
-                        case 0x22: R[fn] -= 4; fast_w32(c, R[fn], c->pr); break; \
-                        case 0x26: c->pr = fast_r32(c, R[fn]); R[fn] += 4; break; \
-                        case 0x11: SET_T((int32_t)R[fn] >= 0); break; \
-                        case 0x15: SET_T((int32_t)R[fn] > 0); break; \
-                        case 0x02: R[fn]-=4; fast_w32(c,R[fn],c->mach); break; \
-                        case 0x12: R[fn]-=4; fast_w32(c,R[fn],c->macl); break; \
-                        case 0x06: c->mach=fast_r32(c,R[fn]); R[fn]+=4; break; \
-                        case 0x16: c->macl=fast_r32(c,R[fn]); R[fn]+=4; break; \
-                        case 0x0A: c->mach=R[fn]; break; \
-                        case 0x1A: c->macl=R[fn]; break; \
-                        case 0x2A: c->pr=R[fn]; break; \
-                        default: HND = 0; break; \
-                        } break; \
-                    case 0x8: \
-                        switch (((OP) >> 8) & 15u) { \
-                        case 0x0: fast_w8(c, R[fm] + ((OP) & 15u), (uint8_t)R[0]); break; \
-                        case 0x1: fast_w16(c, R[fm] + (((OP) & 15u) << 1), (uint16_t)R[0]); break; \
-                        case 0x4: R[0] = (uint32_t)(int32_t)(int8_t)fast_r8(c, R[fm] + ((OP) & 15u)); break; \
-                        case 0x5: R[0] = (uint32_t)(int32_t)(int16_t)fast_r16(c, R[fm] + (((OP) & 15u) << 1)); break; \
-                        case 0x8: SET_T(R[0] == (uint32_t)(int32_t)(int8_t)((OP) & 0xFF)); break; \
-                        default: HND = 0; break; \
-                        } \
-                        break; \
-                    case 0xC: \
-                        switch (((OP) >> 8) & 15u) { \
-                        case 0x0: fast_w8(c,c->gbr+((OP)&0xFFu),(uint8_t)R[0]); break; \
-                        case 0x1: fast_w16(c,c->gbr+(((OP)&0xFFu)<<1),(uint16_t)R[0]); break; \
-                        case 0x2: fast_w32(c,c->gbr+(((OP)&0xFFu)<<2),R[0]); break; \
-                        case 0x4: R[0]=(uint32_t)(int32_t)(int8_t)fast_r8(c,c->gbr+((OP)&0xFFu)); break; \
-                        case 0x5: R[0]=(uint32_t)(int32_t)(int16_t)fast_r16(c,c->gbr+(((OP)&0xFFu)<<1)); break; \
-                        case 0x6: R[0]=fast_r32(c,c->gbr+(((OP)&0xFFu)<<2)); break; \
-                        case 0x7: R[0]=(((PCV)&~3u)+4)+(((OP)&0xFFu)<<2); break; \
-                        case 0x8: SET_T((R[0] & ((OP) & 0xFFu)) == 0); break; \
-                        case 0x9: R[0] &= (OP) & 0xFFu; break; \
-                        case 0xA: R[0] ^= (OP) & 0xFFu; break; \
-                        case 0xB: R[0] |= (OP) & 0xFFu; break; \
-                        default: HND = 0; break; \
-                        } break; \
-                    case 0x0: \
-                        if ((OP) == 0x0009) { } \
-                        else if ((OP) == 0x0008) c->sr &= ~SR_T; \
-                        else if ((OP) == 0x0018) c->sr |= SR_T; \
-                        else if ((OP) == 0x0019) c->sr &= ~(SR_M|SR_Q|SR_T); \
-                        else if ((OP) == 0x0028) c->mach = c->macl = 0; \
-                        else if (((OP) & 0xF0FFu) == 0x0029u) R[fn] = (c->sr & SR_T) ? 1u : 0u; \
-                        else if (((OP) & 0xF0FFu) == 0x0002u) R[fn] = c->sr & SR_MASK; \
-                        else if (((OP) & 0xF0FFu) == 0x000Au) R[fn] = c->mach; \
-                        else if (((OP) & 0xF0FFu) == 0x001Au) R[fn] = c->macl; \
-                        else if (((OP) & 0xF00Fu) == 0x0004u) fast_w8(c,R[0]+R[fn],(uint8_t)R[fm]); \
-                        else if (((OP) & 0xF00Fu) == 0x0005u) fast_w16(c,R[0]+R[fn],(uint16_t)R[fm]); \
-                        else if (((OP) & 0xF00Fu) == 0x0006u) fast_w32(c,R[0]+R[fn],R[fm]); \
-                        else if (((OP) & 0xF00Fu) == 0x000Cu) R[fn]=(uint32_t)(int32_t)(int8_t)fast_r8(c,R[0]+R[fm]); \
-                        else if (((OP) & 0xF00Fu) == 0x000Du) R[fn]=(uint32_t)(int32_t)(int16_t)fast_r16(c,R[0]+R[fm]); \
-                        else if (((OP) & 0xF00Fu) == 0x000Eu) R[fn]=fast_r32(c,R[0]+R[fm]); \
-                        else if (((OP) & 0xF00Fu) == 0x000Fu) { \
-                            int64_t _tn=(int32_t)fast_r32(c,R[fn]); R[fn]+=4; \
-                            int64_t _tm=(int32_t)fast_r32(c,R[fm]); R[fm]+=4; \
-                            int64_t _acc=(int64_t)(((uint64_t)c->mach<<32)|c->macl); \
-                            int64_t _r=_acc+_tn*_tm; \
-                            if (c->sr & SR_S) { if (_r>0x00007FFFFFFFFFFFLL) _r=0x00007FFFFFFFFFFFLL; if (_r<(-0x00007FFFFFFFFFFFLL-1)) _r=(-0x00007FFFFFFFFFFFLL-1); } \
-                            c->mach=(uint32_t)((uint64_t)_r>>32); c->macl=(uint32_t)_r; \
-                        } else HND = 0; \
-                        break; \
-                    default: HND = 0; break; \
-                    } \
-                } while (0)
+
+
+                FAST_SIMPLE(op, pc, handled);
+                if (handled) {
+                    c->pc = pc + 2;
+                    c->cycles += 1;
+                    done++; s->fastpath_hits++; continue;
+                }
 
                 if (hi4 == 0x8) {
                     uint32_t sel = (op >> 8) & 15u;
@@ -1929,7 +2036,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                         uint16_t sop = ifetch(s, c, pc + 2);
                         int take = (sel == 0xF) ? !(c->sr & SR_T)
                                                 :  (c->sr & SR_T) != 0;
-                        FAST_SIMPLE(sop, pc + 2, handled);
+                        handled=fast_delay_slot(c,sop,pc+2);
                         if (!handled) goto slow;
                         c->pc = take
                               ? pc + 4 + 2u * (uint32_t)(int32_t)(int8_t)(op & 0xFF)
@@ -1941,7 +2048,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                     uint16_t sop = ifetch(s, c, pc + 2);
                     int32_t d12 = (int32_t)(op & 0xFFF);
                     if (d12 & 0x800) d12 -= 0x1000;
-                    FAST_SIMPLE(sop, pc + 2, handled);
+                    handled=fast_delay_slot(c,sop,pc+2);
                     if (!handled) goto slow;
                     c->pc = pc + 4 + 2 * d12;
                     c->cycles += 2;
@@ -1955,7 +2062,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                      * stores or reloads PR must see the updated value; the
                      * write is idempotent if the slot punts to the slow path. */
                     c->pr = pc + 4;
-                    FAST_SIMPLE(sop, pc + 2, handled);
+                    handled=fast_delay_slot(c,sop,pc+2);
                     if (!handled) goto slow;
                     c->pc = pc + 4 + 2 * d12;
                     c->cycles += 2;
@@ -1963,7 +2070,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                 } else if (op == 0x000Bu) {                  /* RTS */
                     uint16_t sop = ifetch(s, c, pc + 2);
                     uint32_t target = c->pr;
-                    FAST_SIMPLE(sop, pc + 2, handled);
+                    handled=fast_delay_slot(c,sop,pc+2);
                     if (!handled) goto slow;
                     c->pc = target;
                     c->cycles += 2;
@@ -2001,7 +2108,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                     }
                     /* PR before the slot, as above (Ymir SH2::JSR). */
                     if ((op & 0x00FFu) == 0x0Bu) c->pr = pc + 4;
-                    FAST_SIMPLE(sop, pc + 2, handled);
+                    handled=fast_delay_slot(c,sop,pc+2);
                     if (!handled) goto slow;
                     c->pc = target;
                     c->cycles += 2;
@@ -2013,19 +2120,13 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                     uint32_t target = pc + 4 + R[rm];
                     /* PR before the slot, as above (Ymir SH2::BSRF). */
                     if ((op & 0x00FFu) == 0x03u) c->pr = pc + 4;
-                    FAST_SIMPLE(sop, pc + 2, handled);
+                    handled=fast_delay_slot(c,sop,pc+2);
                     if (!handled) goto slow;
                     c->pc = target;
                     c->cycles += 2;
                     done += 2; s->fastpath_hits += 2; continue;
                 }
 
-                FAST_SIMPLE(op, pc, handled);
-                if (handled) {
-                    c->pc = pc + 2;
-                    c->cycles += 1;
-                    done++; s->fastpath_hits++; continue;
-                }
                 #undef FAST_SIMPLE
 
                 /* ---- medium path --------------------------------------

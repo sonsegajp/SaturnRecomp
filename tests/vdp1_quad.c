@@ -224,10 +224,10 @@ int main(void)
         ck("no gap along the shared quad edge", (uint32_t)holes, 0);
     }
 
-    /* ---- 8. enhanced mesh preserves the VDP1 pixel underneath ----------
-     * A flag-only mesh buffer cannot do this: drawing the blue mesh destroys
-     * the green sprite and the later VDP2 blend uses the background instead.
-     * Ymir keeps the mesh colour in a separate framebuffer. */
+    /* ---- 8. hardware mesh is a checkerboard write mask -----------------
+     * Canonical Saturn/Ymir output writes the mesh colour on one parity and
+     * leaves the existing VDP1 pixel untouched on the other. Transparent mesh
+     * blending is an explicit enhancement, not the default renderer mode. */
     cmd4(0x0000, 0x0004, 0x0100, 0xFC00,
          120, 20, 127, 20, 127, 27, 120, 27);
     v16(0x20, 0x8000);
@@ -237,10 +237,14 @@ int main(void)
         uint32_t o = (uint32_t)(23 * 512 + 123) * 2u;
         S.vdp1_fb[S.fb_draw][o] = 0x83;
         S.vdp1_fb[S.fb_draw][o + 1] = 0xE0;          /* opaque green */
+        o += 2u;
+        S.vdp1_fb[S.fb_draw][o] = 0x83;
+        S.vdp1_fb[S.fb_draw][o + 1] = 0xE0;
     }
     vdp1_execute(&S);
-    ck("mesh preserves underlying sprite", fbw(123, 23), 0x83E0);
-    ck("mesh stores separate source colour", meshw(123, 23), 0xFC00);
+    ck("mesh writes even checker pixel", fbw(123, 23), 0xFC00);
+    ck("mesh preserves odd checker pixel", fbw(124, 23), 0x83E0);
+    ck("canonical mesh uses no blend buffer", meshw(123, 23), 0x0000);
 
     /* ---- 9. user clipping must not replace the system clip -------------
      * Command 8 only updates the user rectangle.  A missing break in the
@@ -254,6 +258,16 @@ int main(void)
     v16(0x0060, 0x8000);
     run_list();
     ck("user clip leaves system clip intact", fbw(103, 103), 0x3456);
+
+    /* Gouraud preserves the incoming palette/RGB flag even when it changes
+     * the five-bit channels. Neutral gray must not turn a palette code into RGB. */
+    cmd4(0, 4, 4, 0x2345, 20, 20, 27, 20, 27, 27, 20, 27);
+    v16(0x1C, 0x1000);v16(0x20, 0x8000);
+    for(unsigned i=0;i<4;i++)v16(0x8000+i*2,0x4210);
+    run_list();ck("Gouraud preserves palette MSB clear",fbw(23,23),0x2345);
+    v16(6,0xA345);run_list();ck("Gouraud preserves RGB MSB set",fbw(23,23),0xA345);
+    for(unsigned i=0;i<4;i++)v16(0x8000+i*2,0x4211);
+    v16(6,0x2345);run_list();ck("Gouraud adjusts channels without forcing RGB",fbw(23,23),0x2346);
 
     if (fails) { printf("FAILED: %d check(s)\n", fails); return 1; }
     printf("PASS: vdp1 rasteriser checks\n");

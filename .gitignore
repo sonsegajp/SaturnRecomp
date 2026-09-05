@@ -36,3 +36,11 @@ gmon.out
 # Regenerated decoder-oracle artifacts
 tests/oracle_sh2.txt
 tests/ours_sh2.txt
+
+# Local launcher library, asset dumps and packages
+/library/
+/dist/
+/launcher/.build/
+/launcher/__pycache__/
+__pycache__/
+*.py[cod]

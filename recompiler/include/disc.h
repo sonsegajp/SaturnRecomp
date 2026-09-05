@@ -37,7 +37,11 @@ typedef struct {
 typedef struct {
     FILE       *fp;
     char        path[1024];
-    uint64_t    size;
+    uint64_t    size;          /* raw bytes, or decoded/padded PCM bytes */
+    void       *audio_decoder; /* seekable decoder for compressed CDDA   */
+    uint64_t    pcm_frames;    /* decoded stereo sample frames           */
+    uint64_t    pcm_pos;       /* next decoded stereo sample frame       */
+    int         is_mp3;
 } disc_file;
 
 typedef struct {

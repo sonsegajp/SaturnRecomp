@@ -101,6 +101,18 @@ int main(int argc, char **argv)
         int32_t  peak = 0;
         int      field, k;
 
+        /* Sonic R's countdown uses the all-ones "keep current playback"
+         * command immediately after choosing its short audio track. */
+        uint32_t end_fad = S.cd.play_end_fad;
+        S.cd.play_repeat = 0;
+        S.cd.cmd_stage[0] = 0x10FF;
+        S.cd.cmd_stage[1] = S.cd.cmd_stage[2] = S.cd.cmd_stage[3] = 0xFFFF;
+        cdb_execute(&S);
+        ck("keep-current command preserves CDDA", S.cd.playing && S.cd.cdda_play, NULL);
+        ck("keep-current command preserves position", S.cd.fad == start_fad, NULL);
+        ck("keep-current command preserves track end", S.cd.play_end_fad == end_fad, NULL);
+        ck("keep-current command preserves repeat count", S.cd.play_repeat == 0, NULL);
+
         for (field = 0; field < 40; field++) {
             cdb_tick(&S);
             for (k = 0; k < 735; k++) {          /* one field at 44.1 kHz */

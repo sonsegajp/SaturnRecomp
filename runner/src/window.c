@@ -11,6 +11,8 @@
  */
 #include "saturn.h"
 #include "vulkan_renderer.h"
+#include "frame_pacing.h"
+#include "geometry_interp.h"
 #include "disc.h"
 #include "game_config.h"
 #include <SDL2/SDL.h>
@@ -33,6 +35,34 @@ void bios_reset_vector(saturn *s, uint32_t *pc, uint32_t *sp);
 #define PANEL_H 372
 
 static saturn g_sys;
+static saturn g_picture; /* Immutable graphics inputs while the next field runs. */
+typedef struct {
+    saturn *system;SDL_sem *start,*done;SDL_Thread *thread;
+    int quit;uint64_t begin,end;
+} field_worker;
+static int run_field_worker(void *arg) {
+    field_worker *w=arg;
+    for(;;){SDL_SemWait(w->start);if(w->quit)break;
+        w->begin=SDL_GetPerformanceCounter();saturn_run_field(w->system);
+        w->end=SDL_GetPerformanceCounter();SDL_SemPost(w->done);
+    }
+    return 0;
+}
+static void picture_snapshot(saturn *out,saturn *s) {
+    memcpy(out->vdp1_vram,s->vdp1_vram,sizeof out->vdp1_vram);
+    memcpy(out->vdp2_vram,s->vdp2_vram,sizeof out->vdp2_vram);
+    memcpy(out->cram,s->cram,sizeof out->cram);
+    memcpy(out->vdp2_reg,s->vdp2_reg,sizeof out->vdp2_reg);
+    out->fb_draw=s->fb_draw;out->layer_mask=s->layer_mask;out->frames=s->frames;
+    out->master=s->master;
+    out->snd_wp=s->snd_wp;out->snd_rp=s->snd_rp;
+#define TAKE_PROFILE(f) out->f+=s->f;s->f=0
+    TAKE_PROFILE(prof_master);TAKE_PROFILE(prof_slave);TAKE_PROFILE(prof_vdp1);
+    TAKE_PROFILE(prof_video);TAKE_PROFILE(prof_other);
+    TAKE_PROFILE(fastpath_hits);TAKE_PROFILE(slowpath_hits);
+#undef TAKE_PROFILE
+}
+
 static uint32_t g_pixels[PANEL_W * PANEL_H];
 /* The real output: the VDP2 composite at its native size, scaled to the
  * window. The debug panel is still available on F1, but it is a development
@@ -104,6 +134,20 @@ static void compose(saturn *s)
  * SATURN_PAD=0 ignores controllers entirely. */
 static SDL_GameController *g_pad;
 
+static uint8_t signed_axis_byte(Sint16 axis)
+{
+    int value = (int)axis + 32768;
+    return (uint8_t)((value * 255 + 32767) / 65535);
+}
+
+static uint8_t trigger_axis_byte(Sint16 axis)
+{
+    int value = axis;
+    if (value <= 0) return 0;
+    if (value >= 32767) return 255;
+    return (uint8_t)((value * 255 + 16383) / 32767);
+}
+
 static void pad_open_first(void)
 {
     int i;
@@ -153,17 +197,19 @@ static void poll_pad(saturn *s)
      * player can use either without a mode switch. */
     if (g_pad) {
         #define BTN(b) SDL_GameControllerGetButton(g_pad, SDL_CONTROLLER_BUTTON_##b)
-        /* The stick reads as a direction too: a digital pad is all the SMPC
-         * reports today, so an analogue title still needs a usable D-pad.
-         * The dead zone is SDL's recommended ~8000 of 32767. */
+        /* In standard-pad mode the host stick remains a D-pad convenience.
+         * A 3D Control Pad reports the stick as full-range X/Y and keeps its
+         * physical D-pad separate, matching the real peripheral. */
         Sint16 ax = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTX);
         Sint16 ay = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_LEFTY);
+        Sint16 al = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+        Sint16 ar = SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
         const Sint16 dead = 8000;
 
-        if (BTN(DPAD_RIGHT) || ax >  dead) lo |= 0x80;
-        if (BTN(DPAD_LEFT)  || ax < -dead) lo |= 0x40;
-        if (BTN(DPAD_DOWN)  || ay >  dead) lo |= 0x20;
-        if (BTN(DPAD_UP)    || ay < -dead) lo |= 0x10;
+        if (BTN(DPAD_RIGHT) || (!s->pad1_analog && ax >  dead)) lo |= 0x80;
+        if (BTN(DPAD_LEFT)  || (!s->pad1_analog && ax < -dead)) lo |= 0x40;
+        if (BTN(DPAD_DOWN)  || (!s->pad1_analog && ay >  dead)) lo |= 0x20;
+        if (BTN(DPAD_UP)    || (!s->pad1_analog && ay < -dead)) lo |= 0x10;
         if (BTN(START))                    lo |= 0x08;
         if (BTN(A))                        lo |= 0x04;   /* Saturn A */
         if (BTN(RIGHTSHOULDER))            lo |= 0x02;   /* Saturn C */
@@ -172,11 +218,16 @@ static void poll_pad(saturn *s)
         if (BTN(X))                        hi |= 0x40;   /* Saturn X */
         if (BTN(Y))                        hi |= 0x20;   /* Saturn Y */
         if (BTN(LEFTSHOULDER))             hi |= 0x10;   /* Saturn Z */
-        /* Triggers are axes, not buttons: half-pressed counts as pressed. */
-        if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT)
-            > 16000) hi |= 0x08;                          /* Saturn L */
-        if (SDL_GameControllerGetAxis(g_pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
-            > 16000) hi |= 0x80;                          /* Saturn R */
+        s->pad1_x = signed_axis_byte(ax);
+        s->pad1_y = signed_axis_byte(ay);
+        s->pad1_l = trigger_axis_byte(al);
+        s->pad1_r = trigger_axis_byte(ar);
+        /* The real 3D pad's analog-to-digital trigger hysteresis switches on
+         * at 145 and off at 85. Preserve the prior state in between. */
+        if (s->pad1_l >= 145 || (s->pad1_l > 85 && (s->pad1_hi & 0x08)))
+            hi |= 0x08;
+        if (s->pad1_r >= 145 || (s->pad1_r > 85 && (s->pad1_hi & 0x80)))
+            hi |= 0x80;
         #undef BTN
     }
 
@@ -243,6 +294,9 @@ static uint64_t frameprof_last_present;
 static double frameprof_emu_ms, frameprof_render_ms, frameprof_wait_ms, frameprof_present_ms;
 static uint64_t frameprof_late;
 
+static double interpolation_intervals[600];
+static unsigned interpolation_samples;
+static uint64_t interpolation_last;
 static int compare_double(const void *aa, const void *bb)
 {
     double a = *(const double *)aa, b = *(const double *)bb;
@@ -291,18 +345,21 @@ static void frameprof_add(uint64_t present_tick, uint64_t freq,
     }
 }
 
+static SDL_atomic_t audio_missing_frames, audio_underruns;
+
 static void audio_cb(void *user, Uint8 *stream, int len)
 {
     saturn *s = (saturn *)user;
     uint32_t frames = (uint32_t)len / 4u;         /* stereo, 16-bit */
     int16_t *out = (int16_t *)stream;
     static int primed;
-    uint32_t fill = (s->snd_wp + SND_RING - s->snd_rp) % SND_RING;
+    uint32_t fill = (s->snd_wp + SATURN_AUDIO_RING_FRAMES - s->snd_rp) % SATURN_AUDIO_RING_FRAMES;
     uint32_t got, i;
     uint32_t target = snd_target();
 
     if (!primed) {
         if (fill < target) {
+            SDL_AtomicAdd(&audio_missing_frames, (int)frames);
             SDL_memset(stream, 0, (size_t)len);
             return;
         }
@@ -311,6 +368,8 @@ static void audio_cb(void *user, Uint8 *stream, int len)
 
     got = sound_drain(s, out, frames);
     if (got < frames) {
+        SDL_AtomicAdd(&audio_missing_frames, (int)(frames - got));
+        SDL_AtomicAdd(&audio_underruns, 1);
         uint32_t fade = frames - got;
         int16_t last_l = got ? out[(got - 1u) * 2u + 0u] : 0;
         int16_t last_r = got ? out[(got - 1u) * 2u + 1u] : 0;
@@ -360,14 +419,23 @@ int main(int argc, char **argv)
     double   field_secs = (double)(CYC_PER_LINE * LINES_TOTAL) /
                           (double)MASTER_CLOCK_NTSC;
     double   cur_fps = 0.0, audio_correction = 0.0;
+    uint64_t title_mark = 0;
     int      have_frame = 0, uncapped = 0, headless = 0, profile = 0, frame_profile = 0;
     unsigned frameprof_interval = 300;
     uint64_t max_frames = 0;
+    unsigned present_hz=0;
+    field_worker worker={0};int worker_pending=0,field_ready=0;
+    geometry_clock presentation_clock={0,MASTER_CLOCK_NTSC,CYC_PER_LINE*LINES_TOTAL,120};
+    uint64_t presentation_deadline=0,presentation_total=0,presentation_mark=0,presentation_mark_count=0;
+    double presentation_fps=0;
+    if(getenv("SATURN_PRESENT_HZ"))present_hz=(unsigned)atoi(getenv("SATURN_PRESENT_HZ"));
+    if(present_hz && (present_hz<60 || present_hz>240)) {fprintf(stderr,"SATURN_PRESENT_HZ must be 60..240\n");return 2;}
+    presentation_clock.hz=present_hz;
 
     if (argc < 2) {
         fprintf(stderr,
             "usage: saturnwin <games/<name>/game.toml> [nobios]\n"
-            "  space = pause/resume, f = single frame, esc = quit\n");
+            "  space = pause/resume, f = single frame, F2 = native/120 Hz interpolation, esc = quit\n");
         return 2;
     }
     /* A field is LINES_TOTAL scanlines of machine time now, so there is no
@@ -421,6 +489,7 @@ int main(int argc, char **argv)
         }
         smpc_persist_load(s);
     }
+    smpc_padseq_load_env(s);
     if (g.bios[0] && !no_bios) {
         char err[256];
         if (bios_rom_load(s, g.bios, err, sizeof(err)) != 0) {
@@ -611,6 +680,9 @@ int main(int argc, char **argv)
         }
     }
 
+    if(present_hz && (!use_vk || !saturn_vk_interpolation_enable(vk))) {
+        fprintf(stderr,"[interp] Vulkan interpolation initialization failed\n");return 2;
+    }
     perf_freq = SDL_GetPerformanceFrequency();
     if (!perf_freq) perf_freq = 1;
     fps_mark  = SDL_GetPerformanceCounter();
@@ -633,7 +705,15 @@ int main(int argc, char **argv)
       if (fpsenv) { double v = atof(fpsenv); if (v > 1.0) field_secs = 1.0 / v; } }
 
     frt_irq_init();
+    if(use_vk) {
+        worker.system=s;worker.start=SDL_CreateSemaphore(0);worker.done=SDL_CreateSemaphore(0);
+        if(!worker.start||!worker.done)return 2;
+        worker.thread=SDL_CreateThread(run_field_worker,"Saturn field",&worker);
+        if(!worker.thread)return 2;
+    }
     while (running) {
+        if(worker_pending){SDL_SemWait(worker.done);worker_pending=0;field_ready=1;}
+
         SDL_Event e;
         int step_one = 0, advanced;   /* fields run this iteration (always 0 or 1) */
         double pace_period = field_secs;
@@ -649,6 +729,37 @@ int main(int argc, char **argv)
             if (e.type == SDL_KEYDOWN) {
                 switch (e.key.keysym.sym) {
                 case SDLK_ESCAPE: running = 0; break;
+                case SDLK_F2:
+                    if(!e.key.repeat && use_vk) {
+                        if(present_hz){present_hz=0;saturn_vk_interpolation_disable(vk);}
+                        else if(saturn_vk_interpolation_enable(vk))present_hz=120;
+                        else fprintf(stderr,"[interp] could not enable interpolation\n");
+                        presentation_clock.hz=present_hz;presentation_clock.credit=0;
+                        presentation_deadline=0;field_deadline=0;interpolation_last=0;
+                        interpolation_samples=0;presentation_mark=0;presentation_mark_count=presentation_total;
+#ifdef _WIN32
+                        const char *settings_path=getenv("SATURN_SETTINGS_FILE");
+                        if(settings_path)WritePrivateProfileStringA("Video","Interpolation",present_hz?"120":"0",settings_path);
+#endif
+                        fprintf(stderr,"[video] global interpolation %s (F2)\n",present_hz?"120 Hz":"off");
+                    }
+                    break;
+                case SDLK_F3:
+                    if(!e.key.repeat && use_vk && getenv("SATURN_GEOMETRY_CAPTURE")) {
+                        char start[32];
+                        /* Allow both framebuffer histories to finish after
+                         * enabling capture; game logic and F2 stay untouched. */
+                        snprintf(start,sizeof start,"%llu",(unsigned long long)s->frames+4);
+#ifdef _WIN32
+                        /* SDL and the runner may use different CRT environment
+                         * caches. Update the CRT read by the renderer. */
+                        _putenv_s("SATURN_GEOMETRY_START",start);
+#else
+                        setenv("SATURN_GEOMETRY_START",start,1);
+#endif
+                        fprintf(stderr,"[geometry] F3 capture armed at field %s: %s\n",start,getenv("SATURN_GEOMETRY_CAPTURE"));
+                    }
+                    break;
                 case SDLK_SPACE:  paused = !paused; break;
                 case SDLK_f:      step_one = 1; break;
                 case SDLK_F1:
@@ -665,6 +776,7 @@ int main(int argc, char **argv)
         advanced = 0;
         if (paused && !step_one) {
             field_deadline = 0;
+            presentation_deadline=0;interpolation_last=0;
             audio_correction = 0.0;
             frameprof_last_present = 0;
         } else {
@@ -674,7 +786,7 @@ int main(int argc, char **argv)
              * +/-1% correction visibly modulated frame delivery. */
             double period = field_secs;
             if (audio_dev) {
-                uint32_t fill = (s->snd_wp + SND_RING - s->snd_rp) % SND_RING;
+                uint32_t fill = (s->snd_wp + SATURN_AUDIO_RING_FRAMES - s->snd_rp) % SATURN_AUDIO_RING_FRAMES;
                 double   tgt  = (double)snd_target();
                 double   err  = ((double)fill - tgt) / tgt;
                 if (err >  1.0) err =  1.0;
@@ -687,9 +799,8 @@ int main(int argc, char **argv)
             }
             pace_period = period;
 
-            emu_begin = SDL_GetPerformanceCounter();
-            saturn_run_field(s);
-            emu_end = SDL_GetPerformanceCounter();
+            if(field_ready){emu_begin=worker.begin;emu_end=worker.end;field_ready=0;}
+            else {emu_begin = SDL_GetPerformanceCounter();saturn_run_field(s);emu_end = SDL_GetPerformanceCounter();}
             frame++;
             advanced = 1;
         }
@@ -701,13 +812,29 @@ int main(int argc, char **argv)
             if (dw > 704) dw = 704; if (dh > 512) dh = 512;
             {
                 uint64_t tv = profile ? __rdtsc() : 0;
-                if (!saturn_vk_render(vk, s, dw, dh, vk_error, sizeof vk_error)) {
+                if (!(present_hz ? saturn_vk_interpolation_begin(vk,s,dw,dh,vk_error,sizeof vk_error) : saturn_vk_render(vk, s, dw, dh, vk_error, sizeof vk_error))) {
                     fprintf(stderr, "[video] Vulkan frame failed: %s\n", vk_error);
                     running = 0;
                 }
                 if (profile) s->prof_video += __rdtsc() - tv;
             }
             g_texw = dw; g_texh = dh; have_frame = 1;
+            /* Capture the actual compute output at a reproducible field,
+             * including VDP1's live command stream rather than CPU shadows. */
+            {
+                static int capture_done;
+                const char *capture_path = getenv("SATURN_VK_CAPTURE");
+                const char *capture_field = getenv("SATURN_VK_CAPTURE_FRAME");
+                if (!capture_done && capture_path && capture_field &&
+                    s->frames >= strtoull(capture_field, NULL, 0)) {
+                    capture_done = 1;
+                    if (saturn_vk_readback(vk, g_frame, dw, dh, vk_error, sizeof vk_error) &&
+                        png_write(capture_path, g_frame, dw, dh) == 0)
+                        fprintf(stderr, "[video] captured Vulkan field %llu to %s\n",
+                                (unsigned long long)s->frames, capture_path);
+                    else fprintf(stderr, "[video] capture failed: %s\n", vk_error);
+                }
+            }
         } else if (g_debug) {
             debugview_render(s, g_pixels, PANEL_W, PANEL_H);
             SDL_UpdateTexture(tex, NULL, g_pixels, PANEL_W * (int)sizeof(uint32_t));
@@ -736,6 +863,12 @@ int main(int argc, char **argv)
             SDL_UpdateTexture(frametex, NULL, g_frame, dw * (int)sizeof(uint32_t));
             have_frame = 1;
         }
+        if(present_hz && advanced) {
+            picture_snapshot(&g_picture,s);
+            if(running && !paused && (!max_frames || frame<max_frames)) {
+                SDL_SemPost(worker.start);worker_pending=1;
+            }
+        }
         if (!headless && !use_vk) {
             SDL_Texture *show = g_debug ? tex : frametex;
             SDL_RenderClear(ren);
@@ -762,16 +895,46 @@ int main(int argc, char **argv)
         }
         render_end = SDL_GetPerformanceCounter();
 
-        /* Hold a completed field until its presentation deadline. Scheduling
-         * starts from the previous ACTUAL present, so sub-deadline emulation
-         * cost cannot turn into visible 15/22 ms jitter. A late field presents
-         * immediately and establishes the next deadline from that late time;
-         * there is never a short catch-up interval. */
-        if (advanced && !uncapped && !step_one && field_deadline)
+        /* Ordinary late fields keep the same clock timeline. Re-anchoring
+         * every deadline at the last actual present made alternating heavy
+         * and light fields permanently slow the game and drain its audio. */
+        if (!present_hz && advanced && !uncapped && !step_one && field_deadline)
             pace_until(field_deadline, perf_freq);
         present_begin = SDL_GetPerformanceCounter();
         if (!headless) {
-            if (use_vk) {
+            if(use_vk && present_hz && advanced) {
+                unsigned pictures=geometry_bank(&presentation_clock);
+                for(unsigned picture=0;picture<pictures;picture++) {
+                    float alpha=(float)geometry_pay(&presentation_clock);
+                    if(!saturn_vk_interpolation_render(vk,&g_picture,alpha,g_texw,g_texh,vk_error,sizeof vk_error)) {running=0;break;}
+                    const char *interp_capture=getenv("SATURN_INTERP_CAPTURE");
+                    const char *interp_field=getenv("SATURN_INTERP_CAPTURE_FRAME");
+                    if(interp_capture && interp_field && frame==strtoull(interp_field,NULL,0)) {
+                        char path[1024];snprintf(path,sizeof path,"%s-%u.png",interp_capture,picture);
+                        if(saturn_vk_readback(vk,g_frame,g_texw,g_texh,vk_error,sizeof vk_error))png_write(path,g_frame,g_texw,g_texh);
+                        fprintf(stderr,"[interp-capture] field %llu picture %u alpha %.6f\n",(unsigned long long)frame,picture,alpha);
+                    }
+                    if(!uncapped && !step_one && presentation_deadline)pace_until(presentation_deadline,perf_freq);
+                    if(!saturn_vk_present(vk,vk_error,sizeof vk_error)){running=0;break;}
+                    uint64_t now=SDL_GetPerformanceCounter();presentation_total++;
+                    if(interpolation_last && interpolation_samples<600)
+                        interpolation_intervals[interpolation_samples++]=1000.0*(double)(now-interpolation_last)/perf_freq;
+                    interpolation_last=now;
+                    if(interpolation_samples==600) {
+                        qsort(interpolation_intervals,600,sizeof(double),compare_double);
+                        fprintf(stderr,"[interp-timing] p50 %.3f p95 %.3f p99 %.3f worst %.3f ms\n",
+                            interpolation_intervals[300],interpolation_intervals[570],interpolation_intervals[594],interpolation_intervals[599]);
+                        interpolation_samples=0;
+                    }
+                    presentation_deadline=saturn_next_field_deadline(presentation_deadline,now,
+                        (uint64_t)((double)perf_freq/present_hz*(pace_period/field_secs)+0.5));
+                    if(!presentation_mark)presentation_mark=now;
+                    if(now-presentation_mark>=perf_freq) {
+                        presentation_fps=(double)(presentation_total-presentation_mark_count)*perf_freq/(now-presentation_mark);
+                        presentation_mark=now;presentation_mark_count=presentation_total;
+                    }
+                }
+            } else if (use_vk) {
                 if (!saturn_vk_present(vk, vk_error, sizeof vk_error)) {
                     fprintf(stderr, "[video] Vulkan present failed: %s\n", vk_error);
                     running = 0;
@@ -782,8 +945,8 @@ int main(int argc, char **argv)
             present_end = present_begin;
         }
         if (advanced && !uncapped && !step_one)
-            field_deadline = present_end +
-                (uint64_t)(pace_period * (double)perf_freq + 0.5);
+            field_deadline = saturn_next_field_deadline(field_deadline, present_end,
+                (uint64_t)(pace_period * (double)perf_freq + 0.5));
         else if (advanced)
             field_deadline = 0;
 
@@ -808,6 +971,7 @@ int main(int argc, char **argv)
         /* SATURN_PROF in the window: report after the field's VDP2 composite
          * and presentation so each interval owns all work for its last field. */
         if (profile && frame >= prof_next && advanced) {
+            saturn *s=present_hz?&g_picture:&g_sys;
             uint64_t pnow = present_end;
             double pel = (double)(pnow - prof_mark) / (double)perf_freq;
             double interval_fps = pel > 0.0
@@ -824,6 +988,13 @@ int main(int argc, char **argv)
                     100.0 * (double)s->fastpath_hits /
                         (double)(s->fastpath_hits + s->slowpath_hits + 1),
                     g_texw, g_texh);
+            if (audio_dev) {
+                int missing = SDL_AtomicSet(&audio_missing_frames, 0);
+                int underruns = SDL_AtomicSet(&audio_underruns, 0);
+                uint32_t fill = (s->snd_wp + SATURN_AUDIO_RING_FRAMES - s->snd_rp) % SATURN_AUDIO_RING_FRAMES;
+                fprintf(stderr, "[audio-prof] queued %u | underruns %d | missing %.2f ms\n",
+                        fill, underruns, (double)missing * 1000.0 / 44100.0);
+            }
             s->prof_master = s->prof_slave = s->prof_vdp1 = 0;
             s->prof_video = s->prof_other = 0;
             s->fastpath_hits = s->slowpath_hits = 0;
@@ -835,8 +1006,9 @@ int main(int argc, char **argv)
 
         if (paused && !step_one) SDL_Delay(8);
 
-        if (!headless) {
-            sh2 *c = &s->master;
+        if (!headless && (!title_mark || present_end - title_mark >= perf_freq / 4u)) {
+            title_mark = present_end;
+            sh2 *c = present_hz?&g_picture.master:&s->master;
             char title[320];
             snprintf(title, sizeof(title),
                      "SaturnRecomp - %s | %.1f/%.2f fps | %dx%d | frame %llu | PC %08X | %llu instr | %s%s",
@@ -846,6 +1018,13 @@ int main(int argc, char **argv)
                      (unsigned long long)c->cycles,
                      c->halted ? "HALTED: " : (paused ? "paused" : "running"),
                      c->halted ? c->fault : "");
+            if(present_hz) {
+                size_t used=strlen(title);
+                snprintf(title+used,sizeof(title)-used," | interp %.1f/%u Hz [F2]",presentation_fps,present_hz);
+            }
+            if(use_vk && !present_hz) {
+                size_t used=strlen(title);snprintf(title+used,sizeof title-used," | F2: 120 Hz interpolation");
+            }
             SDL_SetWindowTitle(win, title);
         }
         /* Clean, deterministic exit for PGO training and automated visual
@@ -855,6 +1034,12 @@ int main(int argc, char **argv)
         if (max_frames && frame >= max_frames) running = 0;
     }
 
+    if(worker.thread) {
+        if(worker_pending)SDL_SemWait(worker.done);
+        worker.quit=1;SDL_SemPost(worker.start);SDL_WaitThread(worker.thread,NULL);
+        SDL_DestroySemaphore(worker.start);SDL_DestroySemaphore(worker.done);
+    }
+    if(present_hz)fprintf(stderr,"[interp] total fields %llu presentations %llu\n",(unsigned long long)frame,(unsigned long long)presentation_total);
     printf("\nstopped at PC=0x%08X after %llu instructions%s%s\n",
            s->master.pc, (unsigned long long)s->master.cycles,
            s->master.halted ? " - HALTED: " : "",

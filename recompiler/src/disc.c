@@ -4,6 +4,11 @@
 #include <string.h>
 #include <ctype.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 static const uint8_t SYNC12[12] = {
     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00
 };
@@ -26,6 +31,124 @@ static uint32_t msf_to_frames(int m, int s, int f) {
     return (uint32_t)(((m * 60) + s) * 75 + f);
 }
 
+/* ------------------------------------------------------- compressed CDDA --
+ * A CUE may store Red Book tracks as MP3.  Those files are containers, not
+ * 2352-byte CD sectors: their compressed byte length cannot define track LBAs
+ * and their bytes cannot be sent directly to the SCSP CDDA input.  Keep disc
+ * access sector-oriented by exposing decoded 44.1 kHz stereo s16 as ordinary
+ * 2352-byte (588 stereo-frame) sectors.
+ *
+ * mpg123 is loaded at runtime so raw BIN/ISO users do not acquire a new link
+ * dependency.  Windows title builds place libmpg123-0.dll beside the runner. */
+#ifdef _WIN32
+typedef void mpg123_handle;
+typedef struct mp3_api {
+    HMODULE dll;
+    int (*init)(void);
+    mpg123_handle *(*new_handle)(const char *, int *);
+    void (*delete_handle)(mpg123_handle *);
+    int (*open_fixed64)(mpg123_handle *, const char *, int, int);
+    int (*getformat)(mpg123_handle *, long *, int *, int *);
+    int (*scan)(mpg123_handle *);
+    int64_t (*length64)(mpg123_handle *);
+    int64_t (*seek64)(mpg123_handle *, int64_t, int);
+    int (*read)(mpg123_handle *, void *, size_t, size_t *);
+    int (*close)(mpg123_handle *);
+    int ready;
+} mp3_api;
+
+static mp3_api mp3;
+
+static int mp3_load_api(char *err, size_t err_size)
+{
+    if (mp3.ready) return 0;
+    if (!mp3.dll) mp3.dll = LoadLibraryA("libmpg123-0.dll");
+    if (!mp3.dll) {
+        snprintf(err, err_size,
+                 "MP3 CD tracks require libmpg123-0.dll beside SaturnRecomp");
+        return -1;
+    }
+#define MP3_SYM(field, name) do {                                             \
+    FARPROC proc = GetProcAddress(mp3.dll, name);                             \
+    _Static_assert(sizeof(mp3.field) == sizeof(proc),                         \
+                   "Windows function pointer size mismatch");                \
+    memcpy(&mp3.field, &proc, sizeof(mp3.field));                             \
+    if (!mp3.field) {                                                         \
+        snprintf(err, err_size, "libmpg123-0.dll is missing %s", name);      \
+        return -1;                                                            \
+    }                                                                         \
+} while (0)
+    MP3_SYM(init,          "mpg123_init");
+    MP3_SYM(new_handle,    "mpg123_new");
+    MP3_SYM(delete_handle, "mpg123_delete");
+    MP3_SYM(open_fixed64,  "mpg123_open_fixed64");
+    MP3_SYM(getformat,     "mpg123_getformat");
+    MP3_SYM(scan,          "mpg123_scan");
+    MP3_SYM(length64,      "mpg123_length64");
+    MP3_SYM(seek64,        "mpg123_seek64");
+    MP3_SYM(read,          "mpg123_read");
+    MP3_SYM(close,         "mpg123_close");
+#undef MP3_SYM
+    if (mp3.init() != 0) {
+        snprintf(err, err_size, "libmpg123 initialization failed");
+        return -1;
+    }
+    mp3.ready = 1;
+    return 0;
+}
+
+static int mp3_open_file(disc *d, disc_file *df)
+{
+    mpg123_handle *mh;
+    int decoder_error = 0, channels = 0, encoding = 0;
+    int64_t frames;
+    long rate = 0;
+
+    if (mp3_load_api(d->err, sizeof(d->err)) != 0) return -1;
+    mh = mp3.new_handle(NULL, &decoder_error);
+    if (!mh) {
+        snprintf(d->err, sizeof(d->err),
+                 "cannot create MP3 decoder for %.180s (error %d)",
+                 df->path, decoder_error);
+        return -1;
+    }
+    /* MPG123_STEREO=2, MPG123_ENC_SIGNED_16=0xD0.  Native byte order on the
+     * Windows targets is the little-endian order expected by SCSP CDDA. */
+    if (mp3.open_fixed64(mh, df->path, 2, 0xD0) != 0 ||
+        mp3.getformat(mh, &rate, &channels, &encoding) != 0 ||
+        rate != 44100 || channels != 2 || encoding != 0xD0) {
+        snprintf(d->err, sizeof(d->err),
+                 "MP3 CD track must decode as 44100 Hz stereo s16: %.180s",
+                 df->path);
+        mp3.close(mh);
+        mp3.delete_handle(mh);
+        return -1;
+    }
+    if (mp3.scan(mh) != 0 || (frames = mp3.length64(mh)) < 0) {
+        snprintf(d->err, sizeof(d->err),
+                 "cannot index MP3 CD track: %.190s", df->path);
+        mp3.close(mh);
+        mp3.delete_handle(mh);
+        return -1;
+    }
+    df->audio_decoder = mh;
+    df->pcm_frames = (uint64_t)frames;
+    df->pcm_pos = 0;
+    /* A CD track occupies an integral number of 2352-byte sectors. */
+    df->size = ((df->pcm_frames * 4u + 2351u) / 2352u) * 2352u;
+    return 0;
+}
+#endif
+
+static int path_is_mp3(const char *path)
+{
+    size_t n = strlen(path);
+    return n >= 4 && path[n - 4] == '.' &&
+           tolower((unsigned char)path[n - 3]) == 'm' &&
+           tolower((unsigned char)path[n - 2]) == 'p' &&
+           tolower((unsigned char)path[n - 1]) == '3';
+}
+
 /* ------------------------------------------------------------------ open */
 
 static int open_bin(disc *d, const char *path)
@@ -39,6 +162,7 @@ static int open_bin(disc *d, const char *path)
     fseek(df->fp, 0, SEEK_END);
     df->size = (uint64_t)ftell(df->fp);
     fseek(df->fp, 0, SEEK_SET);
+    df->is_mp3 = path_is_mp3(path);
     d->nfiles++;
     return 0;
 }
@@ -222,6 +346,20 @@ int disc_open(disc *d, const char *path)
         d->ntracks     = 1;
     }
 
+    /* Decode compressed CDDA geometry before laying out files.  Track start
+     * addresses must derive from decoded duration, never compressed bytes. */
+    for (int i = 0; i < d->nfiles; i++) {
+        if (!d->files[i].is_mp3) continue;
+#ifdef _WIN32
+        if (mp3_open_file(d, &d->files[i]) != 0) return -1;
+#else
+        snprintf(d->err, sizeof(d->err),
+                 "MP3 CD tracks are not supported by this build: %.180s",
+                 d->files[i].path);
+        return -1;
+#endif
+    }
+
     /* Verify the declared sector size against the file, and total up.
      *
      * CD-DA is exempt: detect_sector_size() probes for the MODE1 sync pattern,
@@ -253,8 +391,15 @@ int disc_open(disc *d, const char *path)
 
 void disc_close(disc *d)
 {
-    for (int i = 0; i < d->nfiles; i++)
+    for (int i = 0; i < d->nfiles; i++) {
+#ifdef _WIN32
+        if (d->files[i].audio_decoder && mp3.ready) {
+            mp3.close((mpg123_handle *)d->files[i].audio_decoder);
+            mp3.delete_handle((mpg123_handle *)d->files[i].audio_decoder);
+        }
+#endif
         if (d->files[i].fp) fclose(d->files[i].fp);
+    }
     memset(d, 0, sizeof(*d));
 }
 
@@ -306,6 +451,7 @@ int disc_read_sector(disc *d, uint32_t lba, void *out2048, track_mode *out_mode)
 
     if (!t) return -1;
     if (out_mode) *out_mode = t->mode;
+    if (t->mode == TRACK_AUDIO) return -2;
 
     {
         int64_t fl = resolve_file_lba(d, t, lba);
@@ -354,6 +500,36 @@ int disc_read_raw(disc *d, uint32_t lba, void *out2352)
         file_lba = (uint32_t)fl;
     }
     df  = &d->files[t->file_index];
+    if (df->is_mp3) {
+#ifdef _WIN32
+        uint8_t *out = (uint8_t *)out2352;
+        uint64_t target = (uint64_t)file_lba * 588u;
+        size_t done = 0;
+        int rc = 0;
+        if (!df->audio_decoder || target >= df->pcm_frames) return -1;
+        if (df->pcm_pos != target) {
+            int64_t at = mp3.seek64((mpg123_handle *)df->audio_decoder,
+                                    (int64_t)target, SEEK_SET);
+            if (at < 0) return -1;
+            df->pcm_pos = (uint64_t)at;
+        }
+        while (done < 2352u && df->pcm_pos < df->pcm_frames) {
+            size_t got = 0;
+            rc = mp3.read((mpg123_handle *)df->audio_decoder,
+                          out + done, 2352u - done, &got);
+            done += got;
+            df->pcm_pos += got / 4u;
+            if (rc == -11) continue;        /* MPG123_NEW_FORMAT */
+            if (rc == -12) break;           /* MPG123_DONE       */
+            if (rc != 0) return -1;
+            if (!got) break;
+        }
+        memset(out + done, 0, 2352u - done);
+        return 0;
+#else
+        return -1;
+#endif
+    }
     off = (uint64_t)file_lba * 2352u;
     if (off + 2352 > df->size) return -1;
     if (fseek(df->fp, (long)off, SEEK_SET) != 0) return -1;

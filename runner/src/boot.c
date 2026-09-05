@@ -245,27 +245,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (getenv("SATURN_PADSEQ")) {
-        char sq[1024]; strncpy(sq, getenv("SATURN_PADSEQ"), 1023); sq[1023] = 0;
-        char *tk = strtok(sq, ",");
-        while (tk && s->npadseq < 64) {
-            char *col = strchr(tk, ':');
-            if (col) {
-                /* cy:lo[:hi] -- `lo` carries Right/Left/Down/Up/Start/A/C/B;
-                 * `hi` carries R/X/Y/Z/L.  This is the same byte order as the
-                 * SMPC peripheral report and the direct PDR protocol. */
-                char *col2 = strchr(col + 1, ':');
-                *col = 0;
-                if (col2) *col2 = 0;
-                s->padseq[s->npadseq].cy = strtoull(tk, NULL, 0);
-                s->padseq[s->npadseq].lo = (uint8_t)strtoul(col + 1, NULL, 0);
-                s->padseq[s->npadseq].hi =
-                    col2 ? (uint8_t)strtoul(col2 + 1, NULL, 0) : 0;
-                s->npadseq++;
-            }
-            tk = strtok(NULL, ",");
-        }
-    }
+    smpc_padseq_load_env(s);
     if (getenv("SATURN_PADAT"))
         s->pad_at = strtoull(getenv("SATURN_PADAT"), NULL, 0);
     if (getenv("SATURN_PAD"))
@@ -297,6 +277,16 @@ int main(int argc, char **argv)
         char *dash = strchr(rb, '-');
         if (dash) { *dash = 0; s->rrange_hi = (uint32_t)strtoul(dash+1, NULL, 16); }
         s->rrange_lo = (uint32_t)strtoul(rb, NULL, 16);
+    }
+    /* Optional producer/consumer disambiguation for a watched read range.
+     * SDK bookkeeping often touches every byte before title code consumes the
+     * buffer, filling the bounded log with irrelevant memcpy PCs. */
+    if (getenv("SATURN_RRPC")) {
+        char rb[64]; strncpy(rb, getenv("SATURN_RRPC"), sizeof(rb)-1);
+        rb[sizeof(rb)-1] = 0;
+        char *dash = strchr(rb, '-');
+        if (dash) { *dash = 0; s->rrpc_hi = (uint32_t)strtoul(dash+1, NULL, 16); }
+        s->rrpc_lo = (uint32_t)strtoul(rb, NULL, 16);
     }
     if (getenv("SATURN_PCLAST"))
         s->pclast_pc = (uint32_t)strtoul(getenv("SATURN_PCLAST"), NULL, 0);
@@ -597,6 +587,97 @@ int main(int argc, char **argv)
                     snprintf(path, sizeof path, "%s%04llu.png", frame_pfx,
                              (unsigned long long)s->frames);
                     png_write(path, ffr, fw, fh);
+                }
+            }
+            /* SATURN_LAYERDUMP=field with SATURN_LAYERDUMP_OUT=prefix writes
+             * all six VDP2 inputs from one completed field.  Rendering them
+             * from the same machine state is essential: replaying the title
+             * once per layer can land on different command lists and makes a
+             * compositing fault look like a rasterisation fault. */
+            {
+                static long long layer_field = -2;
+                static int layer_done;
+                if (layer_field == -2) {
+                    const char *e = getenv("SATURN_LAYERDUMP");
+                    layer_field = e ? atoll(e) : -1;
+                }
+                if (!layer_done && layer_field >= 0 &&
+                    (long long)s->frames >= layer_field) {
+                    static const char *name[6] = {
+                        "nbg0", "nbg1", "nbg2", "nbg3", "rbg0", "sprites"
+                    };
+                    static uint32_t lfr[704 * 512];
+                    const char *prefix = getenv("SATURN_LAYERDUMP_OUT");
+                    unsigned saved_mask = s->layer_mask;
+                    int saved_lock = s->layer_lock;
+                    int lw, lh;
+                    char path[320];
+
+                    if (!prefix || !*prefix) prefix = "layerdump";
+                    /* Paired with tools/render_state: preserve the exact inputs
+                     * so renderer changes can be compared without replaying CPUs. */
+                    if (getenv("SATURN_LAYERSTATE")) {
+                        FILE *state_file = fopen(getenv("SATURN_LAYERSTATE"), "wb");
+                        if (state_file) {
+                            if (fwrite(s, sizeof(*s), 1, state_file) != 1)
+                                fprintf(stderr, "failed to write layer state\n");
+                            fclose(state_file);
+                        }
+                    }
+                    vdp2_display_size(s, &lw, &lh);
+                    if (lw < 1 || lw > 704) lw = 320;
+                    if (lh < 1 || lh > 512) lh = 224;
+                    s->layer_lock = 1;
+                    printf("[layerdump] VDP2 SCRCTL=%04X VCSTA=%04X:%04X "
+                           "CYCA0=%04X:%04X CYCA1=%04X:%04X "
+                           "CYCB0=%04X:%04X CYCB1=%04X:%04X\n",
+                           s->vdp2_reg[0x9A >> 1], s->vdp2_reg[0x9C >> 1],
+                           s->vdp2_reg[0x9E >> 1], s->vdp2_reg[0x10 >> 1],
+                           s->vdp2_reg[0x12 >> 1], s->vdp2_reg[0x14 >> 1],
+                           s->vdp2_reg[0x16 >> 1], s->vdp2_reg[0x18 >> 1],
+                           s->vdp2_reg[0x1A >> 1], s->vdp2_reg[0x1C >> 1],
+                           s->vdp2_reg[0x1E >> 1]);
+                    printf("[layerdump] BGON=%04X CHCTLA=%04X PNCN0=%04X "
+                           "PLSZ=%04X MPOFN=%04X PRINA=%04X SPCTL=%04X "
+                           "CCCTL=%04X\n",
+                           s->vdp2_reg[0x20 >> 1], s->vdp2_reg[0x28 >> 1],
+                           s->vdp2_reg[0x30 >> 1], s->vdp2_reg[0x3A >> 1],
+                           s->vdp2_reg[0x3C >> 1], s->vdp2_reg[0xF8 >> 1],
+                           s->vdp2_reg[0xE0 >> 1], s->vdp2_reg[0xEC >> 1]);
+                    printf("[layerdump] WCTLA=%04X WCTLB=%04X WCTLC=%04X "
+                           "WCTLD=%04X W0=%04X,%04X-%04X,%04X "
+                           "W1=%04X,%04X-%04X,%04X\n",
+                           s->vdp2_reg[0xD0 >> 1], s->vdp2_reg[0xD2 >> 1],
+                           s->vdp2_reg[0xD4 >> 1], s->vdp2_reg[0xD6 >> 1],
+                           s->vdp2_reg[0xC0 >> 1], s->vdp2_reg[0xC2 >> 1],
+                           s->vdp2_reg[0xC4 >> 1], s->vdp2_reg[0xC6 >> 1],
+                           s->vdp2_reg[0xC8 >> 1], s->vdp2_reg[0xCA >> 1],
+                           s->vdp2_reg[0xCC >> 1], s->vdp2_reg[0xCE >> 1]);
+                    printf("[layerdump] LWTA0=%04X:%04X LWTA1=%04X:%04X "
+                           "VDP1 TVMR=%04X FBCR=%04X PTMR=%04X "
+                           "draw=%u display=%u\n",
+                           s->vdp2_reg[0xD8 >> 1], s->vdp2_reg[0xDA >> 1],
+                           s->vdp2_reg[0xDC >> 1], s->vdp2_reg[0xDE >> 1],
+                           s->vdp1_reg[0], s->vdp1_reg[1], s->vdp1_reg[2],
+                           (unsigned)s->fb_draw, (unsigned)(s->fb_draw ^ 1));
+                    for (int layer = 0; layer < 6; layer++) {
+                        s->layer_mask = 1u << layer;
+                        vdp2_render(s, lfr, lw, lh, 1);
+                        snprintf(path, sizeof path, "%s.%s.png", prefix, name[layer]);
+                        if (png_write(path, lfr, lw, lh) == 0)
+                            printf("[layerdump] field %llu %s\n",
+                                   (unsigned long long)s->frames, path);
+                    }
+                    s->layer_mask = 0x3Fu;
+                    vdp2_render(s, lfr, lw, lh, 1);
+                    snprintf(path, sizeof path, "%s.full.png", prefix);
+                    if (png_write(path, lfr, lw, lh) == 0)
+                        printf("[layerdump] field %llu %s\n",
+                               (unsigned long long)s->frames, path);
+                    s->layer_mask = saved_mask;
+                    s->layer_lock = saved_lock;
+                    layer_done = 1;
+                    fflush(stdout);
                 }
             }
             if (want_live) {
@@ -1161,8 +1242,10 @@ int main(int argc, char **argv)
                        s->wrlog[k].sz, s->wrlog[k].pc,
                        (unsigned long long)s->wrlog[k].cy);
             for (int k = 0; k < s->nrrlog; k++)
-                printf("rd from PC %08X : %llu times\n",
-                       s->rrlog[k].pc, (unsigned long long)s->rrlog[k].n);
+                printf("rd %08X from PC %08X : %llu times %s\n",
+                       s->rrlog[k].addr, s->rrlog[k].pc,
+                       (unsigned long long)s->rrlog[k].n,
+                       s->rrlog[k].slave ? "slave" : "master");
             printf("composite non-black pixels: %d of %d (%dx%d) first 0x%08X\n",
                    nb, dw*dh, dw, dh, first);
             if (getenv("SATURN_ROW")) {

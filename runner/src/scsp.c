@@ -1,11 +1,8 @@
 /* scsp.c -- Saturn Custom Sound Processor.
  *
- * SCOPE, stated honestly: this renders the SCSP's 32 PCM slots -- address,
- * loop, pitch, envelope, level and pan -- and keeps the full register file so
- * the sound driver's reads see back what it wrote. It does NOT implement the
- * FM (modulation) path, the DSP effect processor, or the LFOs. Those matter
- * for game music; the BIOS start-up sound and the CD player's UI clicks are
- * plain PCM, which is what this is built to get right first.
+ * Renders the 32 PCM slots, direct output, DSP sends/returns and CDDA.
+ * DSP execution is in scsp_dsp.c; CPU accesses to its working registers
+ * share that state. FM feedback and pitch/amplitude LFOs use chip arithmetic.
  *
  * Slot register layout (per slot, 0x20 bytes), from the SCSP manual:
  *   +0x00  KYONEX KYONB SBCTL SSCTL LPCTL PCM8B  SA[19:16]
@@ -19,6 +16,7 @@
  *   +0x16  DISDL DIPAN   direct level and pan
  */
 #include "saturn.h"
+#include "scsp_modulation.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +30,20 @@ static uint16_t rd(saturn *s, uint32_t off)
 
 uint16_t scsp_read(saturn *s, uint32_t off)
 {
+    off &= 0xFFEu;
+    if(off>=0x600u && off<0x680u)return (uint16_t)s->scsp_stack[(off>>1)&63u];
+    /* DSP working registers are live, split low bits first, as in Ymir's
+     * SCSP::Read. They are not aliases of the CPU write latch. */
+    if (off >= 0xC00u && off < 0xEC0u) {
+        uint32_t value;
+        unsigned bits = off >= 0xE80u ? 4u : 8u;
+        if (off < 0xE00u) value = (uint32_t)s->dsp.temp[(off >> 2) & 127u];
+        else if (off < 0xE80u) value = (uint32_t)s->dsp.mems[(off >> 2) & 31u];
+        else value = (uint32_t)s->dsp.mixs[((off >> 2) & 15u) | (s->dsp.mixs_gen ^ 16u)];
+        return (uint16_t)((off & 2u) ? (value >> bits) : (value & ((1u << bits) - 1u)));
+    }
+    if (off >= 0xEC0u && off < 0xEE0u) return (uint16_t)s->dsp.efreg[(off >> 1) & 15u];
+    if (off >= 0xEE0u && off < 0xEE4u) return (uint16_t)s->dsp.exts[(off >> 1) & 1u];
     /* Slot status register (Ymir SCSP::ReadSlotStatus). The WRITTEN value's
      * bits 15-11 select a slot (MSLC); a READ returns that slot's LIVE state:
      *   bits 4-0   EG level >> 5
@@ -136,11 +148,13 @@ static void key_exec(saturn *s)
                 uint16_t r18 = s->scsp_reg[((i * 0x20u) + 0x16u) >> 1];
                 printf("[keyon] slot %02d addr=%05X loop=%04X-%04X "
                        "OCT=%02u FNS=%u EGa=%04X EGb=%04X "
-                       "DISDL=%u EFSDL=%u cy=%llu\n",
+                       "DISDL=%u EFSDL=%u IMXL=%u ISEL=%u cy=%llu\n",
                        i, (unsigned)sa, r4, r6,
                        (unsigned)((r10 >> 11) & 0xF), (unsigned)(r10 & 0x7FF),
                        r8, rA,
                        (unsigned)((r16 >> 13) & 7u), (unsigned)((r18 >> 5) & 7u),
+                       (unsigned)(s->scsp_reg[(i*0x20u+0x14u)>>1]&7u),
+                       (unsigned)((s->scsp_reg[(i*0x20u+0x14u)>>1]>>3)&15u),
                        (unsigned long long)s->master.cycles);
             }
             sl->active  = 1;
@@ -202,7 +216,26 @@ static void scsp_update_irq(saturn *s)
 
 void scsp_write(saturn *s, uint32_t off, uint16_t v)
 {
+    off &= 0xFFEu;
     uint32_t idx = (off >> 1) & (SCSP_REGS - 1u);
+    if(off>=0x600u && off<0x680u){s->scsp_stack[(off>>1)&63u]=(int16_t)v;return;}
+
+    if (off >= 0xC00u && off < 0xEC0u) {
+        int32_t *reg;
+        unsigned bits = off >= 0xE80u ? 4u : 8u;
+        uint32_t mask = (1u << bits) - 1u, value;
+        if (off < 0xE00u) reg = &s->dsp.temp[(off >> 2) & 127u];
+        else if (off < 0xE80u) reg = &s->dsp.mems[(off >> 2) & 31u];
+        else reg = &s->dsp.mixs[((off >> 2) & 15u) | (s->dsp.mixs_gen ^ 16u)];
+        value = (off & 2u) ? (((uint32_t)*reg & mask) | ((uint32_t)v << bits))
+                           : (((uint32_t)*reg & ~mask) | (v & mask));
+        /* TEMP and MEMS are signed 24-bit registers. */
+        if (bits == 8u && (off & 2u)) value = (uint32_t)((int32_t)(value << 8) >> 8);
+        *reg = (int32_t)value;
+        return;
+    }
+    if (off >= 0xEC0u && off < 0xEE0u) { s->dsp.efreg[(off >> 1) & 15u] = (int16_t)v; return; }
+    if (off >= 0xEE0u && off < 0xEE4u) { s->dsp.exts[(off >> 1) & 1u] = (int16_t)v; return; }
 
     if (off == R_SCIRE) {
         /* Write-to-clear: a one clears the matching pending bit. */
@@ -242,7 +275,11 @@ void scsp_write(saturn *s, uint32_t off, uint16_t v)
         int sh = (int)(48u - part * 16u);
         s->dsp.program[instr] &= ~((uint64_t)0xFFFFu << sh);
         s->dsp.program[instr] |= (uint64_t)v << sh;
-        if (v != 0 && instr + 1u > s->dsp.prog_len) s->dsp.prog_len = instr + 1u;
+        /* Keep a trailing NOP to drain delayed memory reads, as Ymir does.
+         * Replacing a program with a shorter one must also shrink it. */
+        unsigned end=128;
+        while(end && s->dsp.program[end-1]==0) --end;
+        s->dsp.prog_len=end ? (end<128 ? end+1 : end) : 0;
     } else if (off >= 0x700u && off <= 0x77Fu) {
         s->dsp.coef[(off - 0x700u) >> 1] = (uint16_t)(v >> 3);
     } else if (off >= 0x780u && off <= 0x7BFu) {
@@ -275,6 +312,23 @@ void scsp_write(saturn *s, uint32_t off, uint16_t v)
         s->scsp_kyonex = 1;
     if (off == R_SCIEB || off == R_SCILV0 || off == R_SCILV1 || off == R_SCILV2)
         scsp_update_irq(s);
+}
+
+/* SCSP is a 16-bit register file but both the 68000 and SCU/SH-2 bus can
+ * write either byte independently. Merge against the stored register word,
+ * not scsp_read(): several readable registers expose live status rather than
+ * the write latch, and using that value corrupts the untouched half. */
+void scsp_write8(saturn *s, uint32_t off, uint8_t v)
+{
+    uint32_t word_off = off & 0xFFEu;
+    uint16_t w = (word_off >= 0xC00u || (word_off>=0x600u && word_off<0x680u)) ? scsp_read(s, word_off)
+                                  : s->scsp_reg[(word_off >> 1) & (SCSP_REGS - 1u)];
+    if (off & 1u) w = (uint16_t)((w & 0xFF00u) | v);
+    else          w = (uint16_t)((w & 0x00FFu) | ((uint16_t)v << 8));
+    /* KYONEX belongs to the written high byte, not the merge latch. */
+    if ((off & 1u) && word_off < 0x400u && (word_off & 0x1Eu) == 0)
+        w &= (uint16_t)~0x1000u;
+    scsp_write(s, word_off, w);
 }
 
 static void scsp_raise(saturn *s, int bit)
@@ -318,11 +372,11 @@ static void scsp_timers_tick(saturn *s)
  * our 10.10 representation. Treating bit 10 as an ordinary magnitude bit
  * made 0x400 (the minimum step) play at 2x and turned affected effects into
  * short, harsh peaks. OCT is a signed 4-bit power-of-two scale. */
-static uint32_t slot_step(saturn *s, int i)
+static uint32_t slot_step(saturn *s, int i, int pitch_lfo)
 {
     uint16_t p = s->scsp_reg[((uint32_t)i * 0x20u + 0x10u) >> 1];
     int oct = (int)((p >> 11) & 0xFu);
-    uint32_t step = (p & 0x7FFu) ^ 0x400u;
+    uint32_t step = ((p & 0x7FFu) ^ 0x400u) + pitch_lfo;
     if (oct & 8) step >>= (16 - oct);                /* negative octave */
     else         step <<= oct;
     return step;
@@ -479,7 +533,7 @@ static void env_tick(saturn *s, int i, scsp_slot *sl)
                 int32_t nv = (int32_t)sl->env + d;
                 sl->env = (uint32_t)(nv < 0 ? 0 : (nv > 0x3FF ? 0x3FF : nv));
             }
-            if (curr == 0) {
+            if ((e2 & 0x4000u) ? sl->crossed : curr == 0) {
                 sl->phase = SCSP_ENV_DECAY1;
             }
             break;
@@ -647,15 +701,36 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
         key_exec(s);
     }
 
+    /* Commit the delayed stage-7 outputs before each stage-2 FM read.
+     * The 64-entry stack advances by 32 entries per output sample, not by
+     * one frame. Slots 26..31 cross the sample boundary. */
+    unsigned stack_base=s->scsp_stack_index;
+    if (!(s->scsp_reg[(26u*0x20u+0x0cu)>>1]&0x200u))
+        s->scsp_stack[(stack_base-6u)&63u]=(int16_t)s->scsp_slot[26].output;
+    uint32_t noise[35],ns=s->scsp_noise;
+    for(unsigned n=0;n<35;n++){ns=scsp_noise_next(ns);noise[n]=ns;}
+    s->scsp_noise=noise[31];
     for (i = 0; i < 32; i++) {
+        unsigned writer=((unsigned)i-5u)&31u;
+        if (!(s->scsp_reg[(writer*0x20u+0x0cu)>>1]&0x200u))
+            s->scsp_stack[(stack_base+(unsigned)i-5u)&63u]=(int16_t)s->scsp_slot[writer].output;
         scsp_slot *sl = &s->scsp_slot[i];
         uint16_t c, lev;
         uint32_t lsa, lea, tl, disdl, dipan;
         int lpctl, pcm8;
         int32_t sample;
 
+        uint16_t lforeg=s->scsp_reg[((unsigned)i*0x20u+0x12u)>>1];
+        unsigned fns=(s->scsp_reg[((unsigned)i*0x20u+0x10u)>>1]&0x7ffu)^0x400u;
+        int plfo=scsp_pitch_lfo(lforeg,sl->lfo_phase,noise[i],fns);
+        if(++sl->lfo_cycles>=scsp_lfo_interval[(lforeg>>10)&31u]) {
+            sl->lfo_cycles=0;sl->lfo_phase++;
+        }
+        if(lforeg&0x8000u)sl->lfo_phase=0;
+        unsigned alfo=scsp_amp_lfo(lforeg,sl->lfo_phase,noise[i+3]);
         if (!sl->active) {
             sl->output = 0;
+            env_tick(s, i, sl); /* EG runs even after wave playback stops. */
             continue;
         }
 
@@ -674,7 +749,13 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
          * `currSmp = reverse ? ~currSample : currSample`). */
         {
             uint32_t idx  = sl->reverse ? (uint16_t)~sl->pos : sl->pos;
-            uint32_t addr = sl->sa + (pcm8 ? idx : idx * 2u);
+            uint16_t fm=s->scsp_reg[((unsigned)i*0x20u+0x0eu)>>1];
+            int32_t modulation=scsp_fm_displacement(
+                s->scsp_stack[(stack_base+i+((fm>>6)&63u))&63u],
+                s->scsp_stack[(stack_base+i+(fm&63u))&63u],fm>>12);
+            unsigned phase=sl->reverse ? (~sl->frac&1023u) : sl->frac;
+            idx=(uint32_t)((int32_t)idx+(modulation>>5)+(((phase>>4)+((modulation&31)*2))>>6));
+            uint32_t addr = (pcm8 ? sl->sa : (sl->sa & ~1u)) + (pcm8 ? idx : idx * 2u);
             addr &= (SOUND_RAM_SZ - 1u);
             if (pcm8) sample = (int32_t)(int8_t)s->sound_ram[addr] << 8;
             else      sample = (int32_t)(int16_t)((s->sound_ram[addr] << 8) |
@@ -692,8 +773,15 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
          * We used to apply a linear envelope gain and THEN a separate linear
          * (255 - TL) multiply, which is neither the right curve nor the right
          * combination. */
-        {
-            uint32_t final_lvl = sl->env + (tl << 2);
+        /* SBCTL changes sample bits before attenuation. SDIR bypasses the
+         * envelope and total level; EGHOLD/EGBYPASS bypass just the envelope. */
+        sample = (int16_t)((uint16_t)sample ^ ((c & 0x0200u) ? 0x7FFFu : 0u)
+                                          ^ ((c & 0x0400u) ? 0x8000u : 0u));
+        if (!(lev & 0x100u)) {
+            uint16_t e1 = s->scsp_reg[((uint32_t)i * 0x20u + 0x08u) >> 1];
+            uint16_t e2 = s->scsp_reg[((uint32_t)i * 0x20u + 0x0Au) >> 1];
+            uint32_t env = ((e2 & 0x8000u) || ((e1 & 0x20u) && sl->phase == SCSP_ENV_ATTACK)) ? 0u : sl->env;
+            uint32_t final_lvl = env + (tl << 2) + alfo;
             if (final_lvl > 0x3FFu) final_lvl = 0x3FFu;
             sample = (sample * (int32_t)((final_lvl & 0x3Fu) ^ 0x7Fu))
                      >> ((final_lvl >> 6) + 7u);
@@ -728,7 +816,7 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
          * LEA == 0 never ended at all and ran on into whatever sample came
          * next in sound RAM.
          *   0 off (stop at LEA)   1 forward   2 reverse   3 alternating */
-        sl->frac += slot_step(s, i);
+        sl->frac += slot_step(s, i, plfo);
         while (sl->frac >= 1024u) {
             sl->frac -= 1024u;
             sl->pos++;
@@ -777,6 +865,8 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
         }
         env_tick(s, i, sl);
     }
+
+    s->scsp_stack_index=(stack_base+32u)&63u;
 
     if (!nodsp && s->dsp.prog_len != 0) {
         /* Ymir ProcessSlots(i): operation 7 belongs to slot i-6.  The DSP
@@ -918,6 +1008,8 @@ void scsp_reset(saturn *s)
     int i;
     memset(s->scsp_reg, 0, sizeof(s->scsp_reg));
     memset(s->scsp_slot, 0, sizeof(s->scsp_slot));
+    memset(s->scsp_stack,0,sizeof s->scsp_stack);
+    s->scsp_stack_index=0; s->scsp_noise=1;
     /* Slots come up in RELEASE, not ATTACK (Ymir Slot::Reset). With the
      * Ymir key rule -- key-on only fires from release -- a slot left in the
      * zeroed ATTACK state could never be started at all. */

@@ -210,7 +210,7 @@ static void sound_run_exact(saturn *s, uint32_t sh2_cycles)
             }
         }
 
-        next = (s->snd_wp + 1u) % SND_RING;
+        next = (s->snd_wp + 1u) % SATURN_AUDIO_RING_FRAMES;
         if (next != s->snd_rp) {          /* drop rather than overwrite */
             s->snd_buf[s->snd_wp * 2u + 0u] = l;
             s->snd_buf[s->snd_wp * 2u + 1u] = r;
@@ -262,7 +262,7 @@ uint32_t sound_drain(saturn *s, int16_t *out, uint32_t frames)
     while (n < frames && s->snd_rp != s->snd_wp) {
         out[n * 2u + 0u] = s->snd_buf[s->snd_rp * 2u + 0u];
         out[n * 2u + 1u] = s->snd_buf[s->snd_rp * 2u + 1u];
-        s->snd_rp = (s->snd_rp + 1u) % SND_RING;
+        s->snd_rp = (s->snd_rp + 1u) % SATURN_AUDIO_RING_FRAMES;
         n++;
     }
     return n;

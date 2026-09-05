@@ -100,6 +100,23 @@ static int gpu_emit(vctx *c, const saturn_vk_vdp1_op *op)
     return gpu_v1.sink.enqueue(gpu_v1.sink.userdata, op);
 }
 
+void vdp1_gpu_fb_write(saturn *s, unsigned target, uint32_t byte_offset,
+                       unsigned size, uint32_t value)
+{
+    saturn_vk_vdp1_op op;
+
+    if (!vdp1_gpu_is_bound(s) || (size != 1u && size != 2u && size != 4u))
+        return;
+
+    memset(&op, 0, sizeof op);
+    op.kind = SATURN_VK_VDP1_FB_WRITE;
+    op.target = target & 1u;
+    op.chr = byte_offset & (VDP1_FB_SZ - 1u);
+    op.tw = size;
+    op.flat = value;
+    gpu_v1.sink.enqueue(gpu_v1.sink.userdata, &op);
+}
+
 static void vctx_init(vctx *c, saturn *s)
 {
     memset(c, 0, sizeof(*c));
@@ -213,8 +230,8 @@ static void ts_advance(texstep *t)
  * identical. */
 typedef struct {
     int32_t x, y, xInc, yInc;
-    int32_t xNum, yNum, xDen, yDen, xAccum, yAccum, xAccumTarget, yAccumTarget;
-    int32_t num, den, accum, accumTarget;
+    uint32_t xNum, yNum, xDen, yDen, xAccum, yAccum, xAccumTarget, yAccumTarget;
+    uint32_t num, den, accum, accumTarget;
 } edgestep;
 
 static void edge_setup(edgestep *e, int32_t x1, int32_t y1,
@@ -228,27 +245,38 @@ static void edge_setup(edgestep *e, int32_t x1, int32_t y1,
     e->x = x1; e->y = y1;
     e->xInc = dx >= 0 ? 1 : -1;
     e->yInc = dy >= 0 ? 1 : -1;
-    e->xNum = adx << 1;
-    e->yNum = ady << 1;
-    e->xDen = e->yDen = dmaj << 1;
-    e->xAccum = e->yAccum = ~dmaj;
-    e->xAccumTarget = dy < 0 ? -1 : 0;
-    e->yAccumTarget = dx < 0 ? -1 : 0;
-    e->num   = dmaj << 1;
-    e->den   = delta << 1;
-    e->accum = ~delta;
+    e->xNum = (uint32_t)(adx << 1);
+    e->yNum = (uint32_t)(ady << 1);
+    e->xDen = e->yDen = (uint32_t)(dmaj << 1);
+    e->xAccum = e->yAccum = (uint32_t)~dmaj;
+    e->xAccumTarget = (uint32_t)(dy < 0 ? -1 : 0);
+    e->yAccumTarget = (uint32_t)(dx < 0 ? -1 : 0);
+    e->num   = (uint32_t)(dmaj << 1);
+    e->den   = (uint32_t)(delta << 1);
+    e->accum = (uint32_t)~delta;
     e->accumTarget = adx >= ady ? e->yAccumTarget : e->xAccumTarget;
+
+    /* Ymir keeps these as signed 13-bit counters by shifting them into the
+     * high bits of a 32-bit word. Unsigned arithmetic gives the same defined
+     * two's-complement wrap in C. Omitting this changes long perspective
+     * edges once an accumulator crosses the 13-bit boundary. */
+    e->xNum <<= 19; e->yNum <<= 19;
+    e->xDen <<= 19; e->yDen <<= 19;
+    e->xAccum <<= 19; e->yAccum <<= 19;
+    e->xAccumTarget <<= 19; e->yAccumTarget <<= 19;
+    e->num <<= 19; e->den <<= 19;
+    e->accum <<= 19; e->accumTarget <<= 19;
 }
 
 static void edge_step(edgestep *e)
 {
     e->accum += e->num;
-    if (e->accum >= e->accumTarget) {
+    if ((int32_t)e->accum >= (int32_t)e->accumTarget) {
         e->accum -= e->den;
         e->xAccum += e->xNum;
-        if (e->xAccum >= e->xAccumTarget) { e->xAccum -= e->xDen; e->x += e->xInc; }
+        if ((int32_t)e->xAccum >= (int32_t)e->xAccumTarget) { e->xAccum -= e->xDen; e->x += e->xInc; }
         e->yAccum += e->yNum;
-        if (e->yAccum >= e->yAccumTarget) { e->yAccum -= e->yDen; e->y += e->yInc; }
+        if ((int32_t)e->yAccum >= (int32_t)e->yAccumTarget) { e->yAccum -= e->yDen; e->y += e->yInc; }
     }
 }
 
@@ -378,16 +406,19 @@ static void pixprobe(vctx *c, int32_t x, int32_t y, uint16_t colour)
         if (e) { int a, b; if (sscanf(e, "%d,%d", &a, &b) == 2) { px = a; py = b; } }
     }
     if (px < 0 || x != px || y != py) return;
-    printf("[v1pix] %d,%d <- cmd %05X COMM=%u ctrl=%04X pmod=%04X colr=%04X "
-           "srca=%05X  colour=%04X\n", x, y, c->cur_addr, c->cur_ctrl & 0xFu,
-           c->cur_ctrl, c->cur_pmod, c->cur_colr, c->cur_srca, colour);
+    printf("[v1pix] f%llu clk=%llu %d,%d <- cmd %05X COMM=%u ctrl=%04X "
+           "pmod=%04X colr=%04X srca=%05X colour=%04X\n",
+           (unsigned long long)c->s->frames,
+           (unsigned long long)c->s->clk, x, y, c->cur_addr,
+           c->cur_ctrl & 0xFu, c->cur_ctrl, c->cur_pmod, c->cur_colr,
+           c->cur_srca, colour);
 }
 
 static void put(vctx *c, int32_t x, int32_t y, uint16_t colour, uint16_t pmod)
 {
     uint32_t o;
     int mesh = (pmod & 0x0100u) != 0;
-    static int stipple = -1;
+    static int mesh_blend = -1;
 
     if (x < 0 || y < 0 || x >= FB_W || y >= FB_H) return;
     if (x > c->sys_x1 || y > c->sys_y1) return;
@@ -403,22 +434,13 @@ static void put(vctx *c, int32_t x, int32_t y, uint16_t colour, uint16_t pmod)
         if (outside != (int)((pmod >> 9) & 1u)) return;
     }
 
-    /* Mesh: the Saturn's stipple transparency. Not a blend -- it simply skips
-     * every other pixel on a checkerboard, which is why it looks the way it
-     * does against VDP2 layers.
-     *
-     * SATURN_NOMESH=1 draws those pixels anyway. That is not accurate (real
-     * hardware really does stipple), but it is the one measurement that tells
-     * a MESHED polygon apart from a polygon the rasteriser is punching holes
-     * in: if the dots survive with this set, they are not mesh. */
-    /* SATURN_MESHSTIPPLE=1 restores the hardware behaviour exactly.
-     * By default the skipped pixel is DRAWN and flagged instead, and the
-     * compositor blends it 50/50 with whatever is behind -- the same
-     * enhancement Ymir offers as `transparentMeshes`. Stipple is what the
-     * hardware does, but it was designed to smear into a blend on a CRT and
-     * reads as a checkerboard of holes at sharp pixel scale. */
-    if (stipple < 0) stipple = getenv("SATURN_MESHSTIPPLE") != NULL;
-    if (mesh && stipple && (((x + y) & 1) != 0)) return;
+    /* Mesh is a checkerboard write mask on Saturn hardware, not alpha blend.
+     * Keep that hardware/Ymir behaviour as the default: Sonic R relies on it
+     * for character shadows, and averaging the mesh colour with the road turns
+     * those shadows into conspicuous solid brown polygons.  The smoother
+     * transparent-mesh enhancement remains available explicitly. */
+    if (mesh_blend < 0) mesh_blend = getenv("SATURN_MESHBLEND") != NULL;
+    if (mesh && !mesh_blend && (((x + y) & 1) != 0)) return;
 
     o = ((uint32_t)y * FB_W + (uint32_t)x) * 2u;
 
@@ -466,7 +488,7 @@ static void put(vctx *c, int32_t x, int32_t y, uint16_t colour, uint16_t pmod)
     }
 
     pixprobe(c, x, y, colour);
-    if (mesh && !stipple) {
+    if (mesh && mesh_blend) {
         /* Ymir's enhancement renders mesh commands to a second colour
          * framebuffer.  Keeping the normal framebuffer untouched is crucial:
          * it contains the VDP1 pixel that must be visible through a shield,
@@ -619,7 +641,9 @@ static uint16_t shade(vctx *c, uint16_t base, uint32_t grda, int use_g,
         if (bg > 31) bg = 31;
         if (bb < 0)  bb = 0;
         if (bb > 31) bb = 31;
-        return (uint16_t)(0x8000 | br | (bg << 5) | (bb << 10));
+        /* Gouraud changes RGB component bits, preserving the input MSB.
+         * Forcing it on converts palette-coded dots into direct RGB. */
+        return (uint16_t)((base & 0x8000u) | br | (bg << 5) | (bb << 10));
     }
 }
 
@@ -675,7 +699,7 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
         op.xy[4] = xc; op.xy[5] = yc; op.xy[6] = xd; op.xy[7] = yd;
         op.chr = chr; op.tw = tw; op.th = th;
         op.colr = colr; op.pmod = pmod; op.grda = grda;
-        op.flat = flat; op.textured = (uint32_t)textured; op.flip = flip;
+        op.flat = flat; op.textured = (uint32_t)textured; op.flip = flip | ((c->cur_ctrl & 15u) << 8);
         op.sys_x1 = c->sys_x1; op.sys_y1 = c->sys_y1;
         op.usr_x0 = c->usr_x0; op.usr_y0 = c->usr_y0;
         op.usr_x1 = c->usr_x1; op.usr_y1 = c->usr_y1;
@@ -1368,6 +1392,7 @@ void vdp1_soft_reset(saturn *s)
     s->vdp1_sys_y1 = 256;
     s->vdp1_clip_set = 0;
     s->vdp1_erase_pending = 0;
+    s->vdp1_vblank_erase = 0;
     s->vdp1_show_interp = 0;
     s->vdp1_interp_ready = 0;
     if (async_v1.s == s) async_v1.active = 0;
@@ -1434,6 +1459,13 @@ void vdp1_erase(saturn *s)
     uint32_t x1 = s->vdp1_ew_x1, x3 = s->vdp1_ew_x3;
     uint32_t y1 = s->vdp1_ew_y1, y3 = s->vdp1_ew_y3;
     uint32_t x, y;
+
+    { static int lg = -1; static unsigned long long n;
+      if (lg < 0) lg = getenv("SATURN_FBLOG") ? 1 : 0;
+      if (lg && ++n <= 100000u)
+          printf("[fberase] #%llu fb%d val=%04X window=%u,%u-%u,%u clk=%llu\n",
+                 n, s->fb_draw ^ 1, s->vdp1_ew_val, x1, y1, x3, y3,
+                 (unsigned long long)s->clk); }
 
     if (vdp1_gpu_is_bound(s)) {
         saturn_vk_vdp1_op op;
@@ -1513,6 +1545,16 @@ void vdp1_write_reg(saturn *s, uint32_t off, uint16_t v)
     s->vdp1_reg[off >> 1] = v;
 
     switch (off) {
+    case 0x00:      /* TVMR.VBE.  The VDP1 begins V-Blank erase when VBE is
+                     * enabled at the V-Blank-IN boundary.  Our field runner
+                     * raises that boundary before allowing the SH-2 to service
+                     * the simultaneous blanking interrupt, so software which
+                     * writes VBE from that handler lands a few instructions
+                     * after the edge.  Treat an enable while TVSTAT.VBLANK is
+                     * already high as part of the same erase interval. */
+        if ((v & 0x0008u) && (s->vdp2_reg[0x04 >> 1] & 0x0008u))
+            s->vdp1_vblank_erase = 1;
+        break;
     case 0x02:      /* FBCR. The erase/swap decision is deferred to the field
                      * boundary; the hardware only latches "FBCR was written"
                      * (Ymir vdp1_regs.hpp fbParamsChanged). */

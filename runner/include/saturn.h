@@ -218,7 +218,9 @@ typedef enum {
  * little slack that a drive delivering a short burst overran the ring. */
 #define CDDA_RING     (2352u * 15u)
 
-#define SND_RING      16384u
+/* Windows playsoundapi.h defines SND_RING as a sound flag (0x100000).
+ * Keep this capacity namespaced: the frontend includes windows.h too. */
+#define SATURN_AUDIO_RING_FRAMES 16384u
 /* Ring fill the window's pacer steers toward, in stereo frames (~70 ms).
  * Must stay comfortably above one SDL callback (1024 frames) so a late
  * field cannot starve the device mid-buffer. */
@@ -247,6 +249,8 @@ typedef struct {
     int      crossed;     /* passed LSA: the loop segment is live now */
     int32_t  output;      /* previous completed pipeline output; slots
                            * 26-31 feed it at the next sample boundary */
+    uint32_t lfo_cycles;
+    uint8_t lfo_phase;
 } scsp_slot;
 
 typedef struct {
@@ -338,13 +342,16 @@ struct saturn {
     int       scsp_kyonex;         /* KYONEX latched by a register write,
                                     * consumed once per sample step (Ymir) */
     scsp_slot scsp_slot[32];
+    int16_t scsp_stack[64];
+    unsigned scsp_stack_index;
+    uint32_t scsp_noise;
     m68k      sound_cpu;          /* the sound-side MC68000            */
     int       sound_on;           /* SMPC SNDON has released the 68000 */
     uint64_t  m68k_acc;           /* fractional sound-CPU clock        */
     uint64_t  m68k_target;        /* cumulative cycles owed since reset */
     uint64_t  scsp_acc;           /* sample-clock accumulator          */
     uint32_t  sound_deferred;     /* SH-2 clocks waiting for sound sync */
-    int16_t   snd_buf[SND_RING * 2];  /* stereo ring, written by the core */
+    int16_t   snd_buf[SATURN_AUDIO_RING_FRAMES * 2];  /* stereo ring, written by the core */
     uint32_t  snd_wp, snd_rp;
 #define COVER_BLOCKS 65536u   /* 32-byte blocks -> 2MB of code */
     uint8_t   cover[COVER_BLOCKS/8];
@@ -382,6 +389,7 @@ struct saturn {
     uint8_t  vdp1_cef;           /* EDSR bit 1: end bit fetched this frame   */
     uint8_t  vdp1_bef;           /* EDSR bit 0: end bit fetched last frame   */
     uint8_t  vdp1_fbparams;      /* FBCR written since the last field change */
+    uint8_t  vdp1_vblank_erase;  /* TVMR.VBE sampled at V-Blank IN            */
     uint16_t vdp1_ew_val;        /* latched EWDR                             */
     uint16_t vdp1_ew_x1, vdp1_ew_y1, vdp1_ew_x3, vdp1_ew_y3;   /* EWLR/EWRR  */
 
@@ -391,7 +399,13 @@ struct saturn {
     int      smpc_ste;       /* set by SETSMEM/SETTIME; INTBACK OREG0 bit 7 */
     int      smpc_resd;      /* RESDISA latch; INTBACK OREG0 bit 6          */
     char     smpc_state_path[512];  /* where STE/SMEM persist between runs */
-    uint8_t  pad1_lo, pad1_hi;/* controller 1, active high */
+    uint8_t  pad1_lo, pad1_hi;/* controller 1 buttons, active high */
+    /* Optional Saturn 3D Control Pad. Digital remains the runtime default so
+     * existing title behavior cannot change merely because the host has an
+     * analog stick. In analog mode X/Y are 00..80..FF and triggers 00..FF. */
+    uint8_t  pad1_analog;
+    uint8_t  pad1_x, pad1_y, pad1_l, pad1_r;
+    uint8_t  pad1_report_pos, pad1_tl;
     /* Console region, as the SMPC reports it in INTBACK OREG9. The BIOS
      * checks the disc's IP.BIN area list against this and refuses to boot a
      * disc that does not name it -- a mismatch drops you at the CD player,
@@ -400,8 +414,10 @@ struct saturn {
     uint8_t  area_code;
     uint64_t pad_at;         /* SATURN_PADAT: hold buttons only after this master cycle */
     /* SATURN_PADSEQ="cy:lo,cy:lo,..." -- from each cycle mark, present that
-     * pad byte until the next mark. Lets a headless run navigate menus. */
-    struct { uint64_t cy; uint8_t lo; uint8_t hi; } padseq[64];
+     * pad byte until the next mark. SATURN_PADSEQ_FILE accepts the same events
+     * from a text file, one or comma-separated, so a complete recorded session
+     * is not constrained by an environment-variable length limit. */
+    struct { uint64_t cy; uint8_t lo; uint8_t hi; } padseq[512];
     int npadseq;
     int      clock_352;
     int      dtr_fill;
@@ -499,7 +515,8 @@ struct saturn {
     struct { uint32_t size, prev_size, prev_read; } stagelog[12];
     uint32_t wrange_lo, wrange_hi;
     uint32_t rrange_lo, rrange_hi;
-    struct { uint32_t pc; uint64_t n; } rrlog[16];
+    uint32_t rrpc_lo, rrpc_hi;
+    struct { uint32_t pc, addr; uint64_t n; uint8_t slave; } rrlog[64];
     int      nrrlog;
     struct { uint32_t addr, val, pc; int sz; uint64_t cy; } wrlog[64];
     int      nwrlog;
@@ -665,6 +682,7 @@ void scsp_dsp_update_rbp(saturn *s, uint16_t lead);
 void scsp_dsp_update_rbl(saturn *s, uint16_t len);
 void smpc_persist_load(saturn *s);
 void smpc_persist_save(saturn *s);
+void smpc_padseq_load_env(saturn *s);
 
 void     bus_w8 (saturn *s, uint32_t a, uint8_t  v);
 void     bus_w16(saturn *s, uint32_t a, uint16_t v);
@@ -690,6 +708,8 @@ void     vdp1_tick(saturn *s, uint32_t cycles);
 void     vdp1_soft_reset(saturn *s);
 void     vdp1_swap(saturn *s);
 void     vdp1_erase(saturn *s);
+void     vdp1_gpu_fb_write(saturn *s, unsigned target, uint32_t byte_offset,
+                           unsigned size, uint32_t value);
 uint16_t vdp1_read_reg(saturn *s, uint32_t off);
 void     vdp1_write_reg(saturn *s, uint32_t off, uint16_t v);
 
@@ -706,6 +726,7 @@ void     smpc_tick(saturn *s);
 void     smpc_ireg0_write(saturn *s, uint8_t v);
 void     smpc_reset(saturn *s);
 uint8_t  smpc_pdr_read(saturn *s, int port);
+unsigned smpc_pad_report(saturn *s, uint8_t out[7]);
 
 void     saturn_init(saturn *s);
 
@@ -787,6 +808,7 @@ uint64_t saturn_run_field(saturn *s);
 uint32_t scsp_cdda_push(saturn *s, const uint8_t *sector2352);
 uint16_t scsp_read  (saturn *s, uint32_t off);
 void     scsp_write (saturn *s, uint32_t off, uint16_t v);
+void     scsp_write8(saturn *s, uint32_t off, uint8_t v);
 void     scsp_render(saturn *s, int16_t *left, int16_t *right);
 void     scsp_reset (saturn *s);
 void     sound_init (saturn *s);
