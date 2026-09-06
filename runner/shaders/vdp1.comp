@@ -17,6 +17,10 @@ const uint FB_W = 512u;
 const uint FB_H = 256u;
 const uint FB_PIXELS = FB_W * FB_H;
 const uint OP_WORDS = 25u;
+/* Keep synchronized with SATURN_VDP1_* in vulkan_renderer.h. */
+const uint DRAW_DIE = 1u << 16;
+const uint DRAW_DIL = 1u << 17;
+const uint DRAW_FIELD_SELECT = 1u << 18;
 
 uint byte_at(uint a)
 {
@@ -279,74 +283,90 @@ void main()
                 hit = true;
             }
         } else {
-            int sysx = int(ops.d[z + 19u]), sysy = int(ops.d[z + 20u]);
-            if (p.x < 0 || p.y < 0 || p.x > sysx || p.y > sysy) continue;
-            if ((pmod & 0x400u) != 0u) {
-                bool outside = p.x < int(ops.d[z + 21u]) || p.y < int(ops.d[z + 22u]) ||
-                               p.x > int(ops.d[z + 23u]) || p.y > int(ops.d[z + 24u]);
-                if (outside != ((pmod & 0x200u) != 0u)) continue;
-            }
-            if (kind == 2u) {
-                hit = line_hit(samplep, vec2(ivec2(vertex_xy(z,2u))),
-                                       vec2(ivec2(vertex_xy(z,4u))));
-                src = ops.d[z + 13u];
-            } else if (kind == 1u) {
-                vec2 uv;
-                hit = quad_uv(samplep,
-                    vertex_xy(z,2u),
-                    vertex_xy(z,4u),
-                    vertex_xy(z,6u),
-                    vertex_xy(z,8u), uv);
-                /* Only pixel-adjacent mesh seams receive conservative
-                 * coverage. Silhouettes and ordinary guest draws keep their
-                 * existing coverage. The pair was verified in both frames. */
-                if(!hit && (ops.d[z+18u]&0x78000000u)!=0u) {
-                    for(uint edge=0u;edge<4u;edge++)if((ops.d[z+18u]&(1u<<(27u+edge)))!=0u) {
-                        vec2 a=vertex_xy(z,2u+edge*2u),b=vertex_xy(z,2u+((edge+1u)&3u)*2u);
-                        vec2 ab=b-a;float len=dot(ab,ab);
-                        if(len<0.00001)continue;
-                        float t=dot(samplep-a,ab)/len;
-                        if(t<0.0||t>1.0)continue;
-                        vec2 q=a+ab*t,d=samplep-q;
-                        if(dot(d,d)>0.25001)continue;
-                        hit=quad_uv(q,vertex_xy(z,2u),vertex_xy(z,4u),vertex_xy(z,6u),vertex_xy(z,8u),uv);
-                        if(hit)break;
+            uint flags = ops.d[z + 18u];
+            bool interlaced = (flags & DRAW_DIE) != 0u;
+            bool select_field = (flags & DRAW_FIELD_SELECT) != 0u;
+            uint passes = interlaced && !select_field ? 2u : 1u;
+            /* Each invocation owns a framebuffer pixel. Evaluate geometry,
+             * clipping, mesh and materials at its original draw-space row.
+             * Outside double-density mode both rows alias this memory pixel
+             * and retain their successive colour-calculation operations. */
+            for (uint pass = 0u; pass < passes; ++pass) {
+                uint line = select_field ? uint((flags & DRAW_DIL) != 0u) : pass;
+                ivec2 drawp = p;
+                vec2 drawsample = samplep;
+                if (interlaced) {
+                    drawp.y = p.y * 2 + int(line);
+                    drawsample.y = samplep.y * 2.0 + float(line);
+                }
+                hit = false;
+                int sysx = int(ops.d[z + 19u]), sysy = int(ops.d[z + 20u]);
+                if (drawp.x < 0 || drawp.y < 0 || drawp.x > sysx || drawp.y > sysy) continue;
+                if ((pmod & 0x400u) != 0u) {
+                    bool outside = drawp.x < int(ops.d[z + 21u]) || drawp.y < int(ops.d[z + 22u]) ||
+                                   drawp.x > int(ops.d[z + 23u]) || drawp.y > int(ops.d[z + 24u]);
+                    if (outside != ((pmod & 0x200u) != 0u)) continue;
+                }
+                if (kind == 2u) {
+                    hit = line_hit(drawsample, vec2(ivec2(vertex_xy(z,2u))),
+                                           vec2(ivec2(vertex_xy(z,4u))));
+                    src = ops.d[z + 13u];
+                } else if (kind == 1u) {
+                    vec2 uv;
+                    hit = quad_uv(drawsample,
+                        vertex_xy(z,2u),
+                        vertex_xy(z,4u),
+                        vertex_xy(z,6u),
+                        vertex_xy(z,8u), uv);
+                    /* Only pixel-adjacent mesh seams receive conservative
+                     * coverage. Silhouettes and ordinary guest draws keep their
+                     * existing coverage. The pair was verified in both frames. */
+                    if(!hit && (ops.d[z+18u]&0x78000000u)!=0u) {
+                        for(uint edge=0u;edge<4u;edge++)if((ops.d[z+18u]&(1u<<(27u+edge)))!=0u) {
+                            vec2 a=vertex_xy(z,2u+edge*2u),b=vertex_xy(z,2u+((edge+1u)&3u)*2u);
+                            vec2 ab=b-a;float len=dot(ab,ab);
+                            if(len<0.00001)continue;
+                            float t=dot(drawsample-a,ab)/len;
+                            if(t<0.0||t>1.0)continue;
+                            vec2 q=a+ab*t,d=drawsample-q;
+                            if(dot(d,d)>0.25001)continue;
+                            hit=quad_uv(q,vertex_xy(z,2u),vertex_xy(z,4u),vertex_xy(z,6u),vertex_xy(z,8u),uv);
+                            if(hit)break;
+                        }
+                    }
+                    if (hit) {
+                        if (ops.d[z + 17u] != 0u) {
+                            bool transparent;
+                            src = texture_colour(ops.d[z+10u], ops.d[z+11u], ops.d[z+12u],
+                                                 ops.d[z+13u], pmod, ops.d[z+18u], uv,
+                                                 transparent);
+                            if (transparent) hit = false;
+                        } else src = ops.d[z + 16u];
+                        if (hit && (pmod & 4u) != 0u)
+                            src = gouraud(src, ops.d[z + 15u], uv);
                     }
                 }
                 if (hit) {
-                    if (ops.d[z + 17u] != 0u) {
-                        bool transparent;
-                        src = texture_colour(ops.d[z+10u], ops.d[z+11u], ops.d[z+12u],
-                                             ops.d[z+13u], pmod, ops.d[z+18u], uv,
-                                             transparent);
-                        if (transparent) hit = false;
-                    } else src = ops.d[z + 16u];
-                    if (hit && (pmod & 4u) != 0u)
-                        src = gouraud(src, ops.d[z + 15u], uv);
-                }
-            }
-            if (hit) {
-                bool write_pixel;
-                src = colour_calc(src, dst, pmod, write_pixel);
-                if (write_pixel) {
-                    bool mesh = (pmod & 0x100u) != 0u;
-                    bool mesh_blend = regs.d[266] != 0u;
-                    if (mesh && mesh_blend) {
-                        mdst = src;
-                    } else if (!mesh || ((p.x + p.y) & 1) == 0) {
-                        /* Hardware mesh writes only one checkerboard phase.
-                         * SATURN_MESHBLEND redirects full coverage to the
-                         * auxiliary buffer for the optional smooth effect. */
-                        dst = src;
-                        mdst = 0u;
+                    bool write_pixel;
+                    src = colour_calc(src, dst, pmod, write_pixel);
+                    if (write_pixel) {
+                        bool mesh = (pmod & 0x100u) != 0u;
+                        bool mesh_blend = regs.d[266] != 0u;
+                        if (mesh && mesh_blend) {
+                            mdst = src;
+                        } else if (!mesh || ((drawp.x + drawp.y) & 1) == 0) {
+                            /* Hardware mesh writes only one checkerboard phase.
+                             * SATURN_MESHBLEND redirects full coverage to the
+                             * auxiliary buffer for the optional smooth effect. */
+                            dst = src;
+                            mdst = 0u;
+                        }
                     }
                 }
             }
         }
-        if (hit) {
-            if (target == 0u) { c0 = dst; m0 = mdst; }
-            else              { c1 = dst; m1 = mdst; }
-        }
+        if (target == 0u) { c0 = dst; m0 = mdst; }
+        else              { c1 = dst; m1 = mdst; }
     }
 
     fb.d[pix] = c0; fb.d[bank_pixels + pix] = c1;

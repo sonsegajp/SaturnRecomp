@@ -95,6 +95,9 @@ if ($LASTEXITCODE -ne 0) { throw "m68k_core build failed" }
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/vdp1_quad.exe tests/vdp1_quad.c runner/src/vdp1.c runner/src/vdp2.c runner/src/m68k.c runner/src/m68k_bus.c runner/src/scsp.c runner/src/scsp_dsp.c runner/src/sound.c runner/src/bus.c runner/src/scu_dsp.c runner/src/sh2_interp.c runner/src/cdblock.c runner/src/smpc.c runner/src/bios.c runner/src/png.c recompiler/src/disc.c external/sh2-recomp-core/common/sh2_decoder.c
 if ($LASTEXITCODE -ne 0) { throw "vdp1_quad build failed" }
 
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/vdp1_interlace.exe tests/vdp1_interlace.c runner/src/vdp1.c runner/src/vdp2.c runner/src/m68k.c runner/src/m68k_bus.c runner/src/scsp.c runner/src/scsp_dsp.c runner/src/sound.c runner/src/bus.c runner/src/scu_dsp.c runner/src/sh2_interp.c runner/src/cdblock.c runner/src/smpc.c runner/src/bios.c runner/src/png.c recompiler/src/disc.c external/sh2-recomp-core/common/sh2_decoder.c
+if ($LASTEXITCODE -ne 0) { throw "vdp1_interlace build failed" }
+
 # ---- tests: CD-DA playback path -------------------------------------------
 # "The music does not play" can fail in the disc layer, the CD block or the
 # SCSP, and they look identical from outside. This drives all three.

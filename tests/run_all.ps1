@@ -153,6 +153,16 @@ if (Test-Path 'tests/vdp1_quad.exe') {
     $skip++
 }
 
+Section 'VDP1 interlace rows, draw-time modes and interpolation boundaries'
+
+if (Test-Path 'tests/vdp1_interlace.exe') {
+    & 'tests/vdp1_interlace.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else {
+    Write-Host 'vdp1_interlace.exe not built - run build.ps1' -ForegroundColor Yellow
+    $skip++
+}
+
 # ------------------------------------- 0c. dual-CPU scheduler / on-chip -----
 Section 'Dual-CPU scheduler, per-core on-chip banks, FRT (vs the SH7604 manual)'
 

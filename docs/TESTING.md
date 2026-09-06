@@ -173,15 +173,23 @@ After a runtime build, run the GPU regressions on an SDL/Vulkan-capable host:
 ```powershell
 .\tools\test_interpolation_material.ps1
 .\tools\test_render_quality.ps1
+.\tools\test_vdp1_interlace.ps1
 ```
 
-Both accept `-ObjectDir` for a different runtime object directory. The material
+All three accept `-ObjectDir` for a different runtime object directory. The material
 test checks texture, CLUT and Gouraud reuse across framebuffer swaps, partial
 draw fallback and recovery. The quality test renders synthetic geometry and
 textures through the production shaders to distinguish real rerasterization
 from pixel enlargement, check RGB filtering and indexed codes, and verify
 supersampling and FXAA. Both inspect native framebuffer/mesh preservation and
 guest-state isolation. They require no game media.
+
+The interlace regression draws synthetic command lists with coordinates above
+255 and checks both field selections, drawing-space clipping and mesh, textures,
+blending, mode changes, and framebuffer memory writes. It also checks 704x448
+composition and 2x rerasterization without altering native buffers or guest
+state. Its CPU and queued-command checks run in the standard suite; the command
+above additionally executes the production Vulkan shader.
 
 The September 2026 F1 overhead check used a fixed 128-quad scene on a GTX 1660 Ti
 at 125% Windows DPI. Three repeated baseline/closed/open runs had overlapping

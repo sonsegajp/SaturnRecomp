@@ -174,8 +174,12 @@ static int op_bounds(const saturn_vk_vdp1_op *o, int *x0, int *y0, int *x1, int 
         for(int k=1;k<4;k++){int x=(int)floorf(geometry_xy(o,k*2)),y=(int)floorf(geometry_xy(o,k*2+1));if(x<*x0)*x0=x;if(x>*x1)*x1=x;if(y<*y0)*y0=y;if(y>*y1)*y1=y;}
     }
     if(o->flip & SATURN_GEOMETRY_FLOAT){--*x0;--*y0;++*x1;++*y1;}
-    if(o->kind!=SATURN_VK_VDP1_ERASE){if(*x1>o->sys_x1)*x1=o->sys_x1;if(*y1>o->sys_y1)*y1=o->sys_y1;}
+    if(o->kind==SATURN_VK_VDP1_QUAD||o->kind==SATURN_VK_VDP1_LINE){if(*x1>o->sys_x1)*x1=o->sys_x1;if(*y1>o->sys_y1)*y1=o->sys_y1;}
     if(o->flip&0x78000000u){(*x0)--;(*y0)--;(*x1)++;(*y1)++;}
+    /* Tile coverage is in framebuffer rows, while clipping and the queued
+     * vertices remain in draw coordinates. Erases and bus writes bypass DIE. */
+    if((o->kind==SATURN_VK_VDP1_QUAD||o->kind==SATURN_VK_VDP1_LINE) &&
+       (o->flip&SATURN_VDP1_DIE)) { *y0 >>= 1; *y1 >>= 1; }
     if(*x0<0)*x0=0;if(*y0<0)*y0=0;if(*x1>511)*x1=511;if(*y1>255)*y1=255;
     return *x0<=*x1&&*y0<=*y1;
 }

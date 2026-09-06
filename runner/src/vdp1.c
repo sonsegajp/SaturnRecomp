@@ -55,7 +55,16 @@ typedef struct {
     uint32_t cur_addr;      /* command being executed, for SATURN_V1PIX */
     uint16_t cur_ctrl, cur_pmod, cur_colr;
     uint32_t cur_srca;
+    uint32_t draw_flags;
 } vctx;
+
+static uint32_t draw_flags(const saturn *s)
+{
+    if (!(s->vdp1_reg[1] & 8u)) return 0;
+    return SATURN_VDP1_DIE |
+        ((s->vdp1_reg[1] & 4u) ? SATURN_VDP1_DIL : 0) |
+        (((s->vdp2_reg[0] & 0xc0u) == 0xc0u) ? SATURN_VDP1_FIELD_SELECT : 0);
+}
 
 /* Hardware-started command lists are resumed by vdp1_tick() from the machine
  * scheduler.  SaturnRecomp has one Saturn instance per process, so keeping the
@@ -420,7 +429,7 @@ static void put(vctx *c, int32_t x, int32_t y, uint16_t colour, uint16_t pmod)
     int mesh = (pmod & 0x0100u) != 0;
     static int mesh_blend = -1;
 
-    if (x < 0 || y < 0 || x >= FB_W || y >= FB_H) return;
+    if (x < 0 || y < 0 || x >= FB_W) return;
     if (x > c->sys_x1 || y > c->sys_y1) return;
 
     /* User clipping. CMDPMOD bit 10 arms it and bit 9 picks the sense: 0 draws
@@ -441,6 +450,16 @@ static void put(vctx *c, int32_t x, int32_t y, uint16_t colour, uint16_t pmod)
      * transparent-mesh enhancement remains available explicitly. */
     if (mesh_blend < 0) mesh_blend = getenv("SATURN_MESHBLEND") != NULL;
     if (mesh && !mesh_blend && (((x + y) & 1) != 0)) return;
+
+    /* Clipping, texture/Gouraud sampling and mesh use the original draw Y.
+     * FBCR.DIE then packs the selected field into the 256-row framebuffer
+     * (Ymir VDP1PlotPixel). A 448-line command must not be clipped at 256. */
+    if (c->draw_flags & SATURN_VDP1_DIE) {
+        if ((c->draw_flags & SATURN_VDP1_FIELD_SELECT) &&
+            (y & 1) != ((c->draw_flags & SATURN_VDP1_DIL) != 0)) return;
+        y >>= 1;
+    }
+    if (y >= FB_H) return;
 
     o = ((uint32_t)y * FB_W + (uint32_t)x) * 2u;
 
@@ -512,8 +531,15 @@ static inline void put_replace(vctx *c, int32_t x, int32_t y, uint16_t colour)
 {
     uint32_t o;
 
-    if ((uint32_t)x >= FB_W || (uint32_t)y >= FB_H) return;
+    if ((uint32_t)x >= FB_W || y < 0) return;
     if (x > c->sys_x1 || y > c->sys_y1) return;
+
+    if (c->draw_flags & SATURN_VDP1_DIE) {
+        if ((c->draw_flags & SATURN_VDP1_FIELD_SELECT) &&
+            (y & 1) != ((c->draw_flags & SATURN_VDP1_DIL) != 0)) return;
+        y >>= 1;
+    }
+    if (y >= FB_H) return;
 
     o = ((uint32_t)y * FB_W + (uint32_t)x) * 2u;
     pixprobe(c, x, y, colour);
@@ -699,7 +725,8 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
         op.xy[4] = xc; op.xy[5] = yc; op.xy[6] = xd; op.xy[7] = yd;
         op.chr = chr; op.tw = tw; op.th = th;
         op.colr = colr; op.pmod = pmod; op.grda = grda;
-        op.flat = flat; op.textured = (uint32_t)textured; op.flip = flip | ((c->cur_ctrl & 15u) << 8);
+        op.flat = flat; op.textured = (uint32_t)textured;
+        op.flip = flip | ((c->cur_ctrl & 15u) << 8) | c->draw_flags;
         op.sys_x1 = c->sys_x1; op.sys_y1 = c->sys_y1;
         op.usr_x0 = c->usr_x0; op.usr_y0 = c->usr_y0;
         op.usr_x1 = c->usr_x1; op.usr_y1 = c->usr_y1;
@@ -1004,6 +1031,7 @@ void vdp1_execute(saturn *s)
         uint32_t srca, grda;
         uint32_t px_before = c.pixels;
         c.cur_addr = addr; c.cur_ctrl = ctrl;
+        c.draw_flags = draw_flags(s);
         int32_t xa, ya, xb, yb, xc_, yc_, xd, yd;
         unsigned cmd, jump;
         int skip;
@@ -1142,6 +1170,7 @@ void vdp1_execute(saturn *s)
                         op.xy[0] = x0; op.xy[1] = y0;
                         op.xy[2] = x1; op.xy[3] = y1;
                         op.colr = colr; op.pmod = pmod;
+                        op.flip = c.draw_flags;
                         op.sys_x1 = c.sys_x1; op.sys_y1 = c.sys_y1;
                         op.usr_x0 = c.usr_x0; op.usr_y0 = c.usr_y0;
                         op.usr_x1 = c.usr_x1; op.usr_y1 = c.usr_y1;

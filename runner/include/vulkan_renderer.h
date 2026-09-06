@@ -25,6 +25,13 @@ enum {
     SATURN_VK_VDP1_FB_WRITE = 4
 };
 
+/* Draw-time framebuffer mode, carried in op.flip alongside texture direction
+ * and command type. Erase and memory writes already address framebuffer rows.
+ * Keeping these bits in the existing word preserves the captured-op layout. */
+#define SATURN_VDP1_DIE          (1u << 16)
+#define SATURN_VDP1_DIL          (1u << 17)
+#define SATURN_VDP1_FIELD_SELECT (1u << 18)
+
 typedef struct saturn_vk_vdp1_op {
     uint32_t kind;
     uint32_t target;

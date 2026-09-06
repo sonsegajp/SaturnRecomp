@@ -23,7 +23,7 @@ the same machine, so these results are not performance benchmarks.
 | Game | Observed path | Result and limit |
 | --- | --- | --- |
 | Burning Rangers | 24,000 fields: training, camera turns, corridor traversal and jet-assisted jumps | Fixed missing and stretched room walls caused by stale cached projection instructions after the game rewrote its own code. Fresh Vulkan captures confirm complete room geometry through movement and camera changes. Dialogue timing and resulting character/camera positions differ from Ymir at some identical field numbers; complete mission coverage remains unverified. |
-| Fighting Vipers | Grace vs. Bahn: movement, jumping, attacks, knockdowns, KO, replay, Round 2; 4,500 fields | Fixed the misplaced arena floor, a sound-command timeout that disabled later combat sounds, and the SCSP timer C interrupt level. A fresh run restored fighter voice/effect events to the recorded mix. Other fighters and stages remain unverified. |
+| Fighting Vipers | Grace vs. Bahn: movement, jumping, attacks, knockdowns, both rounds, match-ending KO, replay and Continue; 7,400 fields | Fixed the misplaced arena floor, a sound-command timeout that disabled later combat sounds, the SCSP timer C interrupt level, and the cropped character on the match-ending screen. Other fighters and stages remain unverified. |
 | Daytona USA | 7,200 fields of boot, racing attract mode, rankings and title | Fixed missing SCSP DAC18B handling, which made game audio four times too quiet. Fixed mix RMS was 1,561 versus Ymir's 1,565, with matching peaks. A player-controlled race was not exercised. |
 | Gunbird | 2,400 fields of logos and opening animation | Corresponding images and audio closely match. Gameplay was not repeated in this pass. |
 | NiGHTS into Dreams | 2,400 fields of logos/opening movie; additional Spring Valley movement captures | Corresponding opening images and aligned audio closely match. Fixed environment flicker in inserted gameplay frames by retaining the displayed frame's complete texture and lighting data. Full stage coverage remains unverified. |
@@ -53,6 +53,23 @@ interval that previously had none. The first eight restored sample triggers
 matched Ymir's sequence; the recorded final stereo mix contained the restored
 voice/effect channels and had no clipped samples. Later fight timing and outcomes
 diverge, so this does not establish event-for-event parity for the complete match.
+
+The September 6 match-ending check reproduced a character cropped at the bottom
+of the screen with both native settings and 120 Hz interpolation. Fighting Vipers
+enables VDP1 interlaced drawing for this scene and submits coordinates in a
+448-line drawing space. The CPU and Vulkan renderers now apply the selected
+interlaced field before storing pixels in the 256-line framebuffer. Clipping,
+mesh and texture sampling retain their original drawing coordinates; erase and
+CPU framebuffer writes retain their memory coordinates. Vulkan records the mode
+with each draw operation, including enhanced and interpolated replays. This is
+a shared hardware fix, with no game-specific camera adjustment.
+
+Fresh 7,400-field runs retained the complete character on the match-ending KO
+and Continue screens. Native and 120 Hz/2x captures match the framing of Ymir's
+corresponding KO outcome; its timeout outcome uses a different pose. Earlier
+gameplay captures remained unchanged, and the full 123.69-second recorded mix
+matched the preceding build. These checks cover this match-ending sequence,
+not every fighter's victory animation.
 
 The shared interpolation renderer now snapshots VDP1 material data separately
 for each framebuffer. Burning Rangers and NiGHTS rewrite texture, palette and
