@@ -36,6 +36,55 @@ $env:SATURN_SHOTS = 'out\shots\frame:100000000'
 
 The runtime exposes additional narrowly scoped `SATURN_*` probes in source comments. They are diagnostics, not compatibility switches. Avoid publishing raw state or framebuffer dumps: they can contain copyrighted game data.
 
+## Paired runtime benchmarks
+
+Compare two builds with the same game, inputs and rendering settings:
+
+```powershell
+python tools/benchmark_pair.py --baseline out/baseline/saturnwin.exe --candidate out/candidate/saturnwin.exe --game games/mygame/game.toml --pad-sequence-file out/local-inputs.txt --frames 7200 --repeats 3
+```
+
+Each repeat runs both builds; the order alternates baseline/candidate, then
+candidate/baseline. `--dry-run` prints the validated plan without running it.
+The optional input file contains `cycle:low[:high]` controller values separated
+by commas or newlines. `--pad-sequence` accepts the same values inline, and
+`--smpc-file` selects an initial console-state seed. Every run starts from a
+fresh copy of that seed and explicit settings.
+
+Rendering options include `--present-hz 120`, `--internal-scale 2`,
+`--texture-filter 1`, `--antialiasing 1` and `--model-smoothing`; defaults use
+native rendering with interpolation off. Runs are uncapped unless `--paced`
+is supplied. Timing always disables profiling counters, audio capture and
+frame capture. Physical audio uses the dummy driver while SCSP/DSP execution
+continues. Run comparisons alone on an otherwise quiet machine.
+
+Results stay under ignored `out/performance/` with a unique prefix, or an
+unused `--tag`. The summary records executable/configuration/input hashes,
+settings, run order, individual wall/process CPU times and their medians.
+Wall time includes process startup and shutdown; CPU time sums the process's
+threads and may be unavailable on some hosts. The reported speedup is baseline
+median wall time divided by candidate median wall time, so values above one
+favor the candidate. Keep the individual samples when assessing variation.
+
+The tool rejects nonzero exits, halted CPUs, rendering failures, changed
+inputs/settings and different final PC/master-cycle counts. An explicit
+runtime completion marker must match the requested field count when present;
+older builds without that marker are labeled in the summary and still must
+match the final PC/cycles. At least one run must verify the requested field
+count: two legacy builds with matching early exits cannot establish completion.
+A legacy baseline paired with a verified candidate is supported. Check
+equivalent gameplay and image/audio correctness separately before treating a
+timing difference as an improvement.
+
+`tools/benchmark_runtime.ps1` remains available for individual profiling runs;
+use `-NoProfileCounters -NoFrameCapture` for timing and reserve `-CaptureAudio`
+for separate audio checks. The paired tool's argument, ordering, failure and
+summary checks require no games or GPU:
+
+```powershell
+python tests/benchmark_pair.py
+```
+
 ## SH-2 cache regressions
 
 `tests/sh2_cache.c` exercises cached self-modifying instructions with byte,

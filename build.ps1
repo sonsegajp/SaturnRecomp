@@ -116,6 +116,9 @@ if ($LASTEXITCODE -ne 0) { throw "sh2_cache build failed" }
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/sound_bus_timing.exe tests/sound_bus_timing.c @BUS_TEST_SRCS
 if ($LASTEXITCODE -ne 0) { throw "sound_bus_timing build failed" }
 
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/frt_advance.exe tests/frt_advance.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "frt_advance build failed" }
+
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/bus_alias.exe tests/bus_alias.c @BUS_TEST_SRCS
 if ($LASTEXITCODE -ne 0) { throw "bus_alias build failed" }
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/cd_bus.exe tests/cd_bus.c @BUS_TEST_SRCS

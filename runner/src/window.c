@@ -1322,6 +1322,10 @@ int main(int argc, char **argv)
            s->master.pc, (unsigned long long)s->master.cycles,
            s->master.halted ? " - HALTED: " : "",
            s->master.halted ? s->master.fault : "");
+    /* Emit actual completed work once at shutdown; benchmark budgets alone
+     * cannot distinguish a full run from an early window/renderer exit. */
+    fprintf(stderr, "[runtime] fields %llu cycles %llu\n",
+            (unsigned long long)s->frames, (unsigned long long)s->master.cycles);
     saturn_report_trace(s, stdout);
 
     if (audio_dev) SDL_CloseAudioDevice(audio_dev);

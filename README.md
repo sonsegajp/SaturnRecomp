@@ -172,6 +172,11 @@ build requires no profile. To use collected profiles through `build.ps1`, set
 corresponding profile and object directories. Both frontends consume the same
 profiled core objects. Measurements on one game do not establish 60 FPS in all games.
 
+[Performance measurements](docs/PERFORMANCE.md) describe the tested scenes,
+shared timer optimization and validation. Use the
+[paired benchmark](docs/TESTING.md#paired-runtime-benchmarks) to compare two
+builds with identical settings and controller inputs on your machine.
+
 ### FM/LFO and high refresh presentation
 
 FM feedback now uses the 64-word SCSP sound stack, including MDL/MDXSL/MDYSL,

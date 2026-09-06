@@ -89,6 +89,12 @@ if (Test-Path 'tests/scsp_modulation.exe') {
     if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
 } else { Write-Host 'scsp_modulation.exe not built'; $skip++ }
 
+Section 'Paired benchmark orchestration and workload validation'
+if ($PY) {
+    & $PY tests/benchmark_pair.py
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'Python not found; benchmark tool tests skipped'; $skip++ }
+
 Section 'Windows frontend audio ring capacity and wraparound'
 if (Test-Path 'tests/audio_ring.exe') {
     & 'tests/audio_ring.exe' | Write-Host
@@ -158,6 +164,12 @@ if (Test-Path 'tests/dual_cpu.exe') {
     Write-Host 'dual_cpu.exe not built - run build.ps1' -ForegroundColor Yellow
     $skip++
 }
+
+Section 'FRT event-free advancement vs per-tick reference'
+if (Test-Path 'tests/frt_advance.exe') {
+    & 'tests/frt_advance.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'frt_advance.exe not built - run build.ps1'; $skip++ }
 
 # ------------------------------------------ 0d. MC68000 sound CPU + SCSP ----
 Section 'MC68000 sound CPU and SCSP (vs the 68000 and SCSP manuals)'

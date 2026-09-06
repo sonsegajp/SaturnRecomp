@@ -1613,6 +1613,17 @@ void frt_advance(sh2 *c, uint32_t cycles)
     ocra = frt_ocr(c, 0);
     ocrb = frt_ocr(c, 1);
 
+    /* With no compare or overflow in this span, only the counter moves.
+     * An equal compare value is one complete wrap away, not an event now.
+     * Keep single-tick spans on the short reference path below. */
+    if (ticks > 1u && ticks < 0x10000u - (uint32_t)c->frc &&
+        ticks <= (uint16_t)(ocra - c->frc - 1u) &&
+        ticks <= (uint16_t)(ocrb - c->frc - 1u)) {
+        c->frc = (uint16_t)(c->frc + ticks);
+        frt_update_pend(c);
+        return;
+    }
+
     /* One tick at a time so a compare match or a wrap inside the span is not
      * stepped over. A scanline is CYC_PER_LINE cycles, so even on the fastest
      * divider this is at most ~228 iterations, and the quantum is far shorter. */
