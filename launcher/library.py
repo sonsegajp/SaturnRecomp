@@ -9,6 +9,7 @@ ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[1]))
 INSTALL = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else ROOT
 PYTHON = sys.executable
 CREATE_HIDDEN = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+RUNTIME_FILES = ('saturnwin.exe', 'SDL2.dll', 'libmpg123-0.dll')
 
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,10 +101,6 @@ class Library:
         self.art = CoverArt()
         self.igdb_available = all(odyssey_credentials())
         self.sync_runtime()
-        ini = configparser.ConfigParser()
-        ini.read(self.root/'settings.ini', encoding='utf-8')
-        if ini.has_option('Video','Interpolation'):
-            self.settings['interpolation'] = ini.get('Video','Interpolation') == '120'
         self.save_settings()
     def tool(self,name):
         for parent in (ROOT/'runtime',ROOT/'out/launcher-tools',ROOT/'out',ROOT/'runner'):
@@ -112,8 +109,9 @@ class Library:
         raise RuntimeError(f'{name} is missing. Run the launcher build script.')
     def sync_runtime(self):
         target=self.root/'runtime'
-        for name in ('saturnwin.exe','SDL2.dll'):
-            choices=[ROOT/'runtime'/name,ROOT/'runner'/name,Path('C:/msys64/mingw64/bin')/name]
+        mingw = Path(os.environ.get('SATURN_MINGW_BIN', 'C:/msys64/mingw64/bin'))
+        for name in RUNTIME_FILES:
+            choices=[ROOT/'runtime'/name,ROOT/'runner'/name,mingw/name]
             source=next((x for x in choices if x.exists()),None)
             if not source:raise RuntimeError(f'Shared runtime file missing: {name}')
             out=target/name
@@ -122,10 +120,73 @@ class Library:
         shaders=ROOT/'runtime/shaders' if (ROOT/'runtime/shaders').exists() else ROOT/'runner/shaders'
         (target/'shaders').mkdir(exist_ok=True)
         for source in shaders.glob('*.spv'):shutil.copy2(source,target/'shaders'/source.name)
-    def save_settings(self):
-        atomic_json(self.settings_path,self.settings)
-        ini=self.root/'settings.ini'
-        ini.write_text('[Video]\nInterpolation='+('120' if self.settings.get('interpolation') else '0')+'\n',encoding='utf-8')
+    def read_runtime_settings(self):
+        """The running game's INI is authoritative for shared video options."""
+        ini = configparser.ConfigParser(interpolation=None, strict=False)
+        path = self.root/'settings.ini'
+        ini.read(path, encoding='utf-8-sig')
+        section = next((name for name in ini.sections() if name.casefold() == 'video'), None)
+        target = 120 if path.exists() else self.settings.get('target_hz', 120)
+        if path.exists(): self.settings['interpolation'] = False
+        try: target = int(target)
+        except (ValueError, TypeError): target = 120
+        if section:
+            def number(name):
+                value = ini.get(section, name)
+                match = re.fullmatch(r'\s*([+-]?\d+)\s*(?:[;#].*)?', value)
+                if not match: raise ValueError('Invalid integer setting')
+                result = int(match[1])
+                if not -(2**31) <= result < 2**31: raise ValueError('Setting is out of range')
+                return result
+            try:
+                enabled = number('Interpolation')
+                self.settings['interpolation'] = enabled > 0
+                if enabled > 1: target = enabled
+            except (ValueError, configparser.Error): pass
+            try: target = number('TargetHz')
+            except (ValueError, configparser.Error): pass
+        self.settings['target_hz'] = max(60, min(240, target))
+
+    def save_settings(self, interpolation=None):
+        with self.lock:
+            self.read_runtime_settings()
+            if interpolation is not None:
+                self.settings['interpolation'] = bool(interpolation)
+            ini = self.root/'settings.ini'
+            if interpolation is not None or not ini.exists():
+                target = self.settings['target_hz']
+                values = {'interpolation': str(target if self.settings.get('interpolation') else 0),
+                          'targethz': str(target)}
+                # Change only these two values. Preserve comments, unknown
+                # options and runtime overlay settings exactly as written.
+                lines = ini.read_text(encoding='utf-8-sig').splitlines(keepends=True) if ini.exists() else []
+                result, seen = [], set()
+                video = found = False
+                def missing():
+                    for key, name in (('interpolation', 'Interpolation'), ('targethz', 'TargetHz')):
+                        if key not in seen:
+                            result.append(f'{name}={values[key]}\n')
+                            seen.add(key)
+                for line in lines:
+                    section = re.match(r'\s*\[([^]]+)\]', line)
+                    if section:
+                        if video: missing()
+                        video = section[1].strip().casefold() == 'video'
+                        found |= video
+                    key = re.match(r'\s*([^=;#]+?)\s*=', line) if video and not section else None
+                    name = key[1].casefold() if key else ''
+                    if name in values:
+                        if name not in seen:
+                            result.append(f'{key[1]}={values[name]}\n')
+                            seen.add(name)
+                    else:
+                        result.append(line if line.endswith(('\n', '\r')) else line+'\n')
+                if not found: result.append('\n[Video]\n')
+                missing()
+                temp = ini.with_suffix('.launcher.tmp')
+                temp.write_text(''.join(result), encoding='utf-8')
+                temp.replace(ini)
+            atomic_json(self.settings_path,self.settings)
     def set_bios(self,path):
         source=Path(path).resolve()
         if not source.is_file() or source.stat().st_size!=512*1024:
@@ -142,8 +203,7 @@ class Library:
             if record.exists():self.write_config(folder,json.loads(record.read_text(encoding='utf-8')))
         return self.state()
     def set_interpolation(self,value):
-        self.settings['interpolation']=bool(value)
-        self.save_settings()
+        self.save_settings(interpolation=bool(value))
         return self.state()
     def set_selected_game(self, key):
         """Remember the focused title without changing the user's collection."""
@@ -170,9 +230,7 @@ class Library:
     def state(self, include_art=True):
         """Return library metadata; native views load art directly from its path."""
         with self.lock:
-            ini=configparser.ConfigParser()
-            ini.read(self.root/'settings.ini',encoding='utf-8')
-            if ini.has_option('Video','Interpolation'):self.settings['interpolation']=ini.get('Video','Interpolation')=='120'
+            self.read_runtime_settings()
             games=[]
             for p in (self.root/'games').glob('*/game.json'):
                 g=json.loads(p.read_text(encoding='utf-8'))

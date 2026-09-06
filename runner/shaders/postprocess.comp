@@ -1,0 +1,93 @@
+#version 450
+
+/* Presentation-only resolve and optional FXAA. Guest framebuffer values,
+ * sprite priorities and emulated memory are never changed by this pass. */
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba8, binding = 0) uniform readonly image2D source_image;
+layout(rgba8, binding = 1) uniform writeonly image2D destination_image;
+layout(push_constant) uniform Presentation {
+    int src_width;
+    int src_height;
+    int dst_width;
+    int dst_height;
+    int antialiasing;
+} presentation;
+
+ivec2 destination_size()
+{
+    return max(ivec2(presentation.dst_width, presentation.dst_height), ivec2(1));
+}
+
+vec4 resolved(ivec2 p)
+{
+    ivec2 dst_size = destination_size();
+    ivec2 src_size = min(max(ivec2(presentation.src_width, presentation.src_height),
+                             ivec2(1)), imageSize(source_image));
+    p = clamp(p, ivec2(0), dst_size - 1);
+    /* The renderer uses either a 1:1 source or 2x on each axis for model
+     * smoothing. Average all four coverage samples before edge detection. */
+    ivec2 ratio = clamp(src_size / dst_size, ivec2(1), ivec2(2));
+    ivec2 base = p * ratio;
+    if (all(equal(ratio, ivec2(1))))
+        return imageLoad(source_image, min(base, src_size - 1));
+    vec4 value = vec4(0.0);
+    for (int y = 0; y < ratio.y; ++y)
+        for (int x = 0; x < ratio.x; ++x)
+            value += imageLoad(source_image, min(base + ivec2(x, y), src_size - 1));
+    return value / float(ratio.x * ratio.y);
+}
+
+vec3 sample_resolved(vec2 p)
+{
+    ivec2 base = ivec2(floor(p));
+    vec2 weight = fract(p);
+    vec3 top = mix(resolved(base).rgb, resolved(base + ivec2(1, 0)).rgb, weight.x);
+    vec3 bottom = mix(resolved(base + ivec2(0, 1)).rgb,
+                      resolved(base + ivec2(1, 1)).rgb, weight.x);
+    return mix(top, bottom, weight.y);
+}
+
+float luma(vec3 rgb)
+{
+    return dot(rgb, vec3(0.299, 0.587, 0.114));
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, destination_size())) ||
+        any(greaterThanEqual(p, imageSize(destination_image)))) return;
+    vec4 center = resolved(p);
+    if (presentation.antialiasing == 0) {
+        imageStore(destination_image, p, center);
+        return;
+    }
+
+    float middle = luma(center.rgb);
+    float nw = luma(resolved(p + ivec2(-1, -1)).rgb);
+    float ne = luma(resolved(p + ivec2( 1, -1)).rgb);
+    float sw = luma(resolved(p + ivec2(-1,  1)).rgb);
+    float se = luma(resolved(p + ivec2( 1,  1)).rgb);
+    float low = min(middle, min(min(nw, ne), min(sw, se)));
+    float high = max(middle, max(max(nw, ne), max(sw, se)));
+    if (high - low < max(1.0 / 32.0, high / 8.0)) {
+        imageStore(destination_image, p, center);
+        return;
+    }
+
+    /* Estimate the edge direction from diagonal contrast. Bound the search
+     * to eight resolved pixels and suppress ringing with a local luma test. */
+    vec2 direction = vec2(-((nw + ne) - (sw + se)), (nw + sw) - (ne + se));
+    float reduction = max((nw + ne + sw + se) * (0.25 / 8.0), 1.0 / 128.0);
+    direction = clamp(direction / (min(abs(direction.x), abs(direction.y)) + reduction),
+                      vec2(-8.0), vec2(8.0));
+    vec2 at = vec2(p);
+    vec3 inner = 0.5 * (sample_resolved(at + direction * (-1.0 / 6.0)) +
+                        sample_resolved(at + direction * ( 1.0 / 6.0)));
+    vec3 outer = inner * 0.5 + 0.25 *
+                 (sample_resolved(at + direction * -0.5) +
+                  sample_resolved(at + direction *  0.5));
+    float outer_luma = luma(outer);
+    vec3 result = outer_luma < low || outer_luma > high ? inner : outer;
+    imageStore(destination_image, p, vec4(result, center.a));
+}

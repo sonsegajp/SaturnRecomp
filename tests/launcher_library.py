@@ -1,8 +1,12 @@
 """Disc preparation integration tests using a synthetic ISO, without firmware."""
 import importlib.util
+import base64
 import json
+import os
 from pathlib import Path
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -12,7 +16,56 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'launcher'))
-from library import Library
+from library import Library, RUNTIME_FILES
+
+# A 0.12-second, 440 Hz stereo test tone encoded as MP3; no game audio is used.
+MP3_TONE = base64.b64decode(
+    '//sQZAAAAHkG04UwAAoAAA0goAABBAgzShmhAAAAADSDAAAAEsSzOM4EAEAaEx+7b4eHl5hDwlAVpWAKMNYBhoPEXRthdcaGr/98KA+Ag1wqCv2KcAbgAGOMZmNGP6OMVh2VU1NlKB7/'
+    '+xJkCgPwjwbVp2AACAAADSDgAAECRB1YhOGCYAAANIAAAATwAPBGFJWCJpx2APktYdr+aWnQciEGNE8DQwRlpKSQBR0gmAKSNygw2RItgAhZkatNKXSEQOaD7n8Oy4jREBJZKBrwAPD/'
+    '+xBkGoPwiAdQAZswmAAADSAAAAEBvBtXAGDAsAAANIAAAARMASsGJVHYDZGoXRqMDzgAZ51IYfQROU/9TD7tnoAAEtAwGAwGAoAAAAAEP0aqRAi0iQn5+n8NlvxuL2/z2cz/yAEd+v/'
+    '7EmQtA/CHB1ADeTEIAAANIAAAAQIYG1qDYSJgAAA0gAAABFN2CCdNd/w3KfMelX+37uW8P8UBdHygPhab8SyY0G6r+OjzES+n8gYPokxBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqv/'
+    '7EGQ+gACJB1clYAAIAAANIKAAAQT4cW2404AQAAA0gwAAAKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq'
+    '//sSZEQAAUUgVIZg4AAAAA0gwAAAAAABpBwAACAAADSDgAAEqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq'
+)
+
+DISC_AUDIO_PROBE = r'''
+#include "disc.h"
+#include <stdint.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    disc d;
+    int audio = 0, decoded = 0, peak = 0;
+    uint64_t nonzero = 0;
+    if (argc != 2) return 2;
+    if (disc_open(&d, argv[1])) { fprintf(stderr, "%s\n", d.err); return 1; }
+    for (int i = 0; i < d.ntracks; ++i) {
+        const disc_track *track = &d.tracks[i];
+        if (track->mode != TRACK_AUDIO) continue;
+        const disc_file *file = &d.files[track->file_index];
+        uint32_t sectors = (uint32_t)(file->size / 2352u);
+        uint32_t offset = sectors / 2u < 750u ? sectors / 2u : 750u;
+        uint64_t signal = 0;
+        ++audio;
+        if (file->is_mp3 && file->audio_decoder && file->pcm_frames) ++decoded;
+        for (uint32_t j = 0; j < 20u && offset + j < sectors; ++j) {
+            int16_t pcm[1176];
+            if (disc_read_raw(&d, track->start_lba + offset + j, pcm)) break;
+            for (int k = 0; k < 1176; ++k) {
+                int sample = pcm[k] < 0 ? -(int)pcm[k] : pcm[k];
+                if (sample) ++signal;
+                if (sample > peak) peak = sample;
+            }
+        }
+        nonzero += signal;
+        printf("track=%d frames=%llu nonzero=%llu\n", track->num,
+            (unsigned long long)file->pcm_frames, (unsigned long long)signal);
+    }
+    printf("tracks=%d audio=%d decoded=%d nonzero=%llu peak=%d\n", d.ntracks,
+        audio, decoded, (unsigned long long)nonzero, peak);
+    disc_close(&d);
+    return decoded && nonzero && peak > 64 ? 0 : 1;
+}
+'''
 
 def directory_entry(name, lba, size, directory=False):
     name = name if isinstance(name, bytes) else name.encode('ascii')
@@ -115,6 +168,54 @@ class LibraryTests(unittest.TestCase):
         self.assertTrue(self.lib.state()['settings']['interpolation'])
         self.lib.dismiss_job('missing')
 
+    def test_runtime_target_rates_survive_launcher_toggle(self):
+        ini = self.lib.root / 'settings.ini'
+        for rate in (60, 75, 120, 144, 165, 239, 240):
+            ini.write_text(f'[Video]\nInterpolation={rate}\nTargetHz={rate}\nInternalScale=3\n'
+                           '[Audio]\nVolume=37\nMuted=1\n[Plugin]\nFutureKey=100% custom\n')
+            state = self.lib.state(False)['settings']
+            self.assertTrue(state['interpolation'])
+            self.assertEqual(state['target_hz'], rate)
+            self.lib.set_interpolation(False)
+            disabled = ini.read_text()
+            self.assertIn('Interpolation=0\n', disabled)
+            self.assertIn(f'TargetHz={rate}\n', disabled)
+            self.assertIn('InternalScale=3\n', disabled)
+            self.assertIn('[Audio]\nVolume=37\nMuted=1\n', disabled)
+            self.assertIn('FutureKey=100% custom\n', disabled)
+            self.lib.set_interpolation(True)
+            self.assertIn(f'Interpolation={rate}\n', ini.read_text())
+
+    def test_selecting_game_preserves_fresh_overlay_settings(self):
+        key = self.import_game()
+        ini = self.lib.root / 'settings.ini'
+        # Simulate an F1 save after the launcher has already loaded old values.
+        fresh = ('; runtime user settings\n[Video]\nInterpolation=0\nTargetHz=165\n'
+                 'WindowWidth=2560\nWindowHeight=1440\nFullscreen=1\n'
+                 'TextureFilter=1\nAntialiasing=1\nModelSmoothing=1\n'
+                 '[Audio]\nVolume=29\nMuted=1\n[Future]\nKeep=opaque:value\n')
+        ini.write_text(fresh)
+        before = ini.read_bytes()
+        self.lib.set_selected_game(key)
+        self.assertEqual(ini.read_bytes(), before)
+        self.assertEqual(self.lib.settings['target_hz'], 165)
+        self.assertFalse(self.lib.settings['interpolation'])
+        reopened = Library(self.lib.root)
+        self.assertEqual(ini.read_bytes(), before)
+        self.assertEqual(reopened.state(False)['settings']['target_hz'], 165)
+
+    def test_legacy_rate_and_malformed_values_match_runtime_defaults(self):
+        ini = self.lib.root / 'settings.ini'
+        ini.write_text('[video]\nInterpolation=165 ; saved by older runtime\n'
+                       'CustomOption=preserve\n[Audio]\nVolume=52\n')
+        self.lib.set_interpolation(False)
+        self.assertIn('TargetHz=165\n', ini.read_text())
+        self.assertIn('CustomOption=preserve\n', ini.read_text())
+        ini.write_text('[Video]\nInterpolation=garbage\nTargetHz=9999999999999999999999999\n')
+        state = self.lib.state(False)['settings']
+        self.assertFalse(state['interpolation'])
+        self.assertEqual(state['target_hz'], 120)
+
     def test_native_selection_persists_without_changing_games(self):
         key = self.import_game()
         record = self.lib.root / 'games' / key / 'game.json'
@@ -184,5 +285,52 @@ class LibraryTests(unittest.TestCase):
                 self.lib.launch(key)
             spawn.assert_not_called()
 
+    def test_packaged_mp3_decoder_reaches_importer_and_shared_runtime(self):
+        mingw = Path(os.environ.get('SATURN_MINGW_BIN', 'C:/msys64/mingw64/bin'))
+        compiler = mingw / 'gcc.exe'
+        if not compiler.is_file():
+            self.skipTest('MP3 integration probe requires the MinGW build toolchain')
+        package = self.folder / 'package'
+        runtime = package / 'runtime'
+        runtime.mkdir(parents=True)
+        for name in RUNTIME_FILES:
+            shutil.copy2(self.lib.root / 'runtime' / name, runtime / name)
+        shutil.copy2(self.lib.tool('saturn-import.exe'), runtime / 'saturn-import.exe')
+        shutil.copy2(self.lib.tool('saturn-game.exe'), runtime / 'saturn-game.exe')
+        (self.folder / 'tone.mp3').write_bytes(MP3_TONE)
+        cue = self.folder / 'complete.cue'
+        cue.write_text('FILE "Test Disc.iso" BINARY\n TRACK 01 MODE1/2048\n INDEX 01 00:00:00\n'
+                       'FILE "tone.mp3" MP3\n TRACK 02 AUDIO\n INDEX 01 00:00:00\n')
+        environment = {'PATH': str(Path(os.environ['SystemRoot']) / 'System32'),
+                       'SATURN_MINGW_BIN': str(self.folder / 'missing-toolchain')}
+        # Simulate the packaged source directory and an end-user PATH. Decoder
+        # discovery must succeed from the supplied DLLs, not the developer PC.
+        with patch('library.ROOT', package), patch.dict(os.environ, environment):
+            packaged = Library(self.folder / 'portable-library')
+            packaged.set_bios(self.folder / 'bios.bin')
+            with patch.object(packaged.art, 'fetch', return_value={'status': 'Offline'}):
+                result = packaged.start_import(cue)
+                deadline = time.monotonic() + 15
+                while packaged.jobs[result['job']]['status'] == 'running' and time.monotonic() < deadline:
+                    time.sleep(.02)
+            job = packaged.jobs[result['job']]
+            self.assertEqual(job['status'], 'complete', job)
+            manifest = ET.parse(packaged.root / 'games' / job['game'] / 'manifest.xml').getroot()
+            self.assertEqual(len(manifest.find('tracks')), 2)
+            decoder = packaged.root / 'runtime/libmpg123-0.dll'
+            self.assertEqual(decoder.read_bytes(), (runtime / decoder.name).read_bytes())
+            probe_source = self.folder / 'disc-audio-probe.c'
+            probe_source.write_text(DISC_AUDIO_PROBE)
+            probe = packaged.root / 'runtime/disc-audio-probe.exe'
+            build_environment = os.environ.copy()
+            build_environment['PATH'] = str(mingw) + os.pathsep + build_environment['PATH']
+            build = subprocess.run([str(compiler), '-O2', '-std=c11', '-I' + str(ROOT / 'recompiler/include'),
+                                    str(probe_source), str(ROOT / 'recompiler/src/disc.c'), '-o', str(probe)],
+                                   capture_output=True, text=True, env=build_environment)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            decoded = subprocess.run([str(probe), str(cue)], cwd=self.folder,
+                                     capture_output=True, text=True)
+            self.assertEqual(decoded.returncode, 0, decoded.stdout + decoded.stderr)
+            self.assertIn('tracks=2 audio=1 decoded=1', decoded.stdout)
 if __name__ == '__main__':
     unittest.main()

@@ -13,9 +13,11 @@
 #include "vulkan_renderer.h"
 #include "frame_pacing.h"
 #include "geometry_interp.h"
+#include "game_overlay.h"
 #include "disc.h"
 #include "game_config.h"
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -345,7 +347,7 @@ static void frameprof_add(uint64_t present_tick, uint64_t freq,
     }
 }
 
-static SDL_atomic_t audio_missing_frames, audio_underruns;
+static SDL_atomic_t audio_missing_frames, audio_underruns, audio_gain;
 
 static void audio_cb(void *user, Uint8 *stream, int len)
 {
@@ -383,8 +385,97 @@ static void audio_cb(void *user, Uint8 *stream, int len)
                    (size_t)(frames - got - fade) * 4u);
         primed = 0;
     }
+    /* Playback gain belongs to the host output. The SCSP ring, CD audio and
+     * diagnostic WAV recordings retain their original samples and timing. */
+    int gain = SDL_AtomicGet(&audio_gain);
+    if (!gain) SDL_memset(stream, 0, (size_t)len);
+    else if (gain != 100)
+        for (i = 0; i < frames * 2u; ++i)
+            out[i] = (int16_t)((int32_t)out[i] * gain / 100);
 }
 
+static void settings_apply(SDL_Window *window, saturn_vk_renderer *vk,
+    saturn_runtime_settings *current, saturn_runtime_settings next,
+    unsigned changed)
+{
+    char error[512] = {0};
+    saturn_settings_normalize(&next);
+    unsigned quality = GAME_OVERLAY_INTERNAL_SCALE | GAME_OVERLAY_TEXTURE_FILTER |
+                       GAME_OVERLAY_ANTIALIASING | GAME_OVERLAY_MODEL_SMOOTHING;
+    if (vk && (changed & quality) && !saturn_vk_set_quality(vk, &next, error, sizeof error)) {
+        next.internal_scale = current->internal_scale;
+        next.texture_filter = current->texture_filter;
+        next.antialiasing = current->antialiasing;
+        next.model_smoothing = current->model_smoothing;
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Rendering setting unavailable", error, window);
+    }
+    if (vk && (changed & GAME_OVERLAY_INTERPOLATION)) {
+        if (!next.interpolation) saturn_vk_interpolation_disable(vk);
+        else if (!saturn_vk_interpolation_enable(vk)) {
+            next.interpolation = 0;
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Interpolation unavailable",
+                                     "Could not allocate interpolation history.", window);
+        }
+    }
+    if (changed & (GAME_OVERLAY_WINDOW | GAME_OVERLAY_FULLSCREEN)) {
+        int ok = SDL_SetWindowFullscreen(window, 0) == 0;
+        if (ok) {
+            SDL_SetWindowSize(window, next.window_width, next.window_height);
+            if (next.fullscreen) ok = SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0;
+        }
+        if (!ok) {
+            next.fullscreen = !!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+            SDL_GetWindowSize(window, &next.window_width, &next.window_height);
+            fprintf(stderr, "[settings] window change failed: %s\n", SDL_GetError());
+        }
+    }
+    SDL_AtomicSet(&audio_gain, next.muted ? 0 : next.volume);
+    *current = next;
+}
+
+static void settings_save_error(SDL_Window *window)
+{
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Settings could not be saved",
+        "The setting is active for this session, but the shared settings file could not be written.", window);
+}
+
+typedef struct diagnostics_window {
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+} diagnostics_window;
+
+static void diagnostics_close(diagnostics_window *view)
+{
+    if (view->texture) SDL_DestroyTexture(view->texture);
+    if (view->renderer) SDL_DestroyRenderer(view->renderer);
+    if (view->window) SDL_DestroyWindow(view->window);
+    memset(view, 0, sizeof *view);
+}
+
+static void diagnostics_toggle(diagnostics_window *view)
+{
+    if (view->window) { diagnostics_close(view); return; }
+    view->window = SDL_CreateWindow("SaturnRecomp Diagnostics", SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED, PANEL_W, PANEL_H, SDL_WINDOW_RESIZABLE);
+    if (view->window) view->renderer = SDL_CreateRenderer(view->window, -1, SDL_RENDERER_SOFTWARE);
+    if (view->renderer) view->texture = SDL_CreateTexture(view->renderer,
+        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, PANEL_W, PANEL_H);
+    if (!view->texture) {
+        fprintf(stderr, "[diagnostics] window unavailable: %s\n", SDL_GetError());
+        diagnostics_close(view);
+    }
+}
+
+static void diagnostics_render(diagnostics_window *view, saturn *s)
+{
+    if (!view->texture) return;
+    debugview_render(s, g_pixels, PANEL_W, PANEL_H);
+    SDL_UpdateTexture(view->texture, NULL, g_pixels, PANEL_W * (int)sizeof(uint32_t));
+    SDL_RenderClear(view->renderer);
+    SDL_RenderCopy(view->renderer, view->texture, NULL, NULL);
+    SDL_RenderPresent(view->renderer);
+}
 
 int main(int argc, char **argv)
 {
@@ -403,10 +494,17 @@ int main(int argc, char **argv)
     SDL_Texture  *tex = NULL;
     SDL_Texture  *frametex = NULL;
     saturn_vk_renderer *vk = NULL;
+    game_overlay *overlay = NULL;
+    diagnostics_window diagnostics = {0};
+    saturn_runtime_settings settings;
+    char settings_path[4096] = {0};
     int use_vk = 0;
     char vk_error[512] = {0};
     int           g_texw = 0, g_texh = 0;
     int running = 1, paused = 0;
+    Uint64 settings_save_at = 0;
+    unsigned settings_save_retries = 0;
+    int release_overlay_input = 0;
     int no_bios = 0;
     int bios_boot = 0;
     uint64_t frame = 0, prof_next = 180, prof_interval = 180, prof_frame_mark = 0;
@@ -435,7 +533,7 @@ int main(int argc, char **argv)
     if (argc < 2) {
         fprintf(stderr,
             "usage: saturnwin <games/<name>/game.toml> [nobios]\n"
-            "  space = pause/resume, f = single frame, F2 = native/120 Hz interpolation, esc = quit\n");
+            "  F1 = settings, F2 = interpolation, space = pause/resume, f = single frame, esc = quit\n");
         return 2;
     }
     /* A field is LINES_TOTAL scanlines of machine time now, so there is no
@@ -563,12 +661,36 @@ int main(int argc, char **argv)
     /* Windows otherwise permits a 15.6 ms scheduler tick, large enough to
      * miss an entire Saturn field when the pacer asks for a 1 ms yield. */
     SDL_SetHint(SDL_HINT_TIMER_RESOLUTION, "1");
+#ifdef _WIN32
+    /* Keep Vulkan's drawable and the overlay in physical pixels while SDL
+     * input/window coordinates follow the monitor's logical DPI scale. */
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
+#endif
     /* GAMECONTROLLER pulls in the joystick subsystem too. A missing or broken
      * controller driver must not stop the emulator from running, so this is a
      * separate, non-fatal init rather than a flag on the one above. */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
+    }
+    {
+        const char *override_path = getenv("SATURN_SETTINGS_FILE");
+        char *base = SDL_GetBasePath();
+        snprintf(settings_path, sizeof settings_path, "%s%s",
+            override_path && *override_path ? override_path : (base ? base : ""),
+            override_path && *override_path ? "" : "settings.ini");
+        if (base) SDL_free(base);
+        saturn_settings_load(&settings, settings_path);
+        /* An explicit diagnostic override, including 0, wins over persisted
+         * preferences without changing the settings file at startup. */
+        if (getenv("SATURN_PRESENT_HZ")) {
+            settings.interpolation = present_hz != 0;
+            if (present_hz) settings.target_hz = (int)present_hz;
+        }
+        present_hz = settings.interpolation ? (unsigned)settings.target_hz : 0;
+        presentation_clock.hz = present_hz;
+        SDL_AtomicSet(&audio_gain, settings.muted ? 0 : settings.volume);
     }
     if (!getenv("SATURN_PAD") || strcmp(getenv("SATURN_PAD"), "0") != 0) {
         if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
@@ -586,8 +708,8 @@ int main(int argc, char **argv)
         use_vk = !headless && (!rd || !*rd || !strcmp(rd, "vulkan"));
     }
     win = SDL_CreateWindow("SaturnRecomp", SDL_WINDOWPOS_CENTERED,
-                           SDL_WINDOWPOS_CENTERED, 960, 720,
-                           SDL_WINDOW_RESIZABLE | (use_vk ? SDL_WINDOW_VULKAN : 0) |
+                           SDL_WINDOWPOS_CENTERED, settings.window_width, settings.window_height,
+                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (use_vk ? SDL_WINDOW_VULKAN : 0) |
                            (getenv("SATURN_VK_HIDDEN") ? SDL_WINDOW_HIDDEN : 0));
     /* The field pacer below already targets the Saturn field clock. A second host-display
      * vsync wait turns a slightly-late field into a full missed refresh and
@@ -623,8 +745,8 @@ int main(int argc, char **argv)
             SDL_DestroyWindow(win);
             use_vk = 0;
             win = SDL_CreateWindow("SaturnRecomp", SDL_WINDOWPOS_CENTERED,
-                                   SDL_WINDOWPOS_CENTERED, 960, 720,
-                                   SDL_WINDOW_RESIZABLE);
+                                   SDL_WINDOWPOS_CENTERED, settings.window_width, settings.window_height,
+                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
             if (!win) { fprintf(stderr, "SDL window fallback failed: %s\n", SDL_GetError()); return 1; }
         }
     }
@@ -643,6 +765,26 @@ int main(int argc, char **argv)
         if (!ren || !tex) {
             fprintf(stderr, "SDL setup failed: %s\n", SDL_GetError());
             return 1;
+        }
+    }
+    /* Keep every F1 control reachable at the smallest output preset. */
+    SDL_SetWindowMinimumSize(win, SATURN_MIN_WINDOW_WIDTH, SATURN_MIN_WINDOW_HEIGHT);
+    if (settings.fullscreen && SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+        fprintf(stderr, "[settings] fullscreen unavailable: %s\n", SDL_GetError());
+        settings.fullscreen = 0;
+    }
+    if (use_vk) {
+        if (!saturn_vk_set_quality(vk, &settings, vk_error, sizeof vk_error)) {
+            fprintf(stderr, "[video] saved rendering options unavailable: %s\n", vk_error);
+            settings.internal_scale = 1;
+            settings.texture_filter = settings.antialiasing = settings.model_smoothing = 0;
+            saturn_vk_set_quality(vk, &settings, vk_error, sizeof vk_error);
+        }
+        overlay = game_overlay_create(win, vk_error, sizeof vk_error);
+        if (!overlay || !saturn_vk_attach_overlay(vk, overlay, vk_error, sizeof vk_error)) {
+            fprintf(stderr, "[video] settings overlay unavailable: %s\n", vk_error);
+            game_overlay_destroy(overlay);
+            overlay = NULL;
         }
     }
 
@@ -681,7 +823,13 @@ int main(int argc, char **argv)
     }
 
     if(present_hz && (!use_vk || !saturn_vk_interpolation_enable(vk))) {
-        fprintf(stderr,"[interp] Vulkan interpolation initialization failed\n");return 2;
+        if (getenv("SATURN_PRESENT_HZ")) {
+            fprintf(stderr,"[interp] Vulkan interpolation initialization failed\n");return 2;
+        }
+        fprintf(stderr,"[interp] saved interpolation unavailable with this renderer\n");
+        present_hz = 0;
+        presentation_clock.hz = 0;
+        settings.interpolation = 0;
     }
     perf_freq = SDL_GetPerformanceFrequency();
     if (!perf_freq) perf_freq = 1;
@@ -715,33 +863,54 @@ int main(int argc, char **argv)
         if(worker_pending){SDL_SemWait(worker.done);worker_pending=0;field_ready=1;}
 
         SDL_Event e;
+        unsigned previous_hz = present_hz;
+        int presentation_was_active = use_vk && saturn_vk_presentation_active(vk);
+        int overlay_captured = game_overlay_is_open(overlay);
+        int overlay_input = overlay_captured;
         int step_one = 0, advanced;   /* fields run this iteration (always 0 or 1) */
         double pace_period = field_secs;
         uint64_t emu_begin = 0, emu_end = 0, render_end = 0;
         uint64_t present_begin = 0, present_end = 0;
 
+        if (overlay_input) game_overlay_input_begin(overlay);
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = 0;
+            if (e.type == SDL_WINDOWEVENT && e.window.windowID == SDL_GetWindowID(win) &&
+                e.window.event == SDL_WINDOWEVENT_CLOSE) running = 0;
+            if (diagnostics.window) {
+                Uint32 id = SDL_GetWindowID(diagnostics.window);
+                if ((e.type == SDL_WINDOWEVENT && e.window.windowID == id &&
+                     e.window.event == SDL_WINDOWEVENT_CLOSE) ||
+                    (e.type == SDL_KEYDOWN && e.key.windowID == id && e.key.keysym.sym == SDLK_ESCAPE)) {
+                    diagnostics_close(&diagnostics);
+                    continue;
+                }
+                if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && e.key.windowID == id) continue;
+            }
             /* Hot-plug: a pad plugged in mid-session should just start
              * working, and unplugging one must not leave a dangling handle. */
             if (e.type == SDL_CONTROLLERDEVICEADDED)   pad_open_first();
             if (e.type == SDL_CONTROLLERDEVICEREMOVED) pad_close(e.cdevice.which);
+            /* A closed settings panel does no layout, input-context work or
+             * drawable-size queries. Start its input frame only on F1. */
+            if (overlay && !overlay_input && e.type == SDL_KEYDOWN &&
+                !e.key.repeat && e.key.keysym.sym == SDLK_F1) {
+                game_overlay_input_begin(overlay);
+                overlay_input = 1;
+            }
+            if (overlay_input && game_overlay_event(overlay, &e)) { overlay_captured = 1; continue; }
             if (e.type == SDL_KEYDOWN) {
                 switch (e.key.keysym.sym) {
                 case SDLK_ESCAPE: running = 0; break;
                 case SDLK_F2:
                     if(!e.key.repeat && use_vk) {
-                        if(present_hz){present_hz=0;saturn_vk_interpolation_disable(vk);}
-                        else if(saturn_vk_interpolation_enable(vk))present_hz=120;
-                        else fprintf(stderr,"[interp] could not enable interpolation\n");
-                        presentation_clock.hz=present_hz;presentation_clock.credit=0;
-                        presentation_deadline=0;field_deadline=0;interpolation_last=0;
-                        interpolation_samples=0;presentation_mark=0;presentation_mark_count=presentation_total;
-#ifdef _WIN32
-                        const char *settings_path=getenv("SATURN_SETTINGS_FILE");
-                        if(settings_path)WritePrivateProfileStringA("Video","Interpolation",present_hz?"120":"0",settings_path);
-#endif
-                        fprintf(stderr,"[video] global interpolation %s (F2)\n",present_hz?"120 Hz":"off");
+                        saturn_runtime_settings next = settings;
+                        next.interpolation = !next.interpolation;
+                        settings_apply(win, vk, &settings, next, GAME_OVERLAY_INTERPOLATION);
+                        settings_save_at = SDL_GetTicks64() + 250;
+                        settings_save_retries = 0;
+                        fprintf(stderr,"[video] interpolation %s, target %d Hz (F2)\n",
+                                settings.interpolation ? "on" : "off", settings.target_hz);
                     }
                     break;
                 case SDLK_F3:
@@ -763,15 +932,91 @@ int main(int argc, char **argv)
                 case SDLK_SPACE:  paused = !paused; break;
                 case SDLK_f:      step_one = 1; break;
                 case SDLK_F1:
-                    if (!use_vk) g_debug = !g_debug;
-                    else fprintf(stderr, "[video] F1 debug panel uses SATURN_RENDERER=software\n");
+                    if (!e.key.repeat) {
+                        if (!use_vk) g_debug = !g_debug;
+                        else if (!overlay) diagnostics_toggle(&diagnostics);
+                    }
                     break;
                 default: break;
                 }
             }
         }
-
+        if (overlay_input) game_overlay_input_end(overlay);
+        if (overlay_input) {
+            static const game_overlay_resolution resolutions[] = {
+                {640,480}, {960,720}, {1280,720}, {1280,960}, {1600,900},
+                {1920,1080}, {1920,1440}, {2560,1440}, {3840,2160}
+            };
+            int dw = 0, dh = 0, ww = 0, wh = 0;
+            SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+            SDL_GetWindowSize(win, &ww, &wh);
+            float dpi = ww > 0 ? (float)dw / ww : 1.0f;
+            game_overlay_view view = {0};
+            view.settings = settings;
+            view.capabilities = GAME_OVERLAY_ALL_SETTINGS;
+            view.resolutions = resolutions;
+            view.resolution_count = sizeof resolutions / sizeof *resolutions;
+            view.native_width = g_texw > 0 ? g_texw : 320;
+            view.native_height = g_texh > 0 ? g_texh : 224;
+            view.internal_width = view.native_width * settings.internal_scale;
+            view.internal_height = view.native_height * settings.internal_scale;
+            view.game_fps = (float)cur_fps;
+            view.present_fps = (float)(present_hz ? presentation_fps : cur_fps);
+            view.game_title = g.name;
+            view.renderer_name = saturn_vk_device_name(vk);
+            saturn_vk_interpolation_stats(vk, &view.interpolation_matches, &view.interpolation_span);
+            game_overlay_actions actions = {0};
+            const game_overlay_draw_data *draw = game_overlay_build(overlay, &view, &actions, dw, dh, dpi);
+            if (actions.changed) {
+                settings_apply(win, vk, &settings, actions.settings, actions.changed);
+                settings_save_at = SDL_GetTicks64() + 250;
+                settings_save_retries = 0;
+            }
+            if (actions.resume) game_overlay_set_open(overlay, 0);
+            saturn_vk_overlay_draw(vk, game_overlay_is_open(overlay) ? draw : NULL);
+            if (actions.diagnostics) diagnostics_toggle(&diagnostics);
+            if (actions.quit) running = 0;
+        } else if (use_vk) saturn_vk_overlay_draw(vk, NULL);
+        /* Apply controls immediately, but coalesce a slider/key-repeat burst
+         * into one atomic disk write. Closing the panel flushes immediately. */
+        if (settings_save_at &&
+            (SDL_GetTicks64() >= settings_save_at ||
+             (!settings_save_retries && (!running || !game_overlay_is_open(overlay))))) {
+            if (saturn_settings_save(&settings, settings_path)) {
+                settings_save_at = 0;
+                settings_save_retries = 0;
+            } else if (++settings_save_retries < 10) {
+                /* A Windows reader may briefly deny atomic replacement.
+                 * Keep processing input and rendering between attempts. */
+                settings_save_at = SDL_GetTicks64() + 50;
+            } else {
+                settings_save_at = 0;
+                settings_save_error(win);
+            }
+        }
+        present_hz = use_vk && settings.interpolation ? (unsigned)settings.target_hz : 0;
+        int presentation_active = use_vk && saturn_vk_presentation_active(vk);
+        int presentation_changed = previous_hz != present_hz || presentation_was_active != presentation_active;
+        if (presentation_changed) {
+            presentation_clock.hz = present_hz;
+            presentation_clock.credit = 0;
+            presentation_deadline = field_deadline = interpolation_last = 0;
+            interpolation_samples = 0;
+            presentation_mark = 0;
+            presentation_mark_count = presentation_total;
+        }
+        if (overlay_captured || game_overlay_is_open(overlay)) release_overlay_input = 1;
         poll_pad(s);
+        if (release_overlay_input || (diagnostics.window && SDL_GetKeyboardFocus() == diagnostics.window)) {
+            /* A held Enter/face button used to resume the menu must not turn
+             * into Start/an attack until the player releases it. */
+            if (!overlay_captured && !game_overlay_is_open(overlay) &&
+                !s->pad1_lo && !s->pad1_hi && !s->pad1_l && !s->pad1_r &&
+                abs((int)s->pad1_x - 128) < 32 && abs((int)s->pad1_y - 128) < 32)
+                release_overlay_input = 0;
+            s->pad1_lo = s->pad1_hi = s->pad1_l = s->pad1_r = 0;
+            s->pad1_x = s->pad1_y = 128;
+        }
 
         advanced = 0;
         if (paused && !step_one) {
@@ -805,14 +1050,14 @@ int main(int argc, char **argv)
             advanced = 1;
         }
 
-        if (use_vk && (advanced || !have_frame)) {
+        if (use_vk && (advanced || !have_frame || !presentation_active || presentation_changed)) {
             int dw, dh;
             vdp2_display_size(s, &dw, &dh);
             if (dw < 1) dw = 320; if (dh < 1) dh = 224;
             if (dw > 704) dw = 704; if (dh > 512) dh = 512;
             {
                 uint64_t tv = profile ? __rdtsc() : 0;
-                if (!(present_hz ? saturn_vk_interpolation_begin(vk,s,dw,dh,vk_error,sizeof vk_error) : saturn_vk_render(vk, s, dw, dh, vk_error, sizeof vk_error))) {
+                if (!(presentation_active ? saturn_vk_interpolation_begin(vk,s,dw,dh,vk_error,sizeof vk_error) : saturn_vk_render(vk, s, dw, dh, vk_error, sizeof vk_error))) {
                     fprintf(stderr, "[video] Vulkan frame failed: %s\n", vk_error);
                     running = 0;
                 }
@@ -823,22 +1068,34 @@ int main(int argc, char **argv)
              * including VDP1's live command stream rather than CPU shadows. */
             {
                 static int capture_done;
+                static uint64_t last_capture_frame;
                 const char *capture_path = getenv("SATURN_VK_CAPTURE");
                 const char *capture_field = getenv("SATURN_VK_CAPTURE_FRAME");
-                if (!capture_done && capture_path && capture_field &&
-                    s->frames >= strtoull(capture_field, NULL, 0)) {
-                    capture_done = 1;
+                const char *capture_every = getenv("SATURN_VK_CAPTURE_EVERY");
+                uint64_t every = capture_every ? strtoull(capture_every, NULL, 0) : 0;
+                uint64_t first = capture_field ? strtoull(capture_field, NULL, 0) : 1;
+                if (capture_path && (capture_field || every) && s->frames >= first &&
+                    s->frames != last_capture_frame &&
+                    (every ? (s->frames - first) % every == 0 : !capture_done)) {
+                    char numbered_path[1024];
+                    const char *path = capture_path;
+                    if (every) {
+                        snprintf(numbered_path, sizeof numbered_path, "%s-%06llu.png",
+                                 capture_path, (unsigned long long)s->frames);
+                        path = numbered_path;
+                    } else capture_done = 1;
+                    last_capture_frame = s->frames;
                     if (saturn_vk_readback(vk, g_frame, dw, dh, vk_error, sizeof vk_error) &&
-                        png_write(capture_path, g_frame, dw, dh) == 0)
+                        png_write(path, g_frame, dw, dh) == 0)
                         fprintf(stderr, "[video] captured Vulkan field %llu to %s\n",
-                                (unsigned long long)s->frames, capture_path);
+                                (unsigned long long)s->frames, path);
                     else fprintf(stderr, "[video] capture failed: %s\n", vk_error);
                 }
             }
-        } else if (g_debug) {
+        } else if (!use_vk && g_debug) {
             debugview_render(s, g_pixels, PANEL_W, PANEL_H);
             SDL_UpdateTexture(tex, NULL, g_pixels, PANEL_W * (int)sizeof(uint32_t));
-        } else if (advanced || !have_frame) {
+        } else if (!use_vk && (advanced || !have_frame)) {
             /* Compositing is the most expensive thing this loop does, so only
              * do it when a field actually advanced. */
             int dw, dh;
@@ -863,9 +1120,12 @@ int main(int argc, char **argv)
             SDL_UpdateTexture(frametex, NULL, g_frame, dw * (int)sizeof(uint32_t));
             have_frame = 1;
         }
-        if(present_hz && advanced) {
+        /* Diagnostics consumes the completed field before the worker starts
+         * modifying guest state for the next one. */
+        diagnostics_render(&diagnostics, s);
+        if(present_hz && (advanced || presentation_changed)) {
             picture_snapshot(&g_picture,s);
-            if(running && !paused && (!max_frames || frame<max_frames)) {
+            if(advanced && running && !paused && (!max_frames || frame<max_frames)) {
                 SDL_SemPost(worker.start);worker_pending=1;
             }
         }
@@ -935,6 +1195,15 @@ int main(int argc, char **argv)
                     }
                 }
             } else if (use_vk) {
+                /* Quality features are independent of interpolation. Replay
+                 * the current picture at its endpoint, including while the
+                 * game is paused so the F1 UI remains responsive. */
+                if (presentation_active &&
+                    !saturn_vk_interpolation_render(vk, present_hz ? &g_picture : s,
+                        1.0f, g_texw, g_texh, vk_error, sizeof vk_error)) {
+                    fprintf(stderr, "[video] enhanced frame failed: %s\n", vk_error);
+                    running = 0;
+                }
                 if (!saturn_vk_present(vk, vk_error, sizeof vk_error)) {
                     fprintf(stderr, "[video] Vulkan present failed: %s\n", vk_error);
                     running = 0;
@@ -1023,7 +1292,7 @@ int main(int argc, char **argv)
                 snprintf(title+used,sizeof(title)-used," | interp %.1f/%u Hz [F2]",presentation_fps,present_hz);
             }
             if(use_vk && !present_hz) {
-                size_t used=strlen(title);snprintf(title+used,sizeof title-used," | F2: 120 Hz interpolation");
+                size_t used=strlen(title);snprintf(title+used,sizeof title-used," | F1: Settings | F2: %d Hz interpolation",settings.target_hz);
             }
             SDL_SetWindowTitle(win, title);
         }
@@ -1039,6 +1308,15 @@ int main(int argc, char **argv)
         worker.quit=1;SDL_SemPost(worker.start);SDL_WaitThread(worker.thread,NULL);
         SDL_DestroySemaphore(worker.start);SDL_DestroySemaphore(worker.done);
     }
+    if (settings_save_at) {
+        int saved = 0;
+        /* Rendering has stopped, so a bounded final retry cannot hitch play. */
+        for (unsigned attempt = 0; attempt < 10 && !saved; ++attempt) {
+            saved = saturn_settings_save(&settings, settings_path);
+            if (!saved) SDL_Delay(50);
+        }
+        if (!saved) settings_save_error(win);
+    }
     if(present_hz)fprintf(stderr,"[interp] total fields %llu presentations %llu\n",(unsigned long long)frame,(unsigned long long)presentation_total);
     printf("\nstopped at PC=0x%08X after %llu instructions%s%s\n",
            s->master.pc, (unsigned long long)s->master.cycles,
@@ -1046,7 +1324,10 @@ int main(int argc, char **argv)
            s->master.halted ? s->master.fault : "");
     saturn_report_trace(s, stdout);
 
+    if (audio_dev) SDL_CloseAudioDevice(audio_dev);
+    diagnostics_close(&diagnostics);
     saturn_vk_destroy(vk);
+    game_overlay_destroy(overlay);
     if (frametex) SDL_DestroyTexture(frametex);
     if (tex) SDL_DestroyTexture(tex);
     if (ren) SDL_DestroyRenderer(ren);

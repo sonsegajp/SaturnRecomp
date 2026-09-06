@@ -9,9 +9,37 @@ static int failures;
 static void check(const char *name, int got, int expected) {
     if (got != expected) { printf("FAIL %s: %d != %d\n", name, got, expected); failures++; }
 }
-/* This isolated mixer test keeps interrupts disabled. */
-void m68k_set_irq(m68k *m, int level, int vector) { (void)m; (void)level; (void)vector; }
+/* Observe the line presented to the sound CPU without running instructions. */
+void m68k_set_irq(m68k *m, int level, int vector) { m->irq_level=level; m->irq_vector=vector; }
 static void reset(void) { memset(&s, 0, sizeof s); scsp_reset(&s); }
+static void interrupt_levels(void) {
+    /* Pending/enabled sources stay independent; only their level selection
+     * shares SCILV bit 7 for the four highest sources. */
+    for(unsigned source=0;source<11;source++) for(unsigned level=1;level<8;level++) {
+        reset();
+        unsigned bit=source<7?source:7;
+        scsp_write(&s,0x424,(level&1u)?1u<<bit:0);
+        scsp_write(&s,0x426,(level&2u)?1u<<bit:0);
+        scsp_write(&s,0x428,(level&4u)?1u<<bit:0);
+        s.scsp_reg[0x420/2]=(uint16_t)(1u<<source);
+        scsp_write(&s,0x41E,(uint16_t)(1u<<source));
+        check("interrupt source level",s.sound_cpu.irq_level,level);
+        scsp_write(&s,0x41E,0);
+        check("disabled pending source releases IRQ",s.sound_cpu.irq_level,0);
+    }
+    /* Fighting Vipers enables timer C and assigns its shared bit level 1.
+     * Exercise the actual timer -> pending -> CPU line -> acknowledge path. */
+    reset();
+    scsp_write(&s,0x424,0x0088);scsp_write(&s,0x426,0x0048);
+    scsp_write(&s,0x428,0);scsp_write(&s,0x41E,0x0100);
+    scsp_write(&s,0x41C,0x00FE);
+    {int16_t l,r;scsp_render(&s,&l,&r);scsp_render(&s,&l,&r);}
+    check("timer C raises independent pending bit",s.scsp_reg[0x420/2]&0x100,0x100);
+    check("timer C uses timer B level bit",s.sound_cpu.irq_level,1);
+    scsp_write(&s,0x422,0x0100);
+    check("timer C acknowledge releases IRQ",s.sound_cpu.irq_level,0);
+    check("timer C acknowledge keeps sample pending",s.scsp_reg[0x420/2]&0x400,0x400);
+}
 static int sample(unsigned control, unsigned level, unsigned envelope) {
     int16_t l, r;
     reset();
@@ -24,7 +52,28 @@ static int sample(unsigned control, unsigned level, unsigned envelope) {
     scsp_render(&s, &l, &r);
     return l;
 }
+static void dac_sample(unsigned control, int left, int right,
+                       int expected_left, int expected_right) {
+    int16_t l, r;
+    reset();
+    scsp_write(&s, 0x400, control);
+    scsp_write(&s, 0x216, (7u << 5) | 0x1Fu); /* EXTS0 -> left */
+    scsp_write(&s, 0x236, (7u << 5) | 0x0Fu); /* EXTS1 -> right */
+    s.dsp.exts[0] = left;
+    s.dsp.exts[1] = right;
+    scsp_render(&s, &l, &r);
+    check("DAC output left", l, expected_left);
+    check("DAC output right", r, expected_right);
+}
 int main(void) {
+    interrupt_levels();
+    /* Ymir's DAC18B callback expands the saturated mix before narrowing to
+     * signed 16-bit host audio. Cover both signs, wrap, and master mute. */
+    dac_sample(0x00F, 1000, -1000, 1000, -1000);
+    dac_sample(0x10F, 1000, -1000, 4000, -4000);
+    dac_sample(0x10F, 10000, -10000, -25536, 25536);
+    dac_sample(0x10F, 32767, -32768, -4, 0);
+    dac_sample(0x100, 1000, -1000, 0, 0);
     reset();
     scsp_write(&s, 0xC00, 0xAB);
     scsp_write(&s, 0xC02, 0x8123);

@@ -13,6 +13,7 @@
  */
 #include <stdlib.h>
 #include "saturn.h"
+#include "sh2_cache.h"
 #include "../../external/sh2-recomp-core/common/sh2_isa.h"
 #include <string.h>
 
@@ -25,6 +26,35 @@
 static int slave_low_reset_reported;
 static int slave_reset_trace = -1;
 static int slave_bios_trace = -1;
+
+/* Debuggers can inspect B-bus memory while an instruction is executing.
+ * Those host reads must not consume guest CPU clocks. Keep real instruction
+ * fetches, data accesses and exception entry on the ordinary bus helpers. */
+static uint16_t diagnostic_read16(saturn *s, uint32_t address)
+{
+    uint8_t active = s->cpu_bus_active;
+    s->cpu_bus_active = 0;
+    uint16_t value = bus_r16(s, address);
+    s->cpu_bus_active = active;
+    return value;
+}
+
+static uint32_t diagnostic_read32(saturn *s, uint32_t address)
+{
+    uint8_t active = s->cpu_bus_active;
+    s->cpu_bus_active = 0;
+    uint32_t value = bus_r32(s, address);
+    s->cpu_bus_active = active;
+    return value;
+}
+
+static void diagnostic_dump(saturn *s)
+{
+    uint8_t active = s->cpu_bus_active;
+    s->cpu_bus_active = 0;
+    mem_dump_at(s, 1);
+    s->cpu_bus_active = active;
+}
 
 static void fault(sh2 *c, const char *why)
 {
@@ -52,7 +82,7 @@ static void fault(sh2 *c, const char *why)
                         c->pc, c->pr, c->sr, (unsigned long long)c->cycles, why);
                 for (k = n; k > 0; k--) {
                     uint32_t a = fs->mring[(fs->mring_head - k) & 255u];
-                    fprintf(stderr, "    master %08X  %04X\n", a, bus_r16(fs, a));
+                    fprintf(stderr, "    master %08X  %04X\n", a, diagnostic_read16(fs, a));
                 }
             }
             c->pc = c->pr; return;
@@ -127,7 +157,7 @@ static int sh2_illegal(sh2 *c, uint32_t pc, uint8_t vector)
 
     if (getenv("SATURN_ILLLOG") && ++taken <= 8)
         fprintf(stderr, "[ill] vec=%u pc=%08X op=%04X -> handler %08X (#%llu)%s\n",
-                vector, pc, bus_r16(s, pc), target,
+                vector, pc, diagnostic_read16(s, pc), target,
                 (unsigned long long)taken, c->is_slave ? " [slave]" : "");
 
     R[15] -= 4; bus_w32(s, R[15], c->sr);
@@ -232,14 +262,6 @@ static unsigned cache_lru_way(uint8_t lru, int two_way)
     return 3u;
 }
 
-static void cache_lru_touch(sh2 *c, unsigned set, unsigned way)
-{
-    static const uint8_t and_mask[4] = { 0x07u, 0x19u, 0x2Au, 0x34u };
-    static const uint8_t or_mask [4] = { 0x00u, 0x20u, 0x14u, 0x0Bu };
-    c->cache_lru[set] = (uint8_t)((c->cache_lru[set] & and_mask[way]) |
-                                  or_mask[way]);
-}
-
 static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
 {
     uint32_t tag = (pc >> 10) & 0x7FFFFu;
@@ -257,10 +279,9 @@ static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
         way = c->if_cache_way;
         if (way < 4u && c->cache_valid[set][way] &&
             c->cache_tag[set][way] == tag) {
-            /* Re-touching the same way is idempotent, and no ordinary memory
-             * access mutates the SH-2 cache LRU state. Guest writes through
-             * the cache address array invalidate if_cache_base in bus.c, so
-             * this shortcut still observes explicit LRU/tag changes. */
+            /* Re-touching the same way is idempotent. Cached write hits and
+             * address-array writes invalidate this shortcut when they change
+             * LRU state, so a same-line fetch still observes those changes. */
             line = &c->cache_data[(way << 10) | (set << 4)];
             return (uint16_t)((line[pc & 0xEu] << 8) |
                               line[(pc & 0xEu) + 1u]);
@@ -294,7 +315,7 @@ static uint16_t cache_ifetch(saturn *s, sh2 *c, uint32_t pc)
 hit:
     c->if_cache_base = base;
     c->if_cache_way = (uint8_t)way;
-    cache_lru_touch(c, set, way);
+    sh2_cache_touch(c, set, way);
     line = &c->cache_data[(way << 10) | (set << 4)];
     return (uint16_t)((line[pc & 0xEu] << 8) | line[(pc & 0xEu) + 1u]);
 }
@@ -462,18 +483,23 @@ static inline uint32_t fast_r32(sh2 *c, uint32_t a)
 static inline void fast_w8(sh2 *c, uint32_t a, uint8_t v)
 {
     uint8_t *p = fast_write_ptr(c, a, 1u);
-    if (p) p[0] = v; else bus_w8(c->sys, a, v);
+    if (p) { sh2_cache_write(c, a, v, 1u); p[0] = v; }
+    else bus_w8(c->sys, a, v);
 }
 static inline void fast_w16(sh2 *c, uint32_t a, uint16_t v)
 {
     uint8_t *p = fast_write_ptr(c, a & ~1u, 2u);
-    if (p) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+    if (p) {
+        sh2_cache_write(c, a & ~1u, v, 2u);
+        p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v;
+    }
     else bus_w16(c->sys, a, v);
 }
 static inline void fast_w32(sh2 *c, uint32_t a, uint32_t v)
 {
     uint8_t *p = fast_write_ptr(c, a & ~3u, 4u);
     if (p) {
+        sh2_cache_write(c, a & ~3u, v, 4u);
         p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
         p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
     } else bus_w32(c->sys, a, v);
@@ -567,7 +593,7 @@ static uint32_t branch_target(sh2 *c, const sh2_insn *i, uint32_t insn_pc)
                 printf("[jsr] pc=%08X -> %08X gbr=%08X r0=%08X r3=%08X "
                        "r8=%08X [r3-4]=%08X cy=%llu %s\n", insn_pc, R[i->n],
                        c->gbr, R[0], R[3], R[8],
-                       bus_r32(c->sys, R[3] - 4u),
+                       diagnostic_read32(c->sys, R[3] - 4u),
                        /* s->clk, NOT c->cycles: the two cores' own counters are
                         * reset independently (sh2_reset memsets the core, and
                         * the slave is re-reset on every SSHON), so they cannot
@@ -587,7 +613,7 @@ static uint32_t branch_target(sh2 *c, const sh2_insn *i, uint32_t insn_pc)
                     uint32_t n = head < 24u ? head : 24u, k;
                     for (k = n; k > 0; k--) {
                         uint32_t a = ring[(head - k) & 255u];
-                        printf("      via %08X  %04X\n", a, bus_r16(s, a));
+                        printf("      via %08X  %04X\n", a, diagnostic_read16(s, a));
                     }
                 }
             }
@@ -672,7 +698,7 @@ static int take_interrupt(sh2 *c)
             if (++seen[v] <= 3 || (seen[v] % 200000ull) == 0)
                 fprintf(stderr, "[irq] vec=%02X lvl=%d scubit=%d -> %08X "
                         "(hit %llu) from pc=%08X\n",
-                        v, level, bit, c->pc, seen[v], bus_r32(s, R[15] + 4));
+                        v, level, bit, c->pc, seen[v], diagnostic_read32(s, R[15] + 4));
         }
     }
     c->sleeping = 0;
@@ -688,7 +714,7 @@ static int take_interrupt(sh2 *c)
         s->irqall_mach = c->mach; s->irqall_macl = c->macl;
         s->irqall_gbr  = c->gbr;
         s->irqall_valid = 1;
-        s->irqall_pc = bus_r32(s, c->vbr + (uint32_t)vector * 4u);
+        s->irqall_pc = c->pc;
     }
     if (!s->irqsave_valid) {
         for (int k = 0; k < 7; k++) s->irqsave[k] = R[8 + k];
@@ -753,7 +779,7 @@ static void cov_mark(saturn *s, sh2 *c, uint32_t pc)
     }
 }
 
-int sh2_step(sh2 *c)
+static int sh2_step_impl(sh2 *c)
 {
     saturn  *s = c->sys;
     sh2_insn i, slot;
@@ -848,9 +874,9 @@ int sh2_step(sh2 *c)
                     c->pr, c->sr, c->vbr, R[15], (unsigned long long)c->cycles);
             for (uint32_t k = n; k > 0; k--) {
                 uint32_t a = s->sring[(s->sring_head - k) & 255u];
-                fprintf(stderr, "    before-reset %08X  %04X\n", a, bus_r16(s, a));
+                fprintf(stderr, "    before-reset %08X  %04X\n", a, diagnostic_read16(s, a));
             }
-            mem_dump_at(s, 1);
+            diagnostic_dump(s);
         }
     }
     /* A JSR/JMP to address 0 is never intentional on the Saturn: the reset
@@ -890,18 +916,6 @@ int sh2_step(sh2 *c)
     }
     if (cov_armed > 0) cov_mark(s, c, pc);
     if (!dbg.init) { dbg_init(); tracewin_init(); }
-    if (tw.on && (c->is_slave ? tw.slave : !tw.slave) &&
-        c->cycles >= tw.a && c->cycles <= tw.b &&
-        (!tw.pchi || (c->pc >= tw.pclo && c->pc <= tw.pchi))) {
-        char txt[64];
-        uint16_t twop = ifetch(s, c, c->pc);
-        if (!sh2_format(twop, c->pc, txt)) txt[0] = 0;
-        printf("TW %llu %08X %-26s %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X mac=%08X:%08X\n",
-               (unsigned long long)c->cycles, c->pc, txt,
-               R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7],
-               R[8], R[9], R[10], R[11], R[12], R[13], R[14], R[15],
-               c->mach, c->macl);
-    }
     if ((dbg.pclog_pc | dbg.badr0_pc | s->pclast_pc | s->regat_pc) != 0) {
         if (dbg.pclog_pc && !c->is_slave) {
             uint32_t w = dbg.pclog_pc;
@@ -919,7 +933,7 @@ int sh2_step(sh2 *c)
              * executed. SATURN_DUMPAT_N selects which hit to capture. */
             if (++s->dumpat_done >= s->dumpat_n) {
                 s->dumpat_done = -1;      /* fire once */
-                mem_dump_at(s, 1);
+                diagnostic_dump(s);
             }
         }
         if (s->pclast_pc && pc == s->pclast_pc) {
@@ -1064,7 +1078,7 @@ int sh2_step(sh2 *c)
                  * only zeros. */
                 if (s->snap_addr) {
                     for (int q = 0; q < 128; q++)
-                        s->snap[q] = bus_r16(s, s->snap_addr + q * 2u);
+                        s->snap[q] = diagnostic_read16(s, s->snap_addr + q * 2u);
                     s->snap_taken = 1;
                 }
             }
@@ -1084,6 +1098,19 @@ int sh2_step(sh2 *c)
     }
 
     op = ifetch(s, c, pc);
+    if (tw.on && (c->is_slave ? tw.slave : !tw.slave) &&
+        c->cycles >= tw.a && c->cycles <= tw.b &&
+        (!tw.pchi || (pc >= tw.pclo && pc <= tw.pchi))) {
+        /* Format the opcode fetched for execution; another diagnostic fetch
+         * would charge twice or warm the emulated cache before the real one. */
+        char txt[64];
+        if (!sh2_format(op, pc, txt)) txt[0] = 0;
+        printf("TW %llu %08X %-26s %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X mac=%08X:%08X\n",
+               (unsigned long long)c->cycles, pc, txt,
+               R[0], R[1], R[2], R[3], R[4], R[5], R[6], R[7],
+               R[8], R[9], R[10], R[11], R[12], R[13], R[14], R[15],
+               c->mach, c->macl);
+    }
     if (!decode_cached(op, pc, &i)) {
         /* An undefined opcode is an EXCEPTION on real hardware, not the end of
          * the machine: Ymir sh2.cpp does `EnterException(xvGenIllegalInstr)`.
@@ -1231,6 +1258,16 @@ int sh2_step(sh2 *c)
         c->cycles += 2;
         return 2;
     }
+}
+
+int sh2_step(sh2 *c)
+{
+    saturn *s=c->sys;
+    if(s->cpu_bus_active)return sh2_step_impl(c);
+    s->cpu_bus_active=1;
+    int result=sh2_step_impl(c);
+    s->cpu_bus_active=0;
+    return result;
 }
 
 static int exec_one(sh2 *c, const sh2_insn *i)
@@ -1801,6 +1838,8 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
     if (!cov_armed) cov_init_env();
     fast_movwtrace_on=movwtrace_on;
     s->cur = c;
+    uint8_t previous_bus_active=s->cpu_bus_active;
+    s->cpu_bus_active=1;
 
     /* Scheduler slices are SH-2 CLOCK budgets, not instruction budgets.
      * Carry the absolute target between calls so an instruction which crosses
@@ -1881,9 +1920,9 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                         c->pr, c->sr, c->vbr, R[15], (unsigned long long)c->cycles);
                 for (uint32_t k = count; k > 0; k--) {
                     uint32_t a = s->sring[(s->sring_head - k) & 255u];
-                    fprintf(stderr, "    before-reset %08X  %04X\n", a, bus_r16(s, a));
+                    fprintf(stderr, "    before-reset %08X  %04X\n", a, diagnostic_read16(s, a));
                 }
-                mem_dump_at(s, 1);
+                diagnostic_dump(s);
             }
         }
         if (c->is_slave && c->pc < BIOS_SIZE && slave_bios_trace) {
@@ -1895,7 +1934,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                         c->pc, c->pr, c->sr, R[0], R[1], R[2], R[4], R[5], R[6], R[7]);
                 for (uint32_t k = count; k > 0; k--) {
                     uint32_t a = s->sring[(s->sring_head - k) & 255u];
-                    fprintf(stderr, "    before %08X  %04X\n", a, bus_r16(s, a));
+                    fprintf(stderr, "    before %08X  %04X\n", a, diagnostic_read16(s, a));
                 }
             }
         }
@@ -1908,7 +1947,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
         if (s->dumpat_pc && c->pc == s->dumpat_pc && s->dumpat_done >= 0) {
             if (++s->dumpat_done >= s->dumpat_n) {
                 s->dumpat_done = -1;
-                mem_dump_at(s, 1);
+                diagnostic_dump(s);
             }
         }
         /* Invalid slave PCs must enter sh2_step so its address-error guard can
@@ -2089,7 +2128,7 @@ uint64_t sh2_run(sh2 *c, uint64_t n)
                                 R[4], R[5], R[6], R[7]);
                         for (int q = -96; q <= 96; q += 2) {
                             uint32_t a = pc + (uint32_t)q;
-                            fprintf(stderr, "    live %08X  %04X\n", a, bus_r16(s, a));
+                            fprintf(stderr, "    live %08X  %04X\n", a, diagnostic_read16(s, a));
                         }
                         }
                     }
@@ -2172,6 +2211,7 @@ slow:   {
             done += (uint64_t)k;
         }
     }
+    s->cpu_bus_active=previous_bus_active;
     return done;
 }
 

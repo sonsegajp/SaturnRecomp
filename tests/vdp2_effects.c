@@ -38,6 +38,20 @@ int main(void){
     ck("per-line coefficient unity",frame[1],0xFF00FF00);
     ck("per-line coefficient double",frame[321],0xFFFF0000);
     ck("coefficient transparency",frame[641],0xFF0000FF);
+    /* Rotation parameters advance at native dot/field-line rates. The
+     * 704x448 output expands these samples; normal backgrounds use their own
+     * counters. This keeps a rotation floor aligned with interlaced sprites. */
+    reg(0,0x81C3);vdp2_render(&s,frame,704,448,1);
+    ck("hires rotation repeats first dot",frame[1],0xFFFF0000);
+    ck("hires rotation next native dot",frame[2],0xFF00FF00);
+    ck("hires rotation repeats next dot",frame[3],0xFF00FF00);
+    ck("interlace rotation repeats line",frame[704+2],0xFF00FF00);
+    ck("interlace coefficient next native line",frame[2*704+2],0xFFFF0000);
+    ck("interlace coefficient repeats next line",frame[3*704+2],0xFFFF0000);
+    ck("interlace coefficient transparent line",frame[4*704+2],0xFF0000FF);
+    reg(0,0x8080);render();
+    ck("single density retains native rotation line",frame[321],0xFFFF0000);
+    reg(0,0x8000);render();
     reg(0xEC,0x10);reg(0xEE,0x300);reg(0x10C,15);
     render();
     ck("grass palette MSB clear remains opaque",frame[0],0xFFFF0000);
@@ -55,5 +69,16 @@ int main(void){
     ck("long coefficient unity",frame[1],0xFF00FF00);
     ck("long coefficient double",frame[321],0xFFFF0000);
     ck("long coefficient transparency",frame[641],0xFF0000FF);
+    /* Per-dot coefficient addresses must repeat with their expanded dot,
+     * including the transparency bit, rather than fetching twice as fast. */
+    reg(0,0x81C3);reg(0x0E,0x10);reg(0xB4,3);reg(0xB6,2);
+    longword(0x60058,0);longword(0x6005C,0x10000);
+    word(0x40000,0x400);word(0x40002,0x800);word(0x40004,0x8000);
+    vdp2_render(&s,frame,704,448,1);
+    ck("per-dot coefficient first pair",frame[1],0xFFFF0000);
+    ck("per-dot coefficient second native dot",frame[2],0xFFFF0000);
+    ck("per-dot coefficient second pair",frame[3],0xFFFF0000);
+    ck("per-dot coefficient transparent pair first",frame[4],0xFF0000FF);
+    ck("per-dot coefficient transparent pair second",frame[5],0xFF0000FF);
     printf("VDP2 effects: %d failure(s)\n",fails);return fails!=0;
 }

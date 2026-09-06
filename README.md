@@ -154,7 +154,8 @@ optimizations apply to every game. Frame pacing and audio-device buffering apply
 to all games in the windowed frontend. Guest timing is preserved; this does not
 force games that render at 30 FPS to generate 60 distinct pictures.
 
-For a runtime-only build, run `tools/build_runtime.ps1`. Optional SH-2 PGO:
+For a runtime-only build, run `tools/build_runtime.ps1`. Optional CPU/audio PGO
+profiles the SH-2 interpreter, 68000, SCSP mixer and sound DSP:
 
 ```powershell
 ./tools/build_runtime.ps1 -Profile generate
@@ -163,12 +164,13 @@ For a runtime-only build, run `tools/build_runtime.ps1`. Optional SH-2 PGO:
 ```
 
 Keep the object and profile directories unchanged between generation and use.
-Regenerate profiles after CPU source changes; missing profiles fail the build.
+Train several representative gameplay paths before the use build. Regenerate
+profiles after CPU/audio source changes; missing profiles fail the build.
 PGO influences host code layout, not game-specific emulation behavior. The normal
 build requires no profile. To use collected profiles through `build.ps1`, set
 `SATURN_PGO_MODE=use`, `SATURN_PGO_DIR`, and `SATURN_RUNTIME_OBJECT_DIR` to the
 corresponding profile and object directories. Both frontends consume the same
-profiled CPU object. Measurements on one game do not establish 60 FPS in all games.
+profiled core objects. Measurements on one game do not establish 60 FPS in all games.
 
 ### FM/LFO and high refresh presentation
 
@@ -177,24 +179,30 @@ STWINH, signed displacement and CPU SOUS access. Pitch and amplitude LFOs use
 all four waveforms, all 32 rates, sensitivity levels, deterministic noise and
 LFORE reset. These features are shared by both runners and all titles.
 
-**F2** toggles native presentation / 120 Hz interpolation live in every game
-using the Vulkan frontend. It preserves game state and clears stale interpolation
-history when re-enabled. To choose the initial global presentation setting:
+**F1** opens the shared native settings panel: display resolution/fullscreen,
+internal resolution, texture filtering, anti-aliasing, model-edge supersampling,
+volume/mute, and frame interpolation with a 60–240 Hz target. Settings persist
+across games. **F2** toggles interpolation at the selected rate during play,
+preserving game state and clearing stale history when re-enabled.
+
+For a diagnostic override of the saved presentation setting:
 
 ```powershell
 $env:SATURN_PRESENT_HZ='120'
 ./runner/saturnwin.exe out/sonicr-check/game.toml
 ```
 
-Remove `SATURN_PRESENT_HZ` to return to native presentation. Interpolation leaves
+Remove `SATURN_PRESENT_HZ` to use the saved setting, or set it to `0` to force
+native presentation. Interpolation leaves
 Saturn logic and audio clocks unchanged. A worker computes the next field while
 the frontend presents immutable graphics snapshots. The renderer matches stable
 primitive attributes and rejects ambiguous or changed-texture matches; HUD
 sprites stay at their original positions. Repeated source fields retain their
 geometry pair. Rotation-background mappings interpolate between two frozen
 sets of parameters and coefficient tables. Live updates for the next picture
-cannot move either endpoint halfway through the current pair; texture and
-palette sampling still use the current field. Generated pictures restore the canonical GPU buffers
+cannot move either endpoint halfway through the current pair. VDP1 texture,
+palette and Gouraud samples come from the displayed framebuffer's draw-time
+material snapshot. Generated pictures restore the canonical GPU buffers
 using GPU transfers, without host framebuffer readback or writes to guest RAM. Material buckets share reciprocal matching work while preserving the full
 identity and ambiguity checks. Generated pictures reuse the canonical VRAM
 upload instead of uploading the same snapshot at every presentation.

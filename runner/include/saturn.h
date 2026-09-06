@@ -453,6 +453,8 @@ struct saturn {
      * alignment gap before `frames`, so raw diagnostic snapshots keep their
      * layout. */
     uint8_t  vblank_boundary_done;
+    uint8_t  dma_bus_depth;   /* DMA bypasses CPU cache write hits; fits padding */
+    uint8_t  cpu_bus_active;  /* CPU access timing excludes loaders/debug/DMA */
     uint64_t frames;
     uint64_t frt_irqs;        /* interrupts sourced from a core's own FRT */
     /* SATURN_PROF: rdtsc cycle buckets, printed at end of run. */
@@ -766,7 +768,9 @@ void     sh2_reset(sh2 *c, saturn *s, int is_slave, uint32_t pc, uint32_t sp);
  * Returns the number of instructions retired (1 or 2), or 0 if halted. */
 int      sh2_step(sh2 *c);
 
-/* Run up to `n` instructions or until halt. Returns instructions retired. */
+/* Advance the cumulative budget by `n` SH-2 clocks, or stop at halt.
+ * An instruction crossing the budget is repaid by later calls.
+ * Returns instructions retired, which can be zero while repaying overshoot. */
 uint64_t sh2_run(sh2 *c, uint64_t n);
 void sh2_report_ophist(FILE *f);
 

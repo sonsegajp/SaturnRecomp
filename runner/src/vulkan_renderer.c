@@ -1,6 +1,7 @@
 #include "vulkan_renderer.h"
 #include "saturn.h"
 #include "geometry_interp.h"
+#include "game_overlay_vk.h"
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -120,12 +121,40 @@ struct saturn_vk_renderer {
     int history_width, history_height;
     saturn_vk_vdp1_op *history, *blend;
     uint8_t *history_vram;
+    uint8_t *geometry_vram[2],*picture_vram;
+    uint8_t geometry_material_valid[2];
+    int picture_vram_pending;
     uint8_t *rotation_history,*rotation_previous,*cram_history,*cram_previous;
     uint16_t rotation_regs[256],previous_regs[256];
     int rotation_valid,rotation_pair,rotation_upload_pending;
     float picture_alpha;
     vkbuf saved_fb, saved_mesh;
+    saturn_runtime_settings quality;
+    unsigned quality_capacity;
+    vkbuf quality_fb,quality_mesh;
+    VkImage quality_output,quality_resolved;
+    VkImageView quality_view,resolved_view;
+    VkDeviceMemory quality_memory,resolved_memory;
+    VkDescriptorSet quality_desc,quality_hold_desc,post_desc;
+    VkDescriptorSetLayout post_desc_layout;
+    VkDescriptorPool post_desc_pool;
+    VkPipelineLayout post_layout;
+    VkPipeline post_pipeline;
+    int quality_ready,resolved_ready;
+    VkImage presented_output;
+    int presented_width,presented_height;
+    game_overlay_vk *overlay;
+    const game_overlay_draw_data *overlay_draw;
 };
+
+static int quality_active(const saturn_vk_renderer *r) {
+    return r->quality.internal_scale>1||r->quality.texture_filter||
+           r->quality.antialiasing||r->quality.model_smoothing;
+}
+static unsigned quality_scale(const saturn_vk_renderer *r) {
+    unsigned scale=r->quality.internal_scale>0?(unsigned)r->quality.internal_scale:1u;
+    return scale*(r->quality.model_smoothing?2u:1u);
+}
 
 static int op_bounds(const saturn_vk_vdp1_op *o, int *x0, int *y0, int *x1, int *y1)
 {
@@ -295,6 +324,7 @@ fail:
 
 static void destroy_swapchain(saturn_vk_renderer *r)
 {
+    if(r->overlay)game_overlay_vk_clear_targets(r->overlay);
     if(r->present_ready)for(uint32_t i=0;i<r->swap_count;i++)
         if(r->present_ready[i])vkDestroySemaphore(r->device,r->present_ready[i],NULL);
     free(r->present_ready);r->present_ready=NULL;
@@ -349,7 +379,7 @@ static int create_swapchain(saturn_vk_renderer *r, char *error, size_t error_siz
     ci.surface = r->surface; ci.minImageCount = count;
     ci.imageFormat = chosen.format; ci.imageColorSpace = chosen.colorSpace;
     ci.imageExtent = extent; ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
@@ -369,6 +399,9 @@ static int create_swapchain(saturn_vk_renderer *r, char *error, size_t error_siz
     if(!r->present_ready){set_error(error,error_size,"out of memory");goto fail;}
     VkSemaphoreCreateInfo semaphore={VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for(uint32_t i=0;i<r->swap_count;i++)VK_CHECK(vkCreateSemaphore(r->device,&semaphore,NULL,&r->present_ready[i]));
+    if(r->overlay &&
+       (!game_overlay_vk_set_format(r->overlay,r->swap_format,error,error_size) ||
+        !game_overlay_vk_set_targets(r->overlay,r->swap_images,r->swap_count,r->swap_extent,error,error_size)))goto fail;
     fprintf(stderr,"[video] presentation %s, %u images, per-image synchronization\n",
         mode==VK_PRESENT_MODE_MAILBOX_KHR?"mailbox":mode==VK_PRESENT_MODE_IMMEDIATE_KHR?"immediate":"fifo",r->swap_count);
     return 1;
@@ -408,7 +441,7 @@ static VkShaderModule shader_module(saturn_vk_renderer *r, const char *name,
     return m;
 }
 
-static int create_compute(saturn_vk_renderer *r, const char *name, VkPipeline *out,
+static int create_compute(saturn_vk_renderer *r, const char *name, VkPipelineLayout layout,VkPipeline *out,
                           char *error, size_t error_size)
 {
     VkShaderModule sm = shader_module(r, name, error, error_size);
@@ -416,7 +449,7 @@ static int create_compute(saturn_vk_renderer *r, const char *name, VkPipeline *o
     VkPipelineShaderStageCreateInfo ss = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     ss.stage = VK_SHADER_STAGE_COMPUTE_BIT; ss.module = sm; ss.pName = "main";
     VkComputePipelineCreateInfo ci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    ci.stage = ss; ci.layout = r->pipeline_layout;
+    ci.stage = ss; ci.layout = layout;
     VkResult vr = vkCreateComputePipelines(r->device, VK_NULL_HANDLE, 1, &ci, NULL, out);
     vkDestroyShaderModule(r->device, sm, NULL);
     if (vr != VK_SUCCESS) { set_error(error, error_size, "compute pipeline %s failed (%d)", name, (int)vr); return 0; }
@@ -440,7 +473,7 @@ static int queue_vdp1(void *userdata, const saturn_vk_vdp1_op *op)
         if (!p) return 0;
         r->pending = p; r->pending_cap = cap;
     }
-    if (r->interpolate || getenv("SATURN_GEOMETRY_CAPTURE")) {
+    if (r->interpolate || quality_active(r) || getenv("SATURN_GEOMETRY_CAPTURE")) {
         unsigned b=op->target&1;
         r->geometry_revision[b]=++r->command_revision;
         if(!r->geometry[b])r->geometry[b]=malloc(8192*sizeof(*op));
@@ -542,8 +575,8 @@ saturn_vk_renderer *saturn_vk_create(SDL_Window *window, saturn *s,
     VK_CHECK(vkCreateDescriptorSetLayout(r->device,&dl,NULL,&r->desc_layout));
     VkPipelineLayoutCreateInfo pl={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pl.setLayoutCount=1;pl.pSetLayouts=&r->desc_layout;
     VK_CHECK(vkCreatePipelineLayout(r->device,&pl,NULL,&r->pipeline_layout));
-    VkDescriptorPoolSize ps[2]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,9},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1}};
-    VkDescriptorPoolCreateInfo dp={VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dp.maxSets=1;dp.poolSizeCount=2;dp.pPoolSizes=ps;
+    VkDescriptorPoolSize ps[2]={{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,27},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,3}};
+    VkDescriptorPoolCreateInfo dp={VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dp.maxSets=3;dp.poolSizeCount=2;dp.pPoolSizes=ps;
     VK_CHECK(vkCreateDescriptorPool(r->device,&dp,NULL,&r->desc_pool));
     VkDescriptorSetAllocateInfo da={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};da.descriptorPool=r->desc_pool;da.descriptorSetCount=1;da.pSetLayouts=&r->desc_layout;
     VK_CHECK(vkAllocateDescriptorSets(r->device,&da,&r->desc_set));
@@ -554,7 +587,7 @@ saturn_vk_renderer *saturn_vk_create(SDL_Window *window, saturn *s,
     for(uint32_t i=7;i<9;i++){dbi[i].buffer=bufs[i]->buffer;dbi[i].offset=0;dbi[i].range=bufs[i]->size;wr[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;wr[i].dstSet=r->desc_set;wr[i].dstBinding=bindno[i];wr[i].descriptorCount=1;wr[i].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;wr[i].pBufferInfo=&dbi[i];}
     VkDescriptorImageInfo di={VK_NULL_HANDLE,r->output_view,VK_IMAGE_LAYOUT_GENERAL};wr[9].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;wr[9].dstSet=r->desc_set;wr[9].dstBinding=7;wr[9].descriptorCount=1;wr[9].descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;wr[9].pImageInfo=&di;
     vkUpdateDescriptorSets(r->device,10,wr,0,NULL);
-    if(!create_compute(r,"vdp1.comp.spv",&r->vdp1_pipeline,error,error_size)||!create_compute(r,"vdp2.comp.spv",&r->vdp2_pipeline,error,error_size))goto fail;
+    if(!create_compute(r,"vdp1.comp.spv",r->pipeline_layout,&r->vdp1_pipeline,error,error_size)||!create_compute(r,"vdp2.comp.spv",r->pipeline_layout,&r->vdp2_pipeline,error,error_size))goto fail;
 
     saturn_vdp1_gpu_sink sink={r,queue_vdp1,reset_vdp1};vdp1_gpu_bind(s,&sink);
     fprintf(stderr,"[video] Vulkan: %s (VDP1 compute + VDP2 compute + swapchain)\n",r->device_name);
@@ -572,12 +605,24 @@ static void image_barrier(VkCommandBuffer cb,VkImage image,VkImageLayout oldl,Vk
     b.srcAccessMask=src;b.dstAccessMask=dst;vkCmdPipelineBarrier(cb,ss,ds,0,0,NULL,0,NULL,1,&b);
 }
 
+#include "vulkan_quality.h"
+
 int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
                      char *error, size_t error_size)
 {
     if(!r||!r->device)return 0;
     unsigned draw_count=r->replaying?r->picture_count:r->pending_count;
     const saturn_vk_vdp1_op *draw_ops=r->replaying?r->picture_ops:r->pending;
+    int enhanced=r->replaying&&quality_active(r);
+    int enhanced_geometry=enhanced&&r->history_valid;
+    unsigned render_scale=enhanced?quality_scale(r):1u;
+    unsigned internal_scale=enhanced?(unsigned)r->quality.internal_scale:1u;
+    if(enhanced_geometry&&!draw_count){draw_count=r->history_count;draw_ops=r->history;}
+    if(enhanced&&!enhanced_geometry)draw_count=0;
+    VkImage output=enhanced?r->quality_output:r->output;
+    VkDescriptorSet descriptor=enhanced?(enhanced_geometry?r->quality_desc:r->quality_hold_desc):r->desc_set;
+    vkbuf *framebuffer=enhanced_geometry?&r->quality_fb:&r->fb;
+    vkbuf *meshbuffer=enhanced_geometry?&r->quality_mesh:&r->mesh;
     if(r->present_pending&&!saturn_vk_present(r,error,error_size))return 0;
     if(width<1)width=320;if(height<1)height=224;if(width>704)width=704;if(height>512)height=512;
     VK_CHECK(vkWaitForFences(r->device,1,&r->fence,VK_TRUE,UINT64_MAX));
@@ -592,9 +637,33 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
      * The field worker writes guest RAM, never these GPU input buffers. */
     if(!r->replaying) {
         memcpy(r->v1ram.map,s->vdp1_vram,VDP1_VRAM_SZ);memcpy(r->v2ram.map,s->vdp2_vram,VDP2_VRAM_SZ);memcpy(r->cram.map,s->cram,CRAM_SIZE);
+        if(r->interpolate || quality_active(r) || getenv("SATURN_GEOMETRY_CAPTURE")) {
+            unsigned touched=0,cleared=0;
+            for(unsigned i=0;i<draw_count;i++) {
+                unsigned bit=1u<<(draw_ops[i].target&1u);
+                touched|=bit;
+                if(draw_ops[i].kind==SATURN_VK_VDP1_ERASE)cleared|=bit;
+            }
+            for(unsigned b=0;b<2;b++)if(touched&(1u<<b)) {
+                if(!r->geometry_vram[b])r->geometry_vram[b]=malloc(VDP1_VRAM_SZ);
+                if(!r->geometry_vram[b]){set_error(error,error_size,"VDP1 material history allocation failed");goto fail;}
+                /* The persistent framebuffer owns the texture, CLUT and
+                 * Gouraud data from this draw submission. Live VRAM may be
+                 * overwritten before that buffer is displayed. A partial
+                 * draw spanning submissions cannot use one material image;
+                 * hold its native framebuffer until a new clear/redraw. */
+                memcpy(r->geometry_vram[b],s->vdp1_vram,VDP1_VRAM_SZ);
+                r->geometry_material_valid[b]=(cleared&(1u<<b))!=0;
+            }
+        }
+    } else if(r->picture_vram_pending) {
+        memcpy(r->v1ram.map,r->picture_vram,VDP1_VRAM_SZ);
+        r->picture_vram_pending=0;
     }
     uint32_t *rp=r->params.map;for(uint32_t i=0;i<256;i++)rp[i]=s->vdp2_reg[i];rp[256]=(uint32_t)width;rp[257]=(uint32_t)height;rp[258]=(uint32_t)(s->fb_draw^1);rp[259]=draw_count;rp[260]=s->layer_mask?s->layer_mask:0x3fu;rp[261]=getenv("SATURN_VK_VDP1_ONLY")?1u:0u;vcell_gpu_params(s,rp);rp[266]=getenv("SATURN_MESHBLEND")?1u:0u;
     rp[267]=0;rp[268]=0;
+    rp[269]=render_scale;rp[270]=enhanced_geometry?render_scale:1u;
+    rp[271]=enhanced?(uint32_t)r->quality.texture_filter:0u;
     if(r->replaying && r->rotation_pair) {
         /* Both mapping endpoints belong to the same source-picture pair.
          * Live VRAM can already contain next field's rotation table while
@@ -615,12 +684,24 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
 
     VK_CHECK(vkResetFences(r->device,1,&r->fence));VK_CHECK(vkResetCommandBuffer(r->command,0));
     VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK_CHECK(vkBeginCommandBuffer(r->command,&bi));
-    image_barrier(r->command,r->output,r->output_ready?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,0,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);r->output_ready=1;
-    vkCmdBindDescriptorSets(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->pipeline_layout,0,1,&r->desc_set,0,NULL);
-    vkCmdBindPipeline(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->vdp1_pipeline);vkCmdDispatch(r->command,64,32,1);
-    VkBufferMemoryBarrier bb[2];memset(bb,0,sizeof bb);for(int i=0;i<2;i++){bb[i].sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;bb[i].srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;bb[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT;bb[i].srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;bb[i].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;bb[i].buffer=i?r->mesh.buffer:r->fb.buffer;bb[i].size=VK_WHOLE_SIZE;}
+    int output_ready=enhanced?r->quality_ready:r->output_ready;
+    if(enhanced&&!r->quality_ready) {
+        vkCmdFillBuffer(r->command,r->quality_fb.buffer,0,VK_WHOLE_SIZE,0);
+        vkCmdFillBuffer(r->command,r->quality_mesh.buffer,0,VK_WHOLE_SIZE,0);
+        VkMemoryBarrier initialized={VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        initialized.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+        initialized.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1,&initialized,0,NULL,0,NULL);
+    }
+    image_barrier(r->command,output,output_ready?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,0,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    if(enhanced)r->quality_ready=1;else r->output_ready=1;
+    vkCmdBindDescriptorSets(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->pipeline_layout,0,1,&descriptor,0,NULL);
+    vkCmdBindPipeline(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->vdp1_pipeline);
+    unsigned v1scale=enhanced_geometry?render_scale:1u;
+    vkCmdDispatch(r->command,64u*v1scale,32u*v1scale,1);
+    VkBufferMemoryBarrier bb[2];memset(bb,0,sizeof bb);for(int i=0;i<2;i++){bb[i].sType=VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;bb[i].srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;bb[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT;bb[i].srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;bb[i].dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;bb[i].buffer=i?meshbuffer->buffer:framebuffer->buffer;bb[i].size=VK_WHOLE_SIZE;}
     vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,NULL,2,bb,0,NULL);
-    if(r->core_only) {
+    if(r->core_only && r->interpolate) {
         for(int i=0;i<2;i++){bb[i].srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;bb[i].dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;}
         vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,NULL,2,bb,0,NULL);
         VkBufferCopy copy={0,0,r->fb.size};vkCmdCopyBuffer(r->command,r->fb.buffer,r->saved_fb.buffer,1,&copy);
@@ -629,8 +710,8 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
         vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&ready,0,NULL,0,NULL);
     }
     /* Keep the canonical composite available for diagnostic readback. */
-    vkCmdBindPipeline(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->vdp2_pipeline);vkCmdDispatch(r->command,((uint32_t)width+7u)/8u,((uint32_t)height+7u)/8u,1);
-    if(r->replaying && r->interpolate) {
+    vkCmdBindPipeline(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->vdp2_pipeline);vkCmdDispatch(r->command,((uint32_t)width*render_scale+7u)/8u,((uint32_t)height*render_scale+7u)/8u,1);
+    if(r->replaying && r->interpolate && !enhanced) {
         for(int i=0;i<2;i++){bb[i].srcAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;bb[i].dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;}
         vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,NULL,2,bb,0,NULL);
         VkBufferCopy copy={0,0,r->fb.size};vkCmdCopyBuffer(r->command,r->saved_fb.buffer,r->fb.buffer,1,&copy);
@@ -638,15 +719,30 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
         for(int i=0;i<2;i++){bb[i].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;bb[i].dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;}
         vkCmdPipelineBarrier(r->command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,0,NULL,2,bb,0,NULL);
     }
+    if(enhanced&&(r->quality.antialiasing||r->quality.model_smoothing)) {
+        image_barrier(r->command,r->quality_output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        image_barrier(r->command,r->quality_resolved,r->resolved_ready?VK_IMAGE_LAYOUT_GENERAL:VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,0,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        r->resolved_ready=1;
+        int32_t post[5]={width*(int)render_scale,height*(int)render_scale,width*(int)internal_scale,height*(int)internal_scale,r->quality.antialiasing};
+        vkCmdBindPipeline(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->post_pipeline);
+        vkCmdBindDescriptorSets(r->command,VK_PIPELINE_BIND_POINT_COMPUTE,r->post_layout,0,1,&r->post_desc,0,NULL);
+        vkCmdPushConstants(r->command,r->post_layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof post,post);
+        vkCmdDispatch(r->command,((unsigned)post[2]+7u)/8u,((unsigned)post[3]+7u)/8u,1);
+        output=r->quality_resolved;
+    }
+    r->presented_output=output;r->presented_width=width*(int)internal_scale;r->presented_height=height*(int)internal_scale;
     if(!r->core_only) {
-    image_barrier(r->command,r->output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+    image_barrier(r->command,output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
     image_barrier(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkClearColorValue black={{0,0,0,1}};VkImageSubresourceRange sr={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};vkCmdClearColorImage(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&sr);
     int outw=(int)r->swap_extent.width,outh=(int)r->swap_extent.height,x0=0,y0=0,x1=outw,y1=outh;if(outw*3<=outh*4){y1=outw*3/4;y0=(outh-y1)/2;y1+=y0;}else{x1=outh*4/3;x0=(outw-x1)/2;x1+=x0;}
-    VkImageBlit bl={0};bl.srcSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.srcSubresource.layerCount=1;bl.srcOffsets[1].x=width;bl.srcOffsets[1].y=height;bl.srcOffsets[1].z=1;bl.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.dstSubresource.layerCount=1;bl.dstOffsets[0].x=x0;bl.dstOffsets[0].y=y0;bl.dstOffsets[1].x=x1;bl.dstOffsets[1].y=y1;bl.dstOffsets[1].z=1;
-    vkCmdBlitImage(r->command,r->output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&bl,VK_FILTER_NEAREST);
-    image_barrier(r->command,r->output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-    image_barrier(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,VK_ACCESS_TRANSFER_WRITE_BIT,0,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    VkImageBlit bl={0};bl.srcSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.srcSubresource.layerCount=1;bl.srcOffsets[1].x=width*(int)internal_scale;bl.srcOffsets[1].y=height*(int)internal_scale;bl.srcOffsets[1].z=1;bl.dstSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;bl.dstSubresource.layerCount=1;bl.dstOffsets[0].x=x0;bl.dstOffsets[0].y=y0;bl.dstOffsets[1].x=x1;bl.dstOffsets[1].y=y1;bl.dstOffsets[1].z=1;
+    vkCmdBlitImage(r->command,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&bl,VK_FILTER_NEAREST);
+    image_barrier(r->command,output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    if(r->overlay&&r->overlay_draw&&r->overlay_draw->command_count) {
+        if(!game_overlay_vk_record(r->overlay,r->command,image_index,r->overlay_draw,error,error_size))goto fail;
+        image_barrier(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,0,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    } else image_barrier(r->command,r->swap_images[image_index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,VK_ACCESS_TRANSFER_WRITE_BIT,0,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     }
     VK_CHECK(vkEndCommandBuffer(r->command));VkPipelineStageFlags waitstage=VK_PIPELINE_STAGE_TRANSFER_BIT;VkSubmitInfo si={VK_STRUCTURE_TYPE_SUBMIT_INFO};si.waitSemaphoreCount=r->core_only?0:1;si.pWaitSemaphores=&r->acquired;si.pWaitDstStageMask=&waitstage;si.commandBufferCount=1;si.pCommandBuffers=&r->command;si.signalSemaphoreCount=r->core_only?0:1;si.pSignalSemaphores=r->core_only?NULL:&r->present_ready[image_index];VK_CHECK(vkQueueSubmit(r->queue,1,&si,r->fence));
     /* Do not serialize the host on the GPU here. The emulated machine writes
@@ -673,6 +769,13 @@ int saturn_vk_render(saturn_vk_renderer *r, saturn *s, int width, int height,
             if((f=fopen(path,"wb"))){fwrite(s,sizeof(*s),1,f);fclose(f);}
             snprintf(path,sizeof path,"%s-%llu.ops",root,(unsigned long long)s->frames);
             if((f=fopen(path,"wb"))){fwrite(r->geometry[b],sizeof(*r->geometry[b]),n,f);fclose(f);}
+            snprintf(path,sizeof path,"%s-%llu.vram",root,(unsigned long long)s->frames);
+            if((f=fopen(path,"wb"))) {
+                const uint32_t header[2]={0x31525653u,r->geometry_material_valid[b]};
+                fwrite(header,sizeof header,1,f);
+                fwrite(r->geometry_vram[b]?r->geometry_vram[b]:s->vdp1_vram,VDP1_VRAM_SZ,1,f);
+                fclose(f);
+            }
             fprintf(stderr,"[geometry] field %llu: %u displayed operations\n",(unsigned long long)s->frames,n);
         }
     }
@@ -694,20 +797,37 @@ int saturn_vk_present(saturn_vk_renderer *r, char *error, size_t error_size)
  * Extra pictures rasterize saved command geometry into a temporary copy of
  * the GPU framebuffer. Restore the exact persistent buffers before returning;
  * neither emulated RAM nor the guest command walker is touched. */
+static void free_interpolation_resources(saturn_vk_renderer *r) {
+    free_buffer(r,&r->saved_fb);free_buffer(r,&r->saved_mesh);
+    free(r->history);r->history=NULL;free(r->blend);r->blend=NULL;
+    free(r->history_vram);r->history_vram=NULL;
+    free(r->picture_vram);r->picture_vram=NULL;
+    free(r->rotation_history);r->rotation_history=NULL;
+    free(r->rotation_previous);r->rotation_previous=NULL;
+    free(r->cram_history);r->cram_history=NULL;
+    free(r->cram_previous);r->cram_previous=NULL;
+    r->interpolate=0;
+}
 int saturn_vk_interpolation_enable(saturn_vk_renderer *r) {
     if(!r)return 0;
     r->history_valid=0;r->rotation_valid=0;r->rotation_pair=0;
     r->geometry_count[0]=r->geometry_count[1]=0;r->history_revision=0;
     r->geometry_stamp=0;r->geometry_span=1;r->geometry_age=0;
+    r->geometry_material_valid[0]=r->geometry_material_valid[1]=0;
     if(r->history){r->interpolate=1;return 1;}
     r->history=calloc(8192,sizeof(*r->history));r->blend=calloc(8192,sizeof(*r->blend));
     r->history_vram=malloc(VDP1_VRAM_SZ);
+    r->picture_vram=malloc(VDP1_VRAM_SZ);
     r->rotation_history=malloc(VDP2_VRAM_SZ);r->rotation_previous=malloc(VDP2_VRAM_SZ);
     r->cram_history=malloc(CRAM_SIZE);r->cram_previous=malloc(CRAM_SIZE);
     char error[256];
-    if(!make_buffer(r,&r->saved_fb,r->fb.size,error,sizeof error)||!make_buffer(r,&r->saved_mesh,r->mesh.size,error,sizeof error))return 0;
-    if(!r->history||!r->blend||!r->history_vram||!r->rotation_history||!r->rotation_previous||!r->cram_history||!r->cram_previous)return 0;
+    if(!r->history||!r->blend||!r->history_vram||!r->picture_vram||!r->rotation_history||!r->rotation_previous||!r->cram_history||!r->cram_previous)goto fail;
+    if(!make_buffer(r,&r->saved_fb,r->fb.size,error,sizeof error)||!make_buffer(r,&r->saved_mesh,r->mesh.size,error,sizeof error))goto fail;
     r->interpolate=1;return 1;
+fail:
+    /* A retry must start from an empty allocation set. In particular, a
+     * history pointer alone must never make partial initialization succeed. */
+    free_interpolation_resources(r);return 0;
 }
 void saturn_vk_interpolation_disable(saturn_vk_renderer *r) {
     if(r){r->interpolate=0;r->history_valid=0;r->rotation_valid=0;r->rotation_pair=0;}
@@ -718,9 +838,15 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
     if(!ok)return 0;
     unsigned b=s->fb_draw^1,n=r->geometry_count[b];
     const saturn_vk_vdp1_op *cur=r->geometry[b];
+    const uint8_t *material=r->geometry_vram[b]?r->geometry_vram[b]:s->vdp1_vram;
+    memcpy(r->picture_vram,material,VDP1_VRAM_SZ);
+    r->picture_vram_pending=1;
     /* Replaying partial clears or CPU-uploaded framebuffers is unsafe. */
-    int safe=n && n<8192 && cur[0].kind==SATURN_VK_VDP1_ERASE &&
-        cur[0].xy[0]==0 && cur[0].xy[1]==0 && cur[0].xy[2]>=w && cur[0].xy[3]>=h-1;
+    int sprite_width=w>512?(w+1)/2:w;
+    int sprite_height=((s->vdp2_reg[0]&0xc0u)==0xc0u&&!getenv("SATURN_VK_VDP1_ONLY"))?(h+1)/2:h;
+    if(sprite_width>512)sprite_width=512;if(sprite_height>256)sprite_height=256;
+    int safe=r->geometry_material_valid[b] && n && n<8192 && cur[0].kind==SATURN_VK_VDP1_ERASE &&
+        cur[0].xy[0]==0 && cur[0].xy[1]==0 && cur[0].xy[2]>=sprite_width && cur[0].xy[3]>=sprite_height-1;
     for(unsigned i=0;i<n;i++)if(cur[i].kind==SATURN_VK_VDP1_FB_WRITE)safe=0;
     /* New source pictures are identified by the guest's draw operations,
      * not by integer XY differences. Quantized still vertices can belong to
@@ -728,7 +854,7 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
     int changed=r->geometry_revision[b]!=r->history_revision;
     r->history_revision=r->geometry_revision[b];
     if(changed || !safe || !r->history_valid || w!=r->history_width || h!=r->history_height) {
-    r->rotation_pair=r->rotation_valid && w==r->history_width && h==r->history_height;
+    r->rotation_pair=r->interpolate && r->rotation_valid && w==r->history_width && h==r->history_height;
     /* Mode and table changes are scene boundaries, not continuous motion. */
     const unsigned controls[]={0x0e,0x20,0x2a,0x3a,0x3e,0xb0,0xb4,0xb6,0xbc,0xbe};
     for(unsigned i=0;i<sizeof controls/sizeof controls[0];i++)
@@ -738,18 +864,20 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
         memcpy(r->cram_previous,r->cram_history,CRAM_SIZE);
         memcpy(r->previous_regs,r->rotation_regs,sizeof r->previous_regs);
     }
-    memcpy(r->rotation_history,s->vdp2_vram,VDP2_VRAM_SZ);
-    memcpy(r->cram_history,s->cram,CRAM_SIZE);
-    memcpy(r->rotation_regs,s->vdp2_reg,sizeof r->rotation_regs);
-    r->rotation_valid=1;r->rotation_upload_pending=1;
+    if(r->interpolate) {
+        memcpy(r->rotation_history,s->vdp2_vram,VDP2_VRAM_SZ);
+        memcpy(r->cram_history,s->cram,CRAM_SIZE);
+        memcpy(r->rotation_regs,s->vdp2_reg,sizeof r->rotation_regs);
+        r->rotation_valid=1;r->rotation_upload_pending=1;
+    }
         r->blend_count=0;r->matched=0;
         uint64_t span=s->frames-r->geometry_stamp;
         r->geometry_span=span>=1 && span<=4?(unsigned)span:1;
         r->geometry_stamp=s->frames;
-        if(safe && r->history_valid && w==r->history_width && h==r->history_height) {
+        if(r->interpolate && safe && r->history_valid && w==r->history_width && h==r->history_height) {
             r->matched=geometry_interpolate(r->history,r->history_count,cur,n,0,r->blend);
             for(unsigned i=0;i<n;i++)if(r->blend[i].flip&SATURN_GEOMETRY_FLOAT) {
-                if(cur[i].textured && geometry_texture_hash(&cur[i],s->vdp1_vram)!=geometry_texture_hash(&cur[i],r->history_vram)) {
+                if(cur[i].textured && geometry_texture_hash(&cur[i],material)!=geometry_texture_hash(&cur[i],r->history_vram)) {
                     r->blend[i]=cur[i];r->matched--;
                 }
             }
@@ -762,6 +890,9 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
                 if((f=fopen(path,"wb"))){fwrite(cur,sizeof(*cur),n,f);fclose(f);}
             }
             unsigned repaired=geometry_weld(cur,n,r->blend);
+            r->matched=0;
+            for(unsigned i=0;i<n;i++)
+                r->matched+=(r->blend[i].flip&SATURN_GEOMETRY_FLOAT)!=0;
             if(audit && s->frames==6500) {
                 char path[1024];FILE *f;snprintf(path,sizeof path,"%s-after.ops",audit);
                 if((f=fopen(path,"wb"))){fwrite(r->blend,sizeof(*r->blend),n,f);fclose(f);}
@@ -770,7 +901,7 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
             r->blend_count=n;
         }
         if(n)memcpy(r->history,cur,n*sizeof(*cur));
-        memcpy(r->history_vram,s->vdp1_vram,VDP1_VRAM_SZ);
+        memcpy(r->history_vram,material,VDP1_VRAM_SZ);
     }
     /* Preserve the pair across repeated display fields (e.g. a 30 Hz game).
      * Target buffer numbers alternate independently of primitive identity. */
@@ -785,7 +916,7 @@ int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,ch
     return 1;
 }
 int saturn_vk_interpolation_render(saturn_vk_renderer *r,saturn *s,float alpha,int w,int h,char *error,size_t size) {
-    alpha=(r->geometry_age+alpha)/(float)(r->geometry_span?r->geometry_span:1);
+    alpha=r->interpolate?(r->geometry_age+alpha)/(float)(r->geometry_span?r->geometry_span:1):1.f;
     if(alpha<0)alpha=0;if(alpha>1)alpha=1;
     r->picture_alpha=alpha;
     r->replaying=1;r->picture_count=0;
@@ -811,11 +942,11 @@ int saturn_vk_replay_geometry(saturn_vk_renderer *r,saturn *s,
 }
 const char *saturn_vk_device_name(const saturn_vk_renderer *r){return r?r->device_name:"";}
 
-int saturn_vk_readback(saturn_vk_renderer *r, uint32_t *pixels, int width, int height,
+static int readback_image(saturn_vk_renderer *r,VkImage source, uint32_t *pixels, int width, int height,
                        char *error, size_t error_size)
 {
     vkbuf readback = {0};
-    if (!r || !pixels || width < 1 || width > 704 || height < 1 || height > 512) return 0;
+    if (!r || !source || !pixels || width < 1 || width > 2816 || height < 1 || height > 2048) return 0;
     if (!saturn_vk_present(r,error,error_size)) return 0;
     VK_CHECK(vkWaitForFences(r->device,1,&r->fence,VK_TRUE,UINT64_MAX));
     if (!make_buffer(r,&readback,(VkDeviceSize)width*height*4,error,error_size)) return 0;
@@ -823,13 +954,13 @@ int saturn_vk_readback(saturn_vk_renderer *r, uint32_t *pixels, int width, int h
     VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(r->command,&bi));
-    image_barrier(r->command,r->output,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    image_barrier(r->command,source,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkBufferImageCopy copy={0};
     copy.imageSubresource.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;copy.imageSubresource.layerCount=1;
     copy.imageExtent.width=width;copy.imageExtent.height=height;copy.imageExtent.depth=1;
-    vkCmdCopyImageToBuffer(r->command,r->output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback.buffer,1,&copy);
-    image_barrier(r->command,r->output,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
+    vkCmdCopyImageToBuffer(r->command,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback.buffer,1,&copy);
+    image_barrier(r->command,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
         VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     VK_CHECK(vkEndCommandBuffer(r->command));
     VK_CHECK(vkResetFences(r->device,1,&r->fence));
@@ -848,16 +979,33 @@ fail:
     return 0;
 }
 
+int saturn_vk_readback(saturn_vk_renderer *r,uint32_t *pixels,int width,int height,char *error,size_t size) {
+    if(!r||width>704||height>512)return 0;
+    return readback_image(r,r->output,pixels,width,height,error,size);
+}
+int saturn_vk_readback_presented(saturn_vk_renderer *r,uint32_t *pixels,int width,int height,char *error,size_t size) {
+    if(!r||width!=r->presented_width||height!=r->presented_height){set_error(error,size,"Presented image dimensions do not match");return 0;}
+    return readback_image(r,r->presented_output,pixels,width,height,error,size);
+}
+
 void saturn_vk_destroy(saturn_vk_renderer *r)
 {
     if(!r)return;if(r->system)vdp1_gpu_bind(r->system,NULL);if(r->device)vkDeviceWaitIdle(r->device);
+    game_overlay_vk_destroy(r->overlay);r->overlay=NULL;
+    free_buffer(r,&r->quality_fb);free_buffer(r,&r->quality_mesh);
+    quality_free_image(r,r->quality_output,r->quality_view,r->quality_memory);
+    quality_free_image(r,r->quality_resolved,r->resolved_view,r->resolved_memory);
+    if(r->post_pipeline)vkDestroyPipeline(r->device,r->post_pipeline,NULL);
+    if(r->post_layout)vkDestroyPipelineLayout(r->device,r->post_layout,NULL);
+    if(r->post_desc_pool)vkDestroyDescriptorPool(r->device,r->post_desc_pool,NULL);
+    if(r->post_desc_layout)vkDestroyDescriptorSetLayout(r->device,r->post_desc_layout,NULL);
     if(r->vdp1_pipeline)vkDestroyPipeline(r->device,r->vdp1_pipeline,NULL);if(r->vdp2_pipeline)vkDestroyPipeline(r->device,r->vdp2_pipeline,NULL);
     if(r->pipeline_layout)vkDestroyPipelineLayout(r->device,r->pipeline_layout,NULL);if(r->desc_pool)vkDestroyDescriptorPool(r->device,r->desc_pool,NULL);if(r->desc_layout)vkDestroyDescriptorSetLayout(r->device,r->desc_layout,NULL);
     if(r->output_view)vkDestroyImageView(r->device,r->output_view,NULL);if(r->output)vkDestroyImage(r->device,r->output,NULL);if(r->output_memory)vkFreeMemory(r->device,r->output_memory,NULL);
-    free_buffer(r,&r->saved_fb);free_buffer(r,&r->saved_mesh);
+    free_interpolation_resources(r);
     free_buffer(r,&r->tile_refs);free_buffer(r,&r->tile_headers);free_buffer(r,&r->mesh);free_buffer(r,&r->fb);free_buffer(r,&r->ops);free_buffer(r,&r->params);free_buffer(r,&r->cram);free_buffer(r,&r->v2ram);free_buffer(r,&r->v1ram);
     if(r->fence)vkDestroyFence(r->device,r->fence,NULL);if(r->acquired)vkDestroySemaphore(r->device,r->acquired,NULL);if(r->command_pool)vkDestroyCommandPool(r->device,r->command_pool,NULL);
     if(r->device){destroy_swapchain(r);vkDestroyDevice(r->device,NULL);}if(r->surface)vkDestroySurfaceKHR(r->instance,r->surface,NULL);if(r->instance)vkDestroyInstance(r->instance,NULL);
-    free(r->history);free(r->blend);free(r->history_vram);free(r->rotation_history);free(r->rotation_previous);free(r->cram_history);free(r->cram_previous);
+    free(r->geometry_vram[0]);free(r->geometry_vram[1]);
     free(r->geometry[0]);free(r->geometry[1]);free(r->pending);free(r);
 }

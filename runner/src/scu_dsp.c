@@ -130,6 +130,7 @@ static void run_dma(saturn *s)
     uint8_t prog = (uint8_t)d->dma_pc;
 
     if (!d->dma_run) return;
+    s->dma_bus_depth++;
     do {
         uint32_t value;
         if (d->dma_to_d0) {
@@ -159,6 +160,7 @@ static void run_dma(saturn *s)
         if (use_data) d->ct[bank] = (uint8_t)((d->ct[bank] + 1u) & 0x3Fu);
         d->dma_count--;
     } while (d->dma_count != 0 && --guard != 0);
+    s->dma_bus_depth--;
 
     if (d->dma_count == 0) {
         if (!d->dma_hold) {

@@ -24,6 +24,8 @@ from PySide6.QtWidgets import QApplication, QProgressBar, QPushButton
 
 from native_dialogs import GameDetailsDialog, SettingsDialog
 from native_ui import MainWindow, STYLE
+from titlebar import (HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT,
+                      HTLEFT, HTMAXBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT)
 
 
 def game(key, name, created, played=0, disc_title=None):
@@ -367,6 +369,120 @@ class LauncherUiTests(unittest.TestCase):
         visible = [dialog for dialog in self.window.dialogs if dialog.isVisible()]
         self.assertEqual(len(visible), 1, 'Enter must activate the focused game once')
         self.assertEqual(visible[0].game['id'], 'm')
+
+    def test_window_controls_fit_compact_header_and_are_keyboard_accessible(self):
+        self.window.resize(900, 650)
+        self.app.processEvents()
+        header = self.window.chrome_header
+        controls = self.window.window_controls
+        self.assertTrue(self.window.windowFlags() & Qt.WindowType.FramelessWindowHint)
+        self.assertEqual(header.y(), 0)
+        targets = [self.window.settings_button, controls.minimize_button,
+                   controls.maximize_button, controls.close_button]
+        for target in targets:
+            with self.subTest(control=target.accessibleName() or target.text()):
+                top_left = target.mapTo(header, QPoint())
+                bottom_right = target.mapTo(header, target.rect().bottomRight())
+                self.assertTrue(header.rect().contains(top_left))
+                self.assertTrue(header.rect().contains(bottom_right))
+                self.assertTrue(target.isVisible())
+                self.assertNotEqual(target.focusPolicy(), Qt.FocusPolicy.NoFocus)
+        for target in targets[1:]:
+            self.assertTrue(target.accessibleName())
+            self.assertTrue(target.toolTip())
+        controls.minimize_button.setFocus()
+        QTest.keyClick(controls.minimize_button, Qt.Key.Key_Tab)
+        self.assertTrue(controls.maximize_button.hasFocus())
+        QTest.keyClick(controls.maximize_button, Qt.Key.Key_Tab)
+        self.assertTrue(controls.close_button.hasFocus())
+
+    def test_window_maximize_restore_and_minimize_keep_library_state(self):
+        self.click_game('m')
+        original_size = self.window.size()
+        controls = self.window.window_controls
+        QTest.mouseClick(controls.maximize_button, Qt.MouseButton.LeftButton)
+        self.assertTrue(self.window.isMaximized())
+        self.assertEqual(controls.maximize_button.accessibleName(), 'Restore window')
+        QTest.keyClick(controls.maximize_button, Qt.Key.Key_Return)
+        self.assertFalse(self.window.isMaximized())
+        self.assertEqual(self.window.size(), original_size)
+        self.assertEqual(controls.maximize_button.accessibleName(), 'Maximize window')
+        QTest.keyClick(controls.minimize_button, Qt.Key.Key_Space)
+        self.assertTrue(self.window.isMinimized())
+        self.window.showNormal()
+        self.assertFalse(self.window.isMinimized())
+        self.assertEqual(self.window.selected_game()['id'], 'm')
+        self.assertFalse(any(call[0] == 'launch' for call in self.lib.calls))
+
+    def test_caption_drag_and_double_click_do_not_launch_or_change_selection(self):
+        header = self.window.chrome_header
+        selected = self.window.selected_game()['id']
+        with patch.object(self.window, 'start_system_move', return_value=True) as move:
+            QTest.mouseClick(header, Qt.MouseButton.LeftButton, pos=QPoint(250, 28))
+        move.assert_called_once()
+        QTest.mouseDClick(header, Qt.MouseButton.LeftButton, pos=QPoint(250, 28))
+        self.assertTrue(self.window.isMaximized())
+        QTest.mouseDClick(header, Qt.MouseButton.LeftButton, pos=QPoint(250, 28))
+        self.assertFalse(self.window.isMaximized())
+        self.assertEqual(self.window.selected_game()['id'], selected)
+        self.assertFalse(any(call[0] == 'launch' for call in self.lib.calls))
+
+    def test_window_hit_regions_preserve_content_controls_and_native_resize(self):
+        width, height = self.window.width(), self.window.height()
+        points = [(QPoint(1, 1), HTTOPLEFT), (QPoint(width // 2, 1), HTTOP),
+                  (QPoint(width - 2, 1), HTTOPRIGHT), (QPoint(1, height // 2), HTLEFT),
+                  (QPoint(width - 2, height // 2), HTRIGHT),
+                  (QPoint(1, height - 2), HTBOTTOMLEFT),
+                  (QPoint(width // 2, height - 2), HTBOTTOM),
+                  (QPoint(width - 2, height - 2), HTBOTTOMRIGHT),
+                  (QPoint(28, 28), HTCAPTION), (QPoint(400, 400), HTCLIENT)]
+        controls = self.window.window_controls
+        for target, expected in [(controls.maximize_button, HTMAXBUTTON),
+                                 (controls.close_button, HTCLIENT),
+                                 (controls.minimize_button, HTCLIENT),
+                                 (self.window.library_nav, HTCLIENT),
+                                 (self.window.settings_button, HTCLIENT)]:
+            points.append((target.mapTo(self.window, target.rect().center()), expected))
+        for point, expected in points:
+            with self.subTest(point=point, expected=expected):
+                self.assertEqual(self.window.hit_test(point), expected)
+        self.window.showMaximized()
+        self.assertEqual(self.window.hit_test(QPoint(1, 1)), HTCAPTION)
+
+    def test_caption_close_respects_pending_action_then_closes(self):
+        self.lib.launch_release.clear()
+        QTest.mouseClick(self.window.spotlight.play_button, Qt.MouseButton.LeftButton)
+        self.wait_until(lambda: any(call[0] == 'launch' for call in self.lib.calls))
+        close = self.window.window_controls.close_button
+        QTest.mouseClick(close, Qt.MouseButton.LeftButton)
+        self.assertTrue(self.window.isVisible())
+        self.assertTrue(self.window.toast.isVisible())
+        self.lib.launch_release.set()
+        self.idle()
+        QTest.mouseClick(close, Qt.MouseButton.LeftButton)
+        self.assertFalse(self.window.isVisible())
+
+    def test_windows_messages_reach_custom_caption_and_resize_regions(self):
+        if sys.platform != 'win32' or self.app.platformName() != 'windows':
+            self.skipTest('Set QT_QPA_PLATFORM=windows to exercise native Win32 messages')
+        import ctypes
+        from ctypes import wintypes
+        user = ctypes.windll.user32
+        user.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user.SendMessageW.restype = ctypes.c_ssize_t
+        user.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+        hwnd = int(self.window.winId())
+        maximum = self.window.window_controls.maximize_button
+        cases = [(QPoint(1, 1), HTTOPLEFT), (QPoint(28, 28), HTCAPTION),
+                 (maximum.mapTo(self.window, maximum.rect().center()), HTMAXBUTTON),
+                 (self.window.settings_button.mapTo(self.window,
+                  self.window.settings_button.rect().center()), HTCLIENT)]
+        for point, expected in cases:
+            native = wintypes.POINT(round(point.x() * self.window.devicePixelRatioF()),
+                                    round(point.y() * self.window.devicePixelRatioF()))
+            user.ClientToScreen(hwnd, ctypes.byref(native))
+            packed = ((native.y & 0xffff) << 16) | (native.x & 0xffff)
+            self.assertEqual(user.SendMessageW(hwnd, 0x84, 0, packed), expected)
 
 
 if __name__ == '__main__':

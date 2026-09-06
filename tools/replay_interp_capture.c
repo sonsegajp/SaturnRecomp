@@ -8,6 +8,7 @@
 #define SDL_MAIN_HANDLED
 #include "../runner/src/vulkan_renderer.c"
 static saturn captured;
+static uint8_t prior_material[VDP1_VRAM_SZ];
 static uint32_t pixels[704*512];
 static saturn_vk_vdp1_op ops[8192],prior[8192];
 int main(int argc,char **argv){
@@ -20,13 +21,30 @@ int main(int argc,char **argv){
  for(unsigned field=first;field<first+12;field++){
   snprintf(path,sizeof path,"%s-%u.bin",argv[1],field);FILE *f=fopen(path,"rb");if(!f)return 2;
   if(fread(&captured,sizeof captured,1,f)!=1)return 2;fclose(f);
+  /* Displayed pixels may predate live VRAM by several fields. Use the
+   * material image captured with that framebuffer, including its Gouraud
+   * tables, instead of reconstructing different wall lighting. */
+  unsigned material_valid=1;
+  snprintf(path,sizeof path,"%s-%u.vram",argv[1],field);f=fopen(path,"rb");
+  if(f) {
+   uint32_t header[2];
+   if(fread(header,sizeof header,1,f)!=1||header[0]!=0x31525653u||
+      fread(captured.vdp1_vram,sizeof captured.vdp1_vram,1,f)!=1)return 2;
+   material_valid=header[1]!=0;fclose(f);
+  } else if(field==first) {
+   fprintf(stderr,"Legacy capture has no draw-time VRAM; reconstructed colors cannot establish native-frame parity.\n");
+  }
   snprintf(path,sizeof path,"%s-%u.ops",argv[1],field);f=fopen(path,"rb");if(!f)return 2;
   unsigned n=fread(ops,sizeof *ops,8192,f);fclose(f);
-  if(n!=lastn||memcmp(ops,prior,n*sizeof *ops))for(unsigned i=0;i<n;i++)queue_vdp1(r,&ops[i]);
+  if(n!=lastn||memcmp(ops,prior,n*sizeof *ops)||
+     memcmp(captured.vdp1_vram,prior_material,sizeof prior_material))
+   for(unsigned i=0;i<n;i++)queue_vdp1(r,&ops[i]);
   memcpy(prior,ops,n*sizeof *ops);lastn=n;
+  memcpy(prior_material,captured.vdp1_vram,sizeof prior_material);
   if(getenv("SATURN_REPLAY_LAYERS")){captured.layer_mask=(unsigned)strtoul(getenv("SATURN_REPLAY_LAYERS"),NULL,0);captured.layer_lock=1;}
   int width,height;vdp2_display_size(&captured,&width,&height);
   if(!saturn_vk_interpolation_begin(r,&captured,width,height,error,sizeof error))return 2;
+  if(!material_valid){r->matched=0;r->history_valid=0;}
   if(!saturn_vk_readback(r,pixels,width,height,error,sizeof error))return 2;
   snprintf(path,sizeof path,"%s-%u-native.png",argv[2],field);png_write(path,pixels,width,height);
   if(argc>3&&atoi(argv[3])==1)r->rotation_pair=0;

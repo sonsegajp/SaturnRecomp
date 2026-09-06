@@ -102,9 +102,9 @@ bool quad_uv(vec2 p, vec2 a, vec2 b, vec2 c, vec2 d, out vec2 uv)
     return triangle_uv(p, a, c, d, vec2(0,0), vec2(1,1), vec2(0,1), uv);
 }
 
-bool line_hit(ivec2 p, ivec2 a, ivec2 b)
+bool line_hit(vec2 p, vec2 a, vec2 b)
 {
-    vec2 ab = vec2(b - a), ap = vec2(p - a);
+    vec2 ab = b - a, ap = p - a;
     float l2 = dot(ab, ab);
     if (l2 < 0.5) return all(equal(p, a));
     float t = clamp(dot(ap, ab) / l2, 0.0, 1.0);
@@ -114,8 +114,8 @@ bool line_hit(ivec2 p, ivec2 a, ivec2 b)
     return dot(vec2(p) - q, vec2(p) - q) <= 0.36;
 }
 
-uint texture_colour(uint chr, uint tw, uint th, uint colr, uint pmod,
-                    uint flip, vec2 uv, out bool transparent)
+uint texture_nearest(uint chr, uint tw, uint th, uint colr, uint pmod,
+                     uint flip, vec2 uv, out bool transparent)
 {
     uint mode = (pmod >> 3) & 7u;
     bool spd = (pmod & 0x40u) != 0u;
@@ -151,6 +151,39 @@ uint texture_colour(uint chr, uint tw, uint th, uint colr, uint pmod,
         }
     }
     return value;
+}
+
+vec3 texture_rgb(uint value)
+{
+    return vec3(value & 31u, (value >> 5) & 31u, (value >> 10) & 31u);
+}
+
+uint texture_colour(uint chr, uint tw, uint th, uint colr, uint pmod,
+                    uint flip, vec2 uv, out bool transparent)
+{
+    uint nearest = texture_nearest(chr, tw, th, colr, pmod, flip, uv, transparent);
+    uint mode = (pmod >> 3) & 7u;
+    /* Indexed framebuffer values carry VDP2 priority and colour-calculation
+     * codes. Interpolate only actual RGB555 colours, including RGB CLUT
+     * entries, and preserve nearest sampling across transparent boundaries. */
+    if (regs.d[271] == 0u || transparent || (nearest & 0x8000u) == 0u ||
+        (mode != 1u && mode < 5u) || tw == 0u || th == 0u)
+        return nearest;
+    vec2 size = vec2(tw, th);
+    vec2 texel = clamp(uv, vec2(0.0), vec2(1.0)) * size - 0.5;
+    vec2 first = floor(texel), weight = fract(texel);
+    uint samples[4];
+    for (uint i = 0u; i < 4u; ++i) {
+        vec2 at = clamp(first + vec2(i & 1u, i >> 1u), vec2(0.0), size - 1.0);
+        bool empty;
+        samples[i] = texture_nearest(chr, tw, th, colr, pmod, flip,
+                                     (at + 0.5) / size, empty);
+        if (empty || (samples[i] & 0x8000u) == 0u) return nearest;
+    }
+    vec3 top = mix(texture_rgb(samples[0]), texture_rgb(samples[1]), weight.x);
+    vec3 bottom = mix(texture_rgb(samples[2]), texture_rgb(samples[3]), weight.x);
+    uvec3 rgb = uvec3(clamp(floor(mix(top, bottom, weight.y) + 0.5), 0.0, 31.0));
+    return 0x8000u | rgb.r | (rgb.g << 5u) | (rgb.b << 10u);
 }
 
 uint gouraud(uint base, uint grda, vec2 uv)
@@ -196,12 +229,16 @@ uint colour_calc(uint src, uint dst, uint pmod, out bool write_pixel)
 void main()
 {
     uvec2 up = gl_GlobalInvocationID.xy;
-    if (up.x >= FB_W || up.y >= FB_H) return;
-    ivec2 p = ivec2(up);
-    uint pix = up.y * FB_W + up.x;
-    uint c0 = fb.d[pix], c1 = fb.d[FB_PIXELS + pix];
-    uint m0 = meshfb.d[pix], m1 = meshfb.d[FB_PIXELS + pix];
-    uint tile = (up.y >> 4) * 32u + (up.x >> 4);
+    uint scale = clamp(regs.d[270], 1u, 8u);
+    uint stride = FB_W * scale, bank_pixels = FB_PIXELS * scale * scale;
+    if (up.x >= stride || up.y >= FB_H * scale) return;
+    uvec2 logical = up / scale;
+    ivec2 p = ivec2(logical);
+    vec2 samplep = vec2(up) / float(scale);
+    uint pix = up.y * stride + up.x, logical_pix = logical.y * FB_W + logical.x;
+    uint c0 = fb.d[pix], c1 = fb.d[bank_pixels + pix];
+    uint m0 = meshfb.d[pix], m1 = meshfb.d[bank_pixels + pix];
+    uint tile = (logical.y >> 4) * 32u + (logical.x >> 4);
     uint first = tiles.d[tile * 2u], count = tiles.d[tile * 2u + 1u];
 
     for (uint ti = 0u; ti < count; ++ti) {
@@ -228,14 +265,14 @@ void main()
             uint value = ops.d[z + 16u];
             uint firstpix = off >> 1;
             uint lastpix = (off + size - 1u) >> 1;
-            if (pix >= firstpix && pix <= lastpix) {
+            if (logical_pix >= firstpix && logical_pix <= lastpix) {
                 if (size == 1u) {
                     if ((off & 1u) == 0u) dst = (dst & 0x00ffu) | ((value & 0xffu) << 8);
                     else                  dst = (dst & 0xff00u) |  (value & 0xffu);
                 } else if (size == 2u) {
                     dst = value & 0xffffu;
                 } else {
-                    dst = pix == firstpix ? ((value >> 16) & 0xffffu)
+                    dst = logical_pix == firstpix ? ((value >> 16) & 0xffffu)
                                           :  (value & 0xffffu);
                 }
                 mdst = 0u;
@@ -250,12 +287,12 @@ void main()
                 if (outside != ((pmod & 0x200u) != 0u)) continue;
             }
             if (kind == 2u) {
-                hit = line_hit(p, ivec2(vertex_xy(z,2u)),
-                                  ivec2(vertex_xy(z,4u)));
+                hit = line_hit(samplep, vec2(ivec2(vertex_xy(z,2u))),
+                                       vec2(ivec2(vertex_xy(z,4u))));
                 src = ops.d[z + 13u];
             } else if (kind == 1u) {
                 vec2 uv;
-                hit = quad_uv(vec2(p),
+                hit = quad_uv(samplep,
                     vertex_xy(z,2u),
                     vertex_xy(z,4u),
                     vertex_xy(z,6u),
@@ -268,9 +305,9 @@ void main()
                         vec2 a=vertex_xy(z,2u+edge*2u),b=vertex_xy(z,2u+((edge+1u)&3u)*2u);
                         vec2 ab=b-a;float len=dot(ab,ab);
                         if(len<0.00001)continue;
-                        float t=dot(vec2(p)-a,ab)/len;
+                        float t=dot(samplep-a,ab)/len;
                         if(t<0.0||t>1.0)continue;
-                        vec2 q=a+ab*t,d=vec2(p)-q;
+                        vec2 q=a+ab*t,d=samplep-q;
                         if(dot(d,d)>0.25001)continue;
                         hit=quad_uv(q,vertex_xy(z,2u),vertex_xy(z,4u),vertex_xy(z,6u),vertex_xy(z,8u),uv);
                         if(hit)break;
@@ -312,6 +349,6 @@ void main()
         }
     }
 
-    fb.d[pix] = c0; fb.d[FB_PIXELS + pix] = c1;
-    meshfb.d[pix] = m0; meshfb.d[FB_PIXELS + pix] = m1;
+    fb.d[pix] = c0; fb.d[bank_pixels + pix] = c1;
+    meshfb.d[pix] = m0; meshfb.d[bank_pixels + pix] = m1;
 }

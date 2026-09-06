@@ -29,6 +29,7 @@ PALETTE = {
     'cyan': '#70dfeb',
     'orange': '#f6a46c',
     'metal': '#bac9d2',
+    'caption_close': '#a94d5c',
 }
 
 SPACE = {'xs': 4, 'sm': 8, 'md': 12, 'lg': 16, 'xl': 24, 'xxl': 32}
@@ -40,6 +41,8 @@ METRICS = {
     'cover_gap': 20,
     'control_height': 36,
     'radius': 5,
+    'caption_button_width': 40,
+    'resize_grip': 6,
 }
 TYPE = {
     'body': (12, QFont.Weight.Normal),

@@ -1863,6 +1863,7 @@ void vdp2_render(saturn *s, uint32_t *out, int w, int h, int force_on)
 
     const int sp_xshift = (w > 512) ? 1 : 0;
     const int sp_yshift = (VR(0) & 0xc0u) == 0xc0u;
+    const int rot_xshift = (VR(0) & 2u) != 0;
 
     /* A window set with nothing enabled suppresses nothing, and that is the
      * common case -- most frames of most games enable no windows at all. Clear
@@ -2036,12 +2037,17 @@ decode_mesh:
             if (wl_bg[n]) win_calc(s, &ws_bg[n], y, w, sp_winbit, win_bg[n]);
         if (wl_cc) win_calc(s, &ws_cc, y, w, sp_winbit, win_cc);
 
-        /* Per-line rotation state (Ymir vdp_renderer_sw.cpp): the screen-space
-         * start of this line and its per-pixel increment. */
+        /* Rotation advances once per native H-counter dot and field scanline.
+         * High-resolution output repeats each rotation dot horizontally;
+         * double-density interlace repeats the field's rotation line vertically.
+         * Unlike normal backgrounds, RBG does not double its vertical increment.
+         * Ymir VDP2CalcRotationParameterTables/VDP2DrawRotationScrollBG use these
+         * native counters before expanding the layer to the output resolution. */
+        const int rot_y = y >> sp_yshift;
         int32_t rXsp = 0, rYsp = 0;
         if (rp.present) {
-            int32_t xst = rp.Xst + rp.dXst * y;
-            int32_t yst = rp.Yst + rp.dYst * y;
+            int32_t xst = rp.Xst + rp.dXst * rot_y;
+            int32_t yst = rp.Yst + rp.dYst * rot_y;
             rXsp = (int32_t)(((int64_t)rp.A * (xst - (rp.Px << 10)) +
                               (int64_t)rp.B * (yst - (rp.Py << 10)) +
                               (int64_t)rp.C * (rp.Zst - (rp.Pz << 10))) >> 10);
@@ -2053,14 +2059,14 @@ decode_mesh:
         int32_t rcoeff[704] = {0};
         uint8_t rtransparent[704] = {0};
         if (rp.coeff_enable) {
-            uint32_t ka = rp.KA + (uint32_t)(rp.dKAst * y);
+            uint32_t ka = rp.KA + (uint32_t)(rp.dKAst * rot_y);
             int32_t value = 0;
             uint8_t transparent = 1;
             rot_coefficient(s, &rp, ka, &value, &transparent);
             for (int x = 0; x < w; x++) {
                 rcoeff[x] = value;
                 rtransparent[x] = transparent;
-                if (rp.coeff_per_dot) {
+                if (rp.coeff_per_dot && (!rot_xshift || (x & 1))) {
                     ka += (uint32_t)rp.dKAx;
                     rot_coefficient(s, &rp, ka, &value, &transparent);
                 }
@@ -2147,8 +2153,9 @@ decode_mesh:
                     int rx = x, ry = y;
                     if (rp.present) {
                         if (rtransparent[x]) continue;
-                        int32_t sx = rXsp + rp.incX * x;
-                        int32_t sy = rYsp + rp.incY * x;
+                        const int rot_x = x >> rot_xshift;
+                        int32_t sx = rXsp + rp.incX * rot_x;
+                        int32_t sy = rYsp + rp.incY * rot_x;
                         int64_t kx = rp.kx, ky = rp.ky;
                         int32_t xp = rp.Xp;
                         if (rp.coeff_enable) {

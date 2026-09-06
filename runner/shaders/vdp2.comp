@@ -300,10 +300,24 @@ bool suppressed(uint wb,int x,int y,bool spwin,bool allowsp)
     return v;
 }
 
-vec2 rotate_coord_at(ivec2 p,bool previous,out bool visible)
+vec2 rotate_coord_at(ivec2 p,vec2 fraction,bool previous,out bool visible)
 {
     rotation_bank=previous?1u:(regs.d[268]!=0u?2u:0u);
     visible=true;
+    /* RBG parameters and coefficient addresses advance at native H-counter
+     * and field-line rates. High-resolution/interlaced output duplicates
+     * their samples; it must not run the rotation transform twice as fast. */
+    uint tvmd=vr(0x00u);
+    vec2 sample_position=vec2(p)+fraction;
+    if((tvmd&2u)!=0u)p.x>>=1;
+    if((tvmd&0xc0u)==0xc0u)p.y>>=1;
+    /* At native resolution keep the exact duplicated counter samples. At
+     * higher render scales evaluate the plane between those native samples;
+     * table/visibility fetches still use the hardware's integer counters. */
+    if(regs.d[269]>1u) {
+        if((tvmd&2u)!=0u)sample_position.x*=0.5;
+        if((tvmd&0xc0u)==0xc0u)sample_position.y*=0.5;
+    } else sample_position=vec2(p);
     uint base=((((vr(0xbc)&7u)<<16)|vr(0xbe))*2u)&0xfff7cu;
     float Xst=float(sextract(v32(base+0x00u),6,23)),Yst=float(sextract(v32(base+0x04u),6,23)),Zst=float(sextract(v32(base+0x08u),6,23));
     float dXst=float(sextract(v32(base+0x0cu),6,13)),dYst=float(sextract(v32(base+0x10u),6,13));
@@ -353,21 +367,22 @@ vec2 rotate_coord_at(ivec2 p,bool previous,out bool visible)
         if(mode==0u||mode==2u)ky=coeff;
         if(mode==3u)Xp=coeff*4.0;
     }
-    float xs=Xst+dXst*float(p.y),ys=Yst+dYst*float(p.y);
+    float xs=Xst+dXst*sample_position.y,ys=Yst+dYst*sample_position.y;
     float rx=(A*(xs-Px*1024.0)+B*(ys-Py*1024.0)+C*(Zst-Pz*1024.0))/1024.0;
     float ry=(D*(xs-Px*1024.0)+E*(ys-Py*1024.0)+F*(Zst-Pz*1024.0))/1024.0;
     float ix=(A*dX+B*dY)/1024.0,iy=(D*dX+E*dY)/1024.0;
     rotation_bank=0u;
-    return vec2(((kx*(rx+ix*float(p.x))/65536.0)+Xp)/1024.0,((ky*(ry+iy*float(p.x))/65536.0)+Yp)/1024.0);
+    return vec2(((kx*(rx+ix*sample_position.x)/65536.0)+Xp)/1024.0,((ky*(ry+iy*sample_position.x)/65536.0)+Yp)/1024.0);
 }
 
 /* Interpolate the inverse screen-to-plane mapping using each field's own
  * coefficient table. Never interpolate texture data, palette entries or
  * visibility bits. Discontinuous mappings keep the current field. */
-ivec2 rotate_coord(ivec2 p,out bool visible) {
-    vec2 current=rotate_coord_at(p,false,visible);
+ivec2 rotate_coord(vec2 samplep,out bool visible) {
+    ivec2 p=ivec2(samplep);vec2 fraction=samplep-vec2(p);
+    vec2 current=rotate_coord_at(p,fraction,false,visible);
     if(regs.d[268]!=0u && visible) {
-        bool oldVisible;vec2 old=rotate_coord_at(p,true,oldVisible);
+        bool oldVisible;vec2 old=rotate_coord_at(p,fraction,true,oldVisible);
         if(oldVisible && all(lessThan(abs(current-old),vec2(256.0))))
             current=mix(old,current,clamp(uintBitsToFloat(regs.d[267]),0.0,1.0));
     }
@@ -387,20 +402,25 @@ void push_layer(int layer,int pri,vec3 col,
 
 void main()
 {
-    ivec2 p=ivec2(gl_GlobalInvocationID.xy);int W=int(regs.d[256]),H=int(regs.d[257]);
-    if(p.x>=W||p.y>=H)return;
+    ivec2 up=ivec2(gl_GlobalInvocationID.xy);int W=int(regs.d[256]),H=int(regs.d[257]);
+    uint scale=clamp(regs.d[269],1u,8u),v1scale=clamp(regs.d[270],1u,8u);
+    if(up.x>=W*int(scale)||up.y>=H*int(scale))return;
+    ivec2 p=up/int(scale);vec2 sample_position=vec2(up)/float(scale);
+    uint v1stride=512u*v1scale,v1pixels=FB_PIXELS*v1scale*v1scale;
     if(regs.d[261]!=0u){
-        uint sx=uint(W>512?p.x>>1:p.x),sy=uint(p.y),display=regs.d[258]&1u;
-        uint raw=(sx<512u&&sy<256u)?fb.d[display*FB_PIXELS+sy*512u+sx]:0u;
-        imageStore(scanout,p,vec4(rgb555(raw),1.0));return;
+        uvec2 samplev=uvec2(up)*v1scale/scale;
+        uint sx=W>512?samplev.x>>1:samplev.x,sy=samplev.y,display=regs.d[258]&1u;
+        uint raw=(sx<v1stride&&sy<256u*v1scale)?fb.d[display*v1pixels+sy*v1stride+sx]:0u;
+        imageStore(scanout,up,vec4(rgb555(raw),1.0));return;
     }
     uint bka=((((vr(0xac)&7u)<<16)|vr(0xae))*2u)+((vr(0xac)&0x8000u)!=0u?uint(p.y)*2u:0u);
     vec3 back=rgb555(v16(bka));uint k0=1u,lmask=regs.d[260];int l0=5,l1=5,l2=5;vec3 c0=back,c1=back,c2=back;uint k1=1u,k2=1u;
     uint sptype=vr(0xe0)&15u;bool spclmd=(vr(0xe0)&0x20u)!=0u;uint display=regs.d[258]&1u;
-    uint spx=uint(W>512?p.x>>1:p.x);
-    uint spy=uint(p.y)>>(((vr(0)&0xc0u)==0xc0u)?1u:0u);
-    uint fi=display*FB_PIXELS+spy*512u+spx;
-    uint sp=(spx<512u&&spy<256u)?fb.d[fi]:0u,mp=(spx<512u&&spy<256u)?meshfb.d[fi]:0u;
+    uvec2 samplev=uvec2(up)*v1scale/scale;
+    uint spx=W>512?samplev.x>>1:samplev.x;
+    uint spy=samplev.y>>(((vr(0)&0xc0u)==0xc0u)?1u:0u);
+    uint fi=display*v1pixels+spy*v1stride+spx;
+    uint sp=(spx<v1stride&&spy<256u*v1scale)?fb.d[fi]:0u,mp=(spx<v1stride&&spy<256u*v1scale)?meshfb.d[fi]:0u;
     const uint cmask[16]=uint[16](0x7ff,0x7ff,0x7ff,0x7ff,0x3ff,0x7ff,0x3ff,0x1ff,0x7f,0x3f,0x3f,0x3f,0xff,0xff,0xff,0xff);
     const int pshift[16]=int[16](14,13,14,13,13,12,12,12,7,7,6,-1,7,7,6,-1);
     const uint pbits[16]=uint[16](2,3,1,2,2,3,3,3,1,1,2,0,1,1,2,0);
@@ -432,7 +452,7 @@ void main()
         if(d.opaque!=0){dotcc[n]=dot_color_calc(n,d);uint mode=(vr(0xea)>>uint(n*2))&3u;if(mode==1u)pri=(pri&~1)|d.sp;else if(mode==2u&&d.sp!=0&&d.code>=0){uint bank=(vr(0x24)>>uint(n))&1u;pri=(pri&~1)|int((vr(0x26)>>(bank*8u+uint(d.code)))&1u);}push_layer(n,pri,d.c,k0,l0,c0,k1,l1,c1,k2,l2,c2);}
     }
     int rpri=int(vr(0xfc)&7u);if((bgon&0x10u)!=0u&&rpri!=0&&(lmask&0x10u)!=0u&&((vr(0x2a)&0x200u)==0u)){
-        uint wb=vr(0xd4)&0xffu;if(!suppressed(wb,p.x,p.y,spwin,true)){ivec2 samplep=p;if((mzctl&0x10u)!=0u)samplep-=ivec2(samplep.x%mzw,samplep.y%mzh);bool visible;ivec2 rp=rotate_coord(samplep,visible);if(visible){Dot d=cell_dot(4,true,rp);if(d.opaque!=0){dotcc[4]=dot_color_calc(4,d);push_layer(4,rpri,d.c,k0,l0,c0,k1,l1,c1,k2,l2,c2);}}}
+        uint wb=vr(0xd4)&0xffu;if(!suppressed(wb,p.x,p.y,spwin,true)){vec2 samplep=sample_position;if((mzctl&0x10u)!=0u)samplep=vec2(p-ivec2(p.x%mzw,p.y%mzh));bool visible;ivec2 rp=rotate_coord(samplep,visible);if(visible){Dot d=cell_dot(4,true,rp);if(d.opaque!=0){dotcc[4]=dot_color_calc(4,d);push_layer(4,rpri,d.c,k0,l0,c0,k1,l1,c1,k2,l2,c2);}}}
     }
     bool sprite_masked=suppressed(vr(0xd4)>>8,p.x,p.y,false,false);
     bool sp_pushed=false;if((lmask&0x20u)!=0u&&spnormal&&sppri!=0u&&!spwin&&!sprite_masked){push_layer(6,int(sppri),spcol,k0,l0,c0,k1,l1,c1,k2,l2,c2);sp_pushed=true;}
@@ -461,5 +481,5 @@ void main()
     }
     colour=apply_offset(colour,l0);
     if(mp!=0u){vec3 mc=(spclmd&&(mp&0x8000u)!=0u)?rgb555(mp):cram_colour(((vr(0xe6)>>4)&7u)*256u+(mp&cmask[sptype]));colour=blend(mc,colour,16u,false);}
-    imageStore(scanout,p,vec4(colour,1.0));
+    imageStore(scanout,up,vec4(colour,1.0));
 }

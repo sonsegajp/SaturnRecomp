@@ -110,6 +110,12 @@ $BUS_TEST_SRCS = @('runner/src/bus.c','runner/src/scu_dsp.c','runner/src/sh2_int
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/sh2_waitloop.exe tests/sh2_waitloop.c @BUS_TEST_SRCS
 if ($LASTEXITCODE -ne 0) { throw "sh2_waitloop build failed" }
 
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/sh2_cache.exe tests/sh2_cache.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "sh2_cache build failed" }
+
+gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/sound_bus_timing.exe tests/sound_bus_timing.c @BUS_TEST_SRCS
+if ($LASTEXITCODE -ne 0) { throw "sound_bus_timing build failed" }
+
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/bus_alias.exe tests/bus_alias.c @BUS_TEST_SRCS
 if ($LASTEXITCODE -ne 0) { throw "bus_alias build failed" }
 gcc @CFLAGS -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common -o tests/cd_bus.exe tests/cd_bus.c @BUS_TEST_SRCS
@@ -126,6 +132,16 @@ if (-not (Test-Path $glslc)) {
 if ($LASTEXITCODE -ne 0) { throw "VDP1 Vulkan shader build failed" }
 & $glslc runner\shaders\vdp2.comp -O -o runner\shaders\vdp2.comp.spv
 if ($LASTEXITCODE -ne 0) { throw "VDP2 Vulkan shader build failed" }
+foreach ($shader in @('postprocess.comp','game_overlay.vert','game_overlay.frag')) {
+    & $glslc "runner/shaders/$shader" -O -o "runner/shaders/$shader.spv"
+    if ($LASTEXITCODE -ne 0) { throw "$shader build failed" }
+}
+gcc @CFLAGS -Irunner/include -o tests/runtime_settings.exe tests/runtime_settings.c runner/src/runtime_settings.c
+if ($LASTEXITCODE -ne 0) { throw 'Runtime settings test build failed' }
+gcc @CFLAGS -Irunner/include -o tests/game_overlay.exe tests/game_overlay.c runner/src/game_overlay.c runner/src/runtime_settings.c -lSDL2
+if ($LASTEXITCODE -ne 0) { throw 'Game overlay test build failed' }
+gcc @CFLAGS -flto -fwhole-program -Irunner/include -Irecompiler/include -Iexternal/sh2-recomp-core/common tests/window_audio.c runner/src/sound.c -lSDL2 -lm -o tests/window_audio.exe
+if ($LASTEXITCODE -ne 0) { throw 'Host playback audio test build failed' }
 
 $env:SATURN_MINGW_BIN = $mingwBin
 & powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_runtime.ps1 -Profile $pgoMode -ProfileDir $pgoDir -ObjectDir $runtimeObjects -Output runner/saturnwin.exe -BootOutput runner/saturnboot.exe

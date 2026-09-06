@@ -16,15 +16,15 @@
  *
  * Method: build a random straight-line program from the opcodes the fast path
  * claims, run it from an identical seeded machine state through both engines,
- * and compare every architectural register plus the scratch memory window.
+ * and compare every architectural register, elapsed cycles and the scratch
+ * memory window.
  * Branches are excluded here on purpose -- they make the two engines'
  * instruction accounting differ (sh2_step returns 2 for a delayed branch) and
  * are pinned by hand in sh2_semantics.c.
  *
- * Addressing is constrained rather than masked: r13/r14/GBR are dedicated
- * pointer registers seeded into a scratch page and never used as ALU
- * destinations, so every generated access lands in WRAM-H no matter what the
- * arithmetic does to the other registers.
+ * Most addressing uses r13/r14/GBR seeded into a scratch page. Occasional
+ * arbitrary bases and pointer clobbers also exercise aliases and MMIO,
+ * including the slower sound bus.
  */
 #include "saturn.h"
 #include "sh2_isa.h"
@@ -45,8 +45,7 @@ static saturn g;
 #define MEM_LEN  0x2000u
 #define PROG_MAX 24
 
-/* Dedicated pointer registers. Never an ALU destination, so every memory
- * access stays inside the scratch page. */
+/* Preferred pointer registers; occasional clobbers cover overlapping operands. */
 #define PA 13
 #define PB 14
 
@@ -90,6 +89,7 @@ typedef struct {
 
 typedef struct {
     uint32_t r[16], mach, macl, pr, gbr, sr, pc;
+    uint64_t cycles;
     uint8_t  mem[MEM_LEN];
 } state;
 
@@ -181,6 +181,7 @@ static void snap(state *st, saturn *g, sh2 *c)
     for (i = 0; i < 16; i++) st->r[i] = c->r[i];
     st->mach = c->mach; st->macl = c->macl; st->pr = c->pr;
     st->gbr = c->gbr;   st->sr = c->sr;     st->pc = c->pc;
+    st->cycles = c->cycles;
     memcpy(st->mem, &g->wram_h[MEM_LO - 0x06000000u], MEM_LEN);
 }
 
@@ -198,7 +199,7 @@ static void boot(saturn *g, const prog *pr)
 }
 
 /* What differs between two snapshots, as a short human-readable string. */
-static const char *diff_of(const state *a, const state *b, uint32_t *sa, uint32_t *sb)
+static const char *diff_of(const state *a, const state *b, uint64_t *sa, uint64_t *sb)
 {
     static char buf[16];
     int i;
@@ -211,6 +212,7 @@ static const char *diff_of(const state *a, const state *b, uint32_t *sa, uint32_
     if (a->gbr  != b->gbr)  { *sa = a->gbr;  *sb = b->gbr;  return "gbr";  }
     if (a->sr   != b->sr)   { *sa = a->sr;   *sb = b->sr;   return "sr";   }
     if (a->pc   != b->pc)   { *sa = a->pc;   *sb = b->pc;   return "pc";   }
+    if (a->cycles != b->cycles) { *sa = a->cycles; *sb = b->cycles; return "cycles"; }
     if (memcmp(a->mem, b->mem, MEM_LEN) != 0) {
         uint32_t o = 0;
         while (o < MEM_LEN && a->mem[o] == b->mem[o]) o++;
@@ -234,11 +236,16 @@ static void lockstep(const prog *pr)
     boot(&gb, pr);
 
     for (i = 0; i < pr->n; i++) {
-        uint32_t va = 0, vb = 0;
+        uint64_t va = 0, vb = 0;
         const char *what;
         char txt[64];
 
         if (!sh2_step(&ga.master)) break;
+        /* This is instruction lockstep, not successive one-clock scheduler
+         * slices. Give the fast engine a fresh budget after the previous
+         * instruction's full cost, including any sound-bus wait states.
+         * Keep cycles cumulative and compare them to catch timing defects. */
+        gb.master.run_target = gb.master.cycles;
         sh2_run(&gb.master, 1);
 
         snap(&a, &ga, &ga.master);
@@ -248,8 +255,9 @@ static void lockstep(const prog *pr)
 
         if (++fails > 10) return;
         if (!sh2_format(pr->ops[i], CODE + (uint32_t)i * 2u, txt)) strcpy(txt, "?");
-        printf("  FAIL op %d/%d  %04X  %-24s %s: step=%08X fast=%08X\n",
-               i + 1, pr->n, pr->ops[i], txt, what, va, vb);
+        printf("  FAIL op %d/%d  %04X  %-24s %s: step=%08llX fast=%08llX\n",
+               i + 1, pr->n, pr->ops[i], txt, what,
+               (unsigned long long)va, (unsigned long long)vb);
         {
             int k;
             printf("        context:");

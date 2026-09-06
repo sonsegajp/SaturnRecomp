@@ -13,11 +13,22 @@ if (-not $SkipRuntime -and -not $ToolsOnly) {
     if ($LASTEXITCODE) { throw 'VDP1 shader build failed' }
     & "$mingw/glslc.exe" runner/shaders/vdp2.comp -O -o runner/shaders/vdp2.comp.spv
     if ($LASTEXITCODE) { throw 'VDP2 shader build failed' }
+    foreach ($shader in @('postprocess.comp','game_overlay.vert','game_overlay.frag')) {
+        & "$mingw/glslc.exe" "runner/shaders/$shader" -O -o "runner/shaders/$shader.spv"
+        if ($LASTEXITCODE) { throw "$shader build failed" }
+    }
 }
 & "$mingw/gcc.exe" -O2 -std=c11 -Irecompiler/include launcher/import_disc.c recompiler/src/disc.c -o out/launcher-tools/saturn-import.exe
 if ($LASTEXITCODE) { throw 'Disc importer build failed' }
 & "$mingw/gcc.exe" -O2 -std=c11 -municode -mwindows launcher/game_entry.c -o out/launcher-tools/saturn-game.exe
 if ($LASTEXITCODE) { throw 'Game executable build failed' }
+# disc.c loads this decoder dynamically for CUE sheets with MP3 CD-audio tracks.
+# Keep it beside the importer even in a ToolsOnly/source build with a clean PATH.
+$mpg123 = Join-Path $mingw 'libmpg123-0.dll'
+if (-not (Test-Path -LiteralPath $mpg123)) {
+    throw 'MP3 CD-audio decoder missing. Install mingw-w64-x86_64-mpg123 in MSYS2.'
+}
+Copy-Item -LiteralPath $mpg123 -Destination out/launcher-tools/libmpg123-0.dll -Force
 if ($ToolsOnly) { exit 0 }
 & $Python -c 'from PySide6 import QtCore, QtGui, QtWidgets; import PyInstaller, PIL'
 if ($LASTEXITCODE) { throw 'Install launcher/requirements.txt with Python before packaging.' }
@@ -30,6 +41,7 @@ $bundleArgs = @('--noconfirm', '--clean', '--windowed', '--onedir', '--name', 'S
     '--add-data', 'assets/saturnrecomp-logo.png;assets',
     '--add-data', 'runner/shaders/*.spv;runtime/shaders',
     '--add-binary', 'runner/saturnwin.exe;runtime', '--add-binary', "$mingw/SDL2.dll;runtime",
+    '--add-binary', 'out/launcher-tools/libmpg123-0.dll;runtime',
     '--add-binary', 'out/launcher-tools/saturn-import.exe;runtime',
     '--add-binary', 'out/launcher-tools/saturn-game.exe;runtime',
     '--exclude-module', 'PyQt5', '--exclude-module', 'PyQt6', '--exclude-module', 'PySide2',

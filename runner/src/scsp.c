@@ -204,11 +204,14 @@ static void scsp_update_irq(saturn *s)
     act  = (uint16_t)(pend & en);
 
     for (i = 0; i < 11; i++) {
-        int lvl;
+        int lvl, level_bit = i < 7 ? i : 7;
         if (!(act & (1u << i))) continue;
-        lvl = ((s->scsp_reg[R_SCILV0 >> 1] >> i) & 1)
-            | (((s->scsp_reg[R_SCILV1 >> 1] >> i) & 1) << 1)
-            | (((s->scsp_reg[R_SCILV2 >> 1] >> i) & 1) << 2);
+        /* SCILV has eight source-level bits. Timer B, timer C, MIDI-out
+         * and the sample interrupt share bit 7, even though their pending
+         * and enable bits remain separate. */
+        lvl = ((s->scsp_reg[R_SCILV0 >> 1] >> level_bit) & 1)
+            | (((s->scsp_reg[R_SCILV1 >> 1] >> level_bit) & 1) << 1)
+            | (((s->scsp_reg[R_SCILV2 >> 1] >> level_bit) & 1) << 2);
         if (lvl > best) best = lvl;
     }
     m68k_set_irq(&s->sound_cpu, best, -1);
@@ -962,9 +965,10 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
         if (l > 32767 || l < -32768 || r > 32767 || r < -32768) mix_clip++;
         if (++mix_n >= 44100u) {
             int q;
-            printf("[mix] cy=%llu preclip_peak=%d clip=%u/44100 MVOL=%X",
+            printf("[mix] cy=%llu preclip_peak=%d clip=%u/44100 MVOL=%X DAC18B=%u",
                    (unsigned long long)s->master.cycles, mix_pre_peak,
-                   mix_clip, s->scsp_reg[0x400u >> 1] & 0xFu);
+                   mix_clip, s->scsp_reg[0x400u >> 1] & 0xFu,
+                   (s->scsp_reg[0x400u >> 1] >> 8) & 1u);
             for (q = 0; q < 32; q++) {
                 if (mix_slot_peak[q] < 6000u) continue;
                 {
@@ -984,6 +988,14 @@ void scsp_render(saturn *s, int16_t *left, int16_t *right)
     if (l < -32768) l = -32768;
     if (r >  32767) r =  32767;
     if (r < -32768) r = -32768;
+    /* DAC18B expands the saturated 16-bit mix to the DAC's 18-bit serial
+     * format. Match Ymir's SCSP output callback: expansion happens after
+     * saturation, and the 16-bit host interface retains the low 16 bits.
+     * Use unsigned arithmetic so expanding a negative sample is defined. */
+    if (mvol_reg & 0x0100u) {
+        l = (int16_t)(uint16_t)((uint32_t)l << 2u);
+        r = (int16_t)(uint16_t)((uint32_t)r << 2u);
+    }
     *left  = (int16_t)l;
     *right = (int16_t)r;
 

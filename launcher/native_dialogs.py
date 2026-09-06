@@ -159,7 +159,7 @@ class SettingsDialog(NativeDialog):
         self.interpolation.toggled.connect(self.change_interpolation)
         layout.addWidget(self.interpolation)
         layout.addSpacing(SPACE['sm'])
-        layout.addWidget(copy_label('Adds intermediate frames at the original game speed.\nApplies to your next launch. Press F2 to toggle during play.'))
+        layout.addWidget(copy_label('Adds intermediate frames at the original game speed.\nPress F1 during play to choose the target rate and graphics settings.\nF2 toggles interpolation at your selected rate.'))
         layout.addSpacing(SPACE['lg'])
         layout.addWidget(rule())
         layout.addSpacing(SPACE['lg'])
@@ -222,14 +222,14 @@ class SettingsDialog(NativeDialog):
         shortcuts = QGridLayout()
         shortcuts.setHorizontalSpacing(SPACE['lg'])
         shortcuts.setVerticalSpacing(SPACE['sm'])
-        for row, (key, action, second_key, second_action) in enumerate((
-            ('Esc', 'Close game', 'Space', 'Pause / resume'),
-            ('F2', '120 Hz on / off', 'F', 'Step while paused'),
+        for index, (key, action) in enumerate((
+            ('F1', 'Game settings'), ('Space', 'Pause / resume'),
+            ('F2', 'Interpolation on / off'), ('F', 'Step while paused'),
+            ('Esc', 'Close panel / game'),
         )):
-            shortcuts.addWidget(keycap(key), row, 0)
-            shortcuts.addWidget(label(action, 'muted'), row, 1)
-            shortcuts.addWidget(keycap(second_key), row, 2)
-            shortcuts.addWidget(label(second_action, 'muted'), row, 3)
+            row, column = divmod(index, 2)
+            shortcuts.addWidget(keycap(key), row, column * 2)
+            shortcuts.addWidget(label(action, 'muted'), row, column * 2 + 1)
         shortcuts.setColumnStretch(1, 1)
         shortcuts.setColumnStretch(3, 1)
         layout.addLayout(shortcuts)
@@ -244,6 +244,9 @@ class SettingsDialog(NativeDialog):
         self.bios_name.setText(name)
         self.bios_name.setToolTip(bios or 'Choose your Saturn BIOS to import and play games.')
         if self.interpolation.isEnabled():
+            target = settings.get('target_hz', 120)
+            self.interpolation.setText(f'Enable {target} Hz presentation')
+            self.interpolation.setAccessibleName(f'Enable experimental {target} Hz presentation')
             self.interpolation.blockSignals(True)
             self.interpolation.setChecked(bool(settings.get('interpolation')))
             self.interpolation.blockSignals(False)

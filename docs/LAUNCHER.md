@@ -23,7 +23,7 @@ the default renderer and 120 Hz presentation.
 In the **MSYS2 MINGW64** terminal, install the build dependencies:
 
 ```sh
-pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-SDL2 mingw-w64-x86_64-vulkan-headers mingw-w64-x86_64-vulkan-loader mingw-w64-x86_64-shaderc
+pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-SDL2 mingw-w64-x86_64-mpg123 mingw-w64-x86_64-vulkan-headers mingw-w64-x86_64-vulkan-loader mingw-w64-x86_64-shaderc
 ```
 
 Then, in **PowerShell**, from the repository root:
@@ -36,6 +36,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_launcher.ps1
 
 The build compiles the shared runtime, Vulkan shaders, disc importer and game
 entry point, then packages `launcher/app.py` and Qt into the desktop application.
+It includes `libmpg123-0.dll` beside the importer and synchronizes it beside
+the library's shared runtime, so MP3 CD-audio tracks work without MSYS2 on the
+player's computer.
 If MinGW is installed elsewhere, set `$env:SATURN_MINGW_BIN` to its
 `mingw64/bin` directory first.
 Use `-Python <path-to-python.exe>` with the build script if the packaging
@@ -68,6 +71,8 @@ The same steps apply to other supported Saturn discs; no hand-written
 not supported. A plain data ISO does not include separate CD audio tracks.
 For mixed-mode games, use a complete CUE with its tracks to retain music.
 Importing an ISO cannot recreate missing audio.
+CUE sheets containing MP3 audio tracks are supported on Windows. Keep the
+MP3 files beside the CUE; selecting the data ISO by itself omits those tracks.
 
 Keep the original disc files accessible after import. The runtime still reads
 them during play; the extracted assets are not a replacement for the disc.
@@ -87,8 +92,14 @@ ISO, BIN, or IMG files. For a multi-track disc, select its CUE once instead of
 importing the individual tracks. Follow preparation in **Imports** and return
 to **Library** when it finishes.
 
-Open **Console settings** for the BIOS picker, 120 Hz presentation option,
+Open **Console settings** for the BIOS picker, frame interpolation option,
 and keyboard control reference.
+
+The top navigation also serves as the window's title bar. Drag its logo or
+empty space to move the window, double-click to maximize or restore, and use
+the controls at the right to minimize, maximize, or close. Window edges remain
+resizable; maximizing respects the Windows taskbar. Hovering the maximize
+control exposes Snap layouts on supported Windows versions.
 
 ## Controls and presentation
 
@@ -101,13 +112,55 @@ and keyboard control reference.
 | L / R | Q / E | LT / RT |
 
 Connect an SDL-compatible controller to use the controller mapping.
-**Esc** closes the game, **Space** pauses/resumes, and **F** advances one
+**F1** opens the shared in-game settings panel. **Esc** closes the panel when
+it is open; otherwise it closes the game. **Space** pauses/resumes, and **F** advances one
 field while paused. The launcher remains available for another game.
 
-**120 Hz presentation** in Console settings chooses the setting for the next
-launch. **F2** toggles it during play and saves the choice for future launches.
+The F1 panel has four pages:
+
+| Page | Settings |
+| --- | --- |
+| Display | Window resolution and fullscreen |
+| Graphics | 1x–4x internal resolution, nearest or bilinear texture filtering, FXAA, and supersampled model edges |
+| Motion | Frame interpolation on/off and a target refresh rate from 60 to 240 Hz |
+| Audio | Master volume and mute |
+
+<details>
+<summary>Preview the in-game graphics and interpolation pages</summary>
+
+![Native in-game graphics settings](images/in-game-graphics.png)
+![Native frame interpolation settings](images/in-game-motion.png)
+
+These are actual Vulkan-rendered UI previews over a synthetic background;
+their zero FPS counters are placeholders, not gameplay measurements.
+
+</details>
+
+Changes apply during play and are saved in the library's `settings.ini` for
+every game. Direct per-game executables share this file too. A standalone
+runtime uses `settings.ini` beside its executable unless `SATURN_SETTINGS_FILE`
+selects a different file. Use the mouse, or **Tab** to move focus and arrow keys
+to adjust controls; **Page Up/Page Down** changes pages. **Diagnostics** opens
+the existing renderer inspection tools. Slider adjustments are saved after a
+brief idle interval; closing the panel or game saves the latest values.
+
+Internal resolution rerasterizes supported geometry at a higher resolution.
+**Smooth model edges** uses additional supersampling; it preserves the original
+model shapes. Texture filtering smooths RGB samples while preserving indexed
+palette and priority codes. These options increase GPU work and cannot add
+detail absent from the game's source textures. Scenes that cannot be replayed
+safely retain their native sprite framebuffer.
+
+The frame interpolation option in Console settings remains available for the next
+launch. **F2** toggles interpolation during play, using the target rate selected
+in F1, and saves the choice for future launches.
 Interpolation is experimental and leaves the game's logic and audio clocks
-unchanged. Leave it off initially if diagnosing image or pacing problems.
+unchanged. Connected geometry with uncertain correspondence stays at its native
+position for that picture; verified geometry can still interpolate. This avoids
+stretching part of a model or opening a shared edge when a face cannot be matched.
+Inserted frames retain the displayed picture's texture, palette and lighting
+data, preventing future draw data from recoloring its walls or environment.
+Leave interpolation off initially if diagnosing image or pacing problems.
 
 ## Library, updates and troubleshooting
 
@@ -137,6 +190,7 @@ After pulling an update, close the launcher and game windows and rerun the
 build command above. Packaging preserves the existing `library` directory.
 Open the updated launcher once to synchronize its shared runtime and shaders
 before starting games, including directly through their game executables.
+This also restores the bundled MP3 decoder to `library/runtime`.
 
 A failed import is never marked ready. Its log and partial files remain in
 `library/.staging/<job>/` for diagnosis. For a launch failure, check
@@ -166,6 +220,6 @@ establish gameplay compatibility. Game details show verification separately.
 
 The launcher uses the same experimental runtime for every game. Compatibility,
 rendering, audio, and performance vary by title; importing a game is not a
-compatibility test. Broad compatibility testing is still pending, including
-confirmation that Burning Rangers works correctly. See
+compatibility test. Targeted comparisons have fixed specific rendering and
+audio defects; broad compatibility and full-game testing remain pending. See
 [Compatibility and limitations](COMPATIBILITY.md) for the project's current scope.

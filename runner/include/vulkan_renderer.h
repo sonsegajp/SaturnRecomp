@@ -3,10 +3,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "runtime_settings.h"
 
 typedef struct SDL_Window SDL_Window;
 typedef struct saturn saturn;
 typedef struct saturn_vk_renderer saturn_vk_renderer;
+typedef struct game_overlay game_overlay;
+typedef struct game_overlay_draw_data game_overlay_draw_data;
 
 /* Resolved VDP1 operation. Command walking, clipping-register updates and
  * draw-end timing remain emulated by vdp1.c; Vulkan owns rasterization and
@@ -56,10 +59,18 @@ int  saturn_vk_present(saturn_vk_renderer *r, char *error, size_t error_size);
 /* Diagnostic readback of the actual compute output, in ARGB8888. */
 int saturn_vk_readback(saturn_vk_renderer *r, uint32_t *pixels, int width, int height,
                        char *error, size_t error_size);
+/* Enhanced game image before the F1 panel, at the configured internal size. */
+int saturn_vk_readback_presented(saturn_vk_renderer *r,uint32_t *pixels,int width,int height,
+                               char *error,size_t error_size);
 int saturn_vk_replay_geometry(saturn_vk_renderer *r, saturn *s,
     const saturn_vk_vdp1_op *ops,unsigned count,int w,int h,char *error,size_t error_size);
 int saturn_vk_interpolation_enable(saturn_vk_renderer *r);
 void saturn_vk_interpolation_disable(saturn_vk_renderer *r);
+int saturn_vk_set_quality(saturn_vk_renderer *r,const saturn_runtime_settings *settings,char *error,size_t size);
+int saturn_vk_presentation_active(const saturn_vk_renderer *r);
+int saturn_vk_attach_overlay(saturn_vk_renderer *r,game_overlay *overlay,char *error,size_t size);
+void saturn_vk_overlay_draw(saturn_vk_renderer *r,const game_overlay_draw_data *draw);
+void saturn_vk_interpolation_stats(const saturn_vk_renderer *r,unsigned *matched,unsigned *span);
 int saturn_vk_interpolation_begin(saturn_vk_renderer *r,saturn *s,int w,int h,char *error,size_t size);
 int saturn_vk_interpolation_render(saturn_vk_renderer *r,saturn *s,float alpha,int w,int h,char *error,size_t size);
 void saturn_vk_destroy(saturn_vk_renderer *r);

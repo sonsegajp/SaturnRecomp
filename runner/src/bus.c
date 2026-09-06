@@ -7,6 +7,7 @@
  * implementing all of VDP2 speculatively.
  */
 #include "saturn.h"
+#include "sh2_cache.h"
 #include <x86intrin.h>
 #include "../../external/sh2-recomp-core/common/sh2_isa.h"
 #include <stdio.h>
@@ -533,6 +534,7 @@ static void dmac_run(saturn *s, int ch)
         s->nocdmalog++;
     }
 
+    s->dma_bus_depth++;
     for (uint32_t i = 0; i < iters; i++) {
         switch (unit) {
         case 1:  bus_w8 (s, dar, bus_r8 (s, sar)); break;
@@ -546,6 +548,7 @@ static void dmac_run(saturn *s, int ch)
         if (sm == 1) sar += unit; else if (sm == 2) sar -= unit;
         if (dm == 1) dar += unit; else if (dm == 2) dar -= unit;
     }
+    s->dma_bus_depth--;
 
     s->dma_transfers++;
     s->dma_bytes += (uint64_t)count * unit;
@@ -740,12 +743,9 @@ static int is_cache_addr(uint32_t a) { return ((a >> 29) & 7u) == 3u; }
  * undocumented 0b100 mirror at 0x80000000 (Ymir sh2.cpp dispatches both to
  * Cache::Read/WriteDataArray). It belongs to the CORE, not the machine.
  *
- * Ymir splits the address into index = bits 9-4, way = bits 11-10 and byte =
- * bits 3-0. That is a PERMUTATION of the same 4KB, and for the way this is
- * actually used -- as scratch RAM, written and read back through the same
- * addresses -- any bijection behaves identically, so the low 12 bits index the
- * array directly. It would only diverge for code that correlates cache
- * contents with the cached memory behind them, which needs a real cache model. */
+ * Bits 9-4 select the set, bits 11-10 the way and bits 3-0 the byte. This is
+ * the same layout used by instruction fetches and cached write hits, so the
+ * low 12 bits directly index the unified cache data array. */
 static int is_cachearr(uint32_t a) { return ((a >> 29) & 5u) == 4u; }
 
 static uint8_t *cache_ptr(saturn *s, uint32_t a)
@@ -797,15 +797,27 @@ static void cache_purge_all(sh2 *c)
 }
 
 /* Host pointer to a whole 4KB page of plain memory, or NULL if any part of it
- * is not ordinary RAM/ROM. The interpreter caches this per core so an opcode
- * fetch is two byte loads instead of a full bus decode. Pointing into the live
- * arrays keeps self-modifying code visible for free. */
+ * is not ordinary RAM/ROM. Used for cache-line fills and cache-through opcode
+ * fetches; cached instruction hits read the CPU's private line instead. */
 const uint8_t *bus_page(saturn *s, uint32_t a)
 {
     return ram_ptr(s, a & 0x07FFF000u, 0x1000u);
 }
 
 /* --------------------------------------------------------------- reads */
+
+static void sound_bus_access(saturn *s,int write)
+{
+    /* The SCSP bus is substantially slower than SH-2 work RAM. Ymir's
+     * normal bus timing uses 40 clocks for a read and 2 for a write, for
+     * each access width. The instruction already supplies one clock.
+     * Omitting this wait lets counted sound-command polls expire before
+     * the 68000's next timer service, disabling later effects and voices.
+     * DMA and diagnostic reads are not instructions on the current CPU. */
+    if(s->cpu_bus_active && !s->dma_bus_depth && s->cur)
+        s->cur->cycles += write ? 1u : 39u;
+    sound_sync(s);
+}
 
 uint8_t bus_r8(saturn *s, uint32_t a)
 {
@@ -829,7 +841,7 @@ uint8_t bus_r8(saturn *s, uint32_t a)
         return cc->onchip[OC(off)];
     }
     b = a & 0x07FFFFFFu;
-    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_bus_access(s,0);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 1);
     if (p) return *p;
@@ -907,7 +919,7 @@ uint16_t bus_r16(saturn *s, uint32_t a)
         return (uint16_t)((cc->onchip[OC(off)] << 8) | cc->onchip[OC(off)+1]);
     }
     b = a & 0x07FFFFFEu;
-    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_bus_access(s,0);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 2);
     if (p) return (uint16_t)((p[0] << 8) | p[1]);
@@ -983,7 +995,7 @@ uint32_t bus_r32(saturn *s, uint32_t a)
     }
     if (is_onchip(a)) return oc_r32(s, a & 0xFFFCu);
     b = a & 0x07FFFFFCu;
-    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_bus_access(s,0);
     rrange_note(s, b);
     uint8_t *p = ram_ptr(s, b, 4);
     if (p)
@@ -996,6 +1008,12 @@ uint32_t bus_r32(saturn *s, uint32_t a)
         if ((b & 0xFCu) >= 0x80u && (b & 0xFCu) <= 0x8Cu)
             return scu_dsp_read_reg(s, b & 0xFCu);
         return s->scu_reg[o];
+    }
+    if (b >= 0x05B00000u && b < 0x05C00000u) {
+        uint32_t off=(b-0x05B00000u)&0xFFEu;
+        trace(s,b,0,4);
+        uint32_t high=scsp_read(s,off);
+        return (high<<16)|scsp_read(s,(off+2u)&0xFFEu);
     }
     /* Fall back to two halfword reads so peripheral windows stay consistent. */
     return ((uint32_t)bus_r16(s, b) << 16) | bus_r16(s, b + 2);
@@ -1033,6 +1051,8 @@ static int prot_block(saturn *s, uint32_t a)
 void bus_w8(saturn *s, uint32_t a, uint8_t v)
 {
     if (prot_block(s, a)) return;
+    if (!s->dma_bus_depth)
+        sh2_cache_write(s->cur ? s->cur : &s->master, a, v, 1u);
     uint32_t b, cdoff;
     if (is_cache_purge(a)) { cache_purge_addr(s, a); return; }
     if (is_cache_addr(a)) { cache_addr_write(s, a, v); return; }
@@ -1043,7 +1063,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
         return;
     }
     b = a & 0x07FFFFFFu;
-    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_bus_access(s,1);
     /* MINIT/SINIT doorbell. The ADDRESS selects the target CPU and the data is
      * irrelevant -- any write in the region rings it. This path used to fire
      * only on an ODD address, while the 16- and 32-bit paths below fire
@@ -1119,7 +1139,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
         uint16_t w  = bus_r16(s, wa);
         w = (b & 1u) ? (uint16_t)((w & 0xFF00) | v)
                      : (uint16_t)((w & 0x00FF) | ((uint16_t)v << 8));
-        bus_w16(s, wa, w);
+        bus_w16(s, a & ~1u, w);
         return;
     }
 
@@ -1130,6 +1150,8 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
 void bus_w16(saturn *s, uint32_t a, uint16_t v)
 {
     if (prot_block(s, a)) return;
+    if (!s->dma_bus_depth)
+        sh2_cache_write(s->cur ? s->cur : &s->master, a & ~1u, v, 2u);
     uint32_t b, cdoff;
     if (is_cache_purge(a)) { cache_purge_addr(s, a); return; }
     if (is_cache_addr(a)) { cache_addr_write(s, a, v); return; }
@@ -1146,7 +1168,7 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
         return;
     }
     b = a & 0x07FFFFFEu;
-    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_bus_access(s,1);
 
     /* MINIT/SINIT: the doorbell is named for who RINGS it, not who hears it.
      * Writes to MINIT (0x01000000-0x017FFFFF) pulse the SLAVE's FRT
@@ -1239,6 +1261,8 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
 void bus_w32(saturn *s, uint32_t a, uint32_t v)
 {
     if (prot_block(s, a)) return;
+    if (!s->dma_bus_depth)
+        sh2_cache_write(s->cur ? s->cur : &s->master, a & ~3u, v, 4u);
     uint32_t b;
     if (is_cache_purge(a)) { cache_purge_addr(s, a); return; }
     if (is_cache_addr(a)) { cache_addr_write(s, a, v); return; }
@@ -1258,7 +1282,7 @@ void bus_w32(saturn *s, uint32_t a, uint32_t v)
         return;
     }
     b = a & 0x07FFFFFCu;
-    if (b >= 0x05A00000u && b < 0x05C00000u) sound_sync(s);
+    if (b >= 0x05A00000u && b < 0x05C00000u) sound_bus_access(s,1);
     if (b >= 0x01000000u && b < 0x02000000u) {
         frt_capture(b < 0x01800000u ? &s->slave : &s->master);
         return;
@@ -1337,8 +1361,15 @@ void bus_w32(saturn *s, uint32_t a, uint32_t v)
         }
         return;
     }
-    bus_w16(s, b,     (uint16_t)(v >> 16));
-    bus_w16(s, b + 2, (uint16_t)v);
+    if (b >= 0x05B00000u && b < 0x05C00000u) {
+        uint32_t off=(b-0x05B00000u)&0xFFEu;
+        trace(s,b,1,4);
+        scsp_write(s,off,(uint16_t)(v>>16));
+        scsp_write(s,(off+2u)&0xFFEu,(uint16_t)v);
+        return;
+    }
+    bus_w16(s, a & ~3u,       (uint16_t)(v >> 16));
+    bus_w16(s, (a & ~3u) + 2, (uint16_t)v);
 }
 
 /* ----------------------------------------------------------------- init */
@@ -2320,6 +2351,7 @@ static void scu_dma_copy(saturn *s, uint32_t src, uint32_t dst,
     /* B-Bus targets (VDP1/VDP2/SCSP registers) accept 16-bit units. */
     const uint32_t unit = (wr_step == 2u) ? 2u : 4u;
 
+    s->dma_bus_depth++;
     while (bytes >= unit) {
         if (unit == 2u) bus_w16(s, dst, bus_r16(s, src));
         else            bus_w32(s, dst, bus_r32(s, src));
@@ -2334,6 +2366,7 @@ static void scu_dma_copy(saturn *s, uint32_t src, uint32_t dst,
         bytes -= 2;
     }
     if (bytes) bus_w8(s, dst, bus_r8(s, src));
+    s->dma_bus_depth--;
 }
 
 static void scu_dma_run(saturn *s, int level)

@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QLinearGradient, Q
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QStyledItemDelegate, QStyle, QTabWidget, QVBoxLayout, QWidget)
 
 from theme import STYLE, PALETTE, SPACE, METRICS, color, font
+from titlebar import ChromeWindow
 
 
 def label(text='', name=''):
@@ -413,7 +414,7 @@ class SortCombo(QComboBox):
         painter.drawLine(QPointF(x - 3, y - 1.5), QPointF(x, y + 1.5))
         painter.drawLine(QPointF(x, y + 1.5), QPointF(x + 3, y - 1.5))
 
-class MainWindow(QMainWindow):
+class MainWindow(ChromeWindow):
     def __init__(self, library):
         super().__init__()
         self.library = library
@@ -441,15 +442,15 @@ class MainWindow(QMainWindow):
         header.setObjectName('header')
         header.setFixedHeight(METRICS['header_height'])
         bar = QHBoxLayout(header)
-        bar.setContentsMargins(SPACE['xl'], 0, SPACE['xl'], 0)
-        bar.setSpacing(20)
+        bar.setContentsMargins(SPACE['xl'], 0, 0, 0)
+        bar.setSpacing(SPACE['md'])
         from library import ROOT
         logo = QPixmap(str(ROOT / 'assets/saturnrecomp-logo.png'))
         branding = label()
         branding.setPixmap(logo.scaledToWidth(180, Qt.TransformationMode.SmoothTransformation))
         branding.setFixedWidth(190)
         bar.addWidget(branding)
-        bar.addSpacing(SPACE['xl'])
+        bar.addSpacing(SPACE['sm'])
         self.library_nav = button('Library', 'nav')
         self.library_nav.setCheckable(True)
         self.library_nav.setChecked(True)
@@ -468,6 +469,8 @@ class MainWindow(QMainWindow):
         folder.setAccessibleName('Open library folder')
         folder.clicked.connect(lambda: self.open_folder())
         bar.addWidget(folder)
+        bar.addSpacing(SPACE['sm'])
+        bar.addWidget(self.install_titlebar(header, branding))
         shell.addWidget(header)
 
         from visuals import SaturnHeader, OrbitalBackdrop
@@ -651,7 +654,7 @@ class MainWindow(QMainWindow):
             saved=settings.get('selected_game')
             self.selected=saved if saved in {g['id'] for g in games} else max(games,key=lambda g:(g.get('last_played',0),g.get('created',0)))['id'] if games else None
         self.console_status.setText('●  Console ready' if settings.get('bios') else '○  Console setup needed')
-        self.presentation_status.setText('  120 Hz presentation' if settings.get('interpolation') else '  Native presentation')
+        self.presentation_status.setText(f"  {settings.get('target_hz',120)} Hz presentation" if settings.get('interpolation') else '  Native presentation')
         self.art_status.setText('Cover artwork by IGDB' if state['igdb'] else 'Cover artwork optional')
         self.subtitle.setText(f"{len(games)} games \u00b7 Sega Saturn" if self.view=='library' and games else 'Your Saturn game collection.' if self.view=='library' else 'Disc preparation, all in one place.')
         self.notice.setVisible(not settings.get('bios') and self.view=='library')

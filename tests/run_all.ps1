@@ -15,6 +15,8 @@
 
 $ErrorActionPreference = 'Continue'
 Set-Location (Join-Path $PSScriptRoot '..')
+$testRuntimePath = Join-Path (Get-Location) 'runner'
+$env:PATH = "$testRuntimePath;$env:PATH"
 
 # SATURN_PYTHON can select a Python installation that has `capstone`.
 $PY = $env:SATURN_PYTHON
@@ -60,6 +62,27 @@ if (Test-Path 'tests/sh2_waitloop.exe') {
     if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
 } else { Write-Host 'sh2_waitloop.exe not built - run build.ps1'; $skip++ }
 
+Section 'SH-2 cache write-through, self-modifying code and DMA isolation'
+if (Test-Path 'tests/sh2_cache.exe') {
+    & 'tests/sh2_cache.exe' | Write-Host
+    if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'sh2_cache.exe not built - run build.ps1'; $skip++ }
+
+Section 'SH-2 sound-bus wait states, counted command polls and DMA timing isolation'
+if (Test-Path 'tests/sound_bus_timing.exe') {
+    & 'tests/sound_bus_timing.exe' | Write-Host
+    $timingResult=$LASTEXITCODE
+    & 'tests/sound_bus_timing.exe' --diagnostics | Write-Host
+    if ($LASTEXITCODE -eq 0 -and $timingResult -eq 0) { $pass++ } else { $fail++ }
+} else { Write-Host 'sound_bus_timing.exe not built - run build.ps1'; $skip++ }
+
+Section 'Shared runtime settings and native in-game controls'
+foreach ($test in @('runtime_settings','game_overlay','window_audio')) {
+    if (Test-Path "tests/$test.exe") {
+        & "tests/$test.exe" | Write-Host
+        if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+    } else { Write-Host "$test.exe not built - run build.ps1"; $skip++ }
+}
 Section 'SCSP FM feedback and pitch/amplitude LFO'
 if (Test-Path 'tests/scsp_modulation.exe') {
     & 'tests/scsp_modulation.exe' | Write-Host
