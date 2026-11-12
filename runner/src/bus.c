@@ -124,6 +124,47 @@ static void vdp1_fb_bus_write(saturn *s, uint32_t a,
  *
  * Keep this as the ONE predicate used by reads, writes, DMA (which uses the
  * public bus accessors), unmapped accounting, and trace-region reporting. */
+/* ------------------------------------------------------ NetLink probe --
+ * Games with Sega NetLink support (Saturn Bomberman among them) look for the
+ * modem's 16550-style UART in A-Bus CS2 outside the CD register file: they
+ * write the scratch register at 0x0589501D, write 0x0582503D to drive the bus
+ * to another value, then read the scratch register back. Reading 0 every time
+ * (unmapped) left Saturn Bomberman probing forever after the licence screen.
+ * Match the reference emulator Ymir (CDBlock::ReadReg/WriteReg): the scratch
+ * byte reads back what was written, the modem status register at 0x05895019
+ * reports 0x30, and the 0x0582503D write is accepted and discarded. Byte
+ * accesses only, as there. */
+static uint8_t netlink_scr;
+
+/* Off by default: a console without the modem attached. With no modem the
+ * probe fails, Saturn Bomberman times it out on FRT compare-match ticks and
+ * boots normally; with the stub the game believes a modem is present and
+ * waits on its status forever. SATURN_NETLINK=1 turns the stub on. */
+static int netlink_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SATURN_NETLINK");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+static int netlink_read8(uint32_t b, uint8_t *v)
+{
+    if (!netlink_enabled()) return 0;
+    if (b == 0x0589501Du) { *v = netlink_scr; return 1; }
+    if (b == 0x05895019u) { *v = 0x30u;       return 1; }
+    return 0;
+}
+
+static int netlink_write8(uint32_t b, uint8_t v)
+{
+    if (!netlink_enabled()) return 0;
+    if (b == 0x0589501Du) { netlink_scr = v; return 1; }
+    return b == 0x0582503Du;
+}
+
 static int cdb_reg_decode(uint32_t a, uint32_t *off)
 {
     uint32_t rel;
@@ -871,6 +912,10 @@ uint8_t bus_r8(saturn *s, uint32_t a)
         }
         return (uint8_t)(s->scu_reg[o] >> (8 * (3 - (b & 3))));
     }
+    {
+        uint8_t nl;
+        if (netlink_read8(b, &nl)) { trace(s, b, 0, 1); return nl; }
+    }
     if (cdb_reg_decode(b, &cdoff)) {
         /* The CD block is a 16-bit peripheral bus. Ymir dispatches byte I/O
          * directly: an even register address returns the low byte of that
@@ -1126,6 +1171,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
         if (o == 0x01) smpc_ireg0_write(s, v);
         return;
     }
+    if (netlink_write8(b, v)) { trace(s, b, 1, 1); return; }
     if (cdb_reg_decode(b, &cdoff)) {
         /* Direct byte dispatch is required for side-effectful CD registers.
          * A read/modify/write consumes DATATRNS and acknowledges CR4 merely to
