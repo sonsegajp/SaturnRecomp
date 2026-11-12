@@ -111,6 +111,40 @@ static int compare_cpu(const fixture *f) {
     }
     REQUIRE(1,"complete CPU framebuffer matches independent row reference");return 1;
 }
+/* The Vulkan path never enters the CPU pixel loops, yet the pixel count it
+ * reports still paces the command walk and therefore the Sprite Draw End
+ * interrupt. An upright 320x160 quad used to count as one row (320 pixels),
+ * so draw end fired almost at once -- before a game had armed its wait for
+ * it -- and the game waited forever. The queued path must charge the same
+ * pixels the CPU raster plots. */
+static void cost_list(unsigned type) {
+    memset(machine.vdp1_vram,0,VDP1_VRAM_SZ);
+    machine.vdp1_reg[1]=0;machine.vdp2_reg[0]=0;machine.fb_draw=0;
+    basic_command(0,9);word(0x14,511);word(0x16,255);
+    basic_command(0x20,10);
+    basic_command(0x40,type);word(0x44,5u<<3);word(0x46,0x8421);
+    word(0x48,0x10000/8);word(0x4a,0x108);
+    word(0x4c,0);word(0x4e,32);word(0x50,319);word(0x52,32);
+    word(0x54,319);word(0x56,191);word(0x58,0);word(0x5a,191);
+    word(0x60,0x8000);
+    for(unsigned i=0;i<64;i++)word(0x10000+i*2,0x8001);
+}
+static int draw_cost_tests(void) {
+    static const unsigned types[]={2,4};
+    for(unsigned t=0;t<2;t++) {
+        cost_list(types[t]);machine.vdp1_pixels=0;vdp1_execute(&machine);
+        uint64_t cpu=machine.vdp1_pixels;
+        saturn_vdp1_gpu_sink sink={NULL,capture,NULL};vdp1_gpu_bind(&machine,&sink);
+        captured_count=0;cost_list(types[t]);machine.vdp1_pixels=0;vdp1_execute(&machine);
+        uint64_t gpu=machine.vdp1_pixels;vdp1_gpu_bind(&machine,NULL);
+        snprintf(error_text,sizeof error_text,"type %u: CPU %llu GPU %llu",types[t],
+                 (unsigned long long)cpu,(unsigned long long)gpu);
+        REQUIRE(cpu==320u*160u,"CPU raster plots the whole upright quad");
+        REQUIRE(captured_count==1,"queued path emits the quad");
+        REQUIRE(gpu==cpu,"queued quad charges the pixels the CPU plots");
+    }
+    return 1;
+}
 static int cpu_tests(void) {
     for(unsigned i=0;i<sizeof cases/sizeof *cases;i++) {
         prepare(&cases[i]);reference(&cases[i]);vdp1_execute(&machine);
@@ -130,7 +164,9 @@ static int cpu_tests(void) {
     REQUIRE(!geometry_same(&a,&b),"opposite fields cannot become interpolation endpoints");
     b=a;b.flip&=~SATURN_VDP1_DIE;
     REQUIRE(!geometry_same(&a,&b),"different draw modes cannot become interpolation endpoints");
-    vdp1_gpu_bind(&machine,NULL);return 1;
+    vdp1_gpu_bind(&machine,NULL);
+    REQUIRE(draw_cost_tests(),"GPU draw cost");
+    return 1;
 }
 
 #ifdef SATURN_TEST_VULKAN
