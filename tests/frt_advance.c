@@ -52,8 +52,13 @@ static void reference(sh2 *c, uint32_t cycles)
             }
         }
         if (c->frc == b) c->onchip[OC(0xFE11u)] |= 4u;
-        c->frt_pend = g_frt_irq &&
-            (int)((c->onchip[OC(0xFE10u)] & c->onchip[OC(0xFE11u)] & 0x8Eu) != 0);
+        /* Compare-match and overflow are always deliverable; input capture
+         * only on the slave or with SATURN_FRTIRQ. The cached flag also
+         * covers a raised WDT interval interrupt (OVF set, WT/IT clear). */
+        c->frt_pend =
+            (int)((c->onchip[OC(0xFE10u)] & c->onchip[OC(0xFE11u)] &
+                   ((g_frt_irq || c->is_slave) ? 0x8Eu : 0x0Eu)) != 0) ||
+            (c->onchip[OC(0xFE80u)] & 0xC0u) == 0x80u;
     }
 }
 
@@ -161,6 +166,93 @@ int main(void)
         initial.onchip[OC(0xFE11u)] = 1;
         compare_value(0xFE14u, 1);
         compare(2); known("A clear before B match resets prescaler", 0, 13, 0, 1);
+    }
+
+    /* Master FRT delivery: compare-match always, input capture only with the
+     * SATURN_FRTIRQ switch. IPRB level 5, VCRC = ICI 0x64 / OCI 0x65. */
+    {
+        int vec = 0, lvl = 0;
+        static sh2 m;
+        static saturn sys;                            /* frt_pending counts into it */
+        memset(&m, 0, sizeof m);
+        m.sys = &sys;
+        m.onchip[OC(0xFE60u)] = 0x05;
+        m.onchip[OC(0xFE66u)] = 0x64; m.onchip[OC(0xFE67u)] = 0x65;
+        m.onchip[OC(0xFE10u)] = 0x88;                 /* ICIE | OCIAE */
+        m.onchip[OC(0xFE11u)] = 0x08;                 /* OCFA */
+        g_frt_irq = 0;
+        ++checks;
+        if (!frt_pending(&m, 0, &vec, &lvl) || vec != 0x65 || lvl != 5) {
+            ++failures; printf("FAIL master OCIA delivered by default\n");
+        }
+        m.onchip[OC(0xFE11u)] = 0x80;                 /* ICF only */
+        ++checks;
+        if (frt_pending(&m, 0, &vec, &lvl)) {
+            ++failures; printf("FAIL master ICI held back without switch\n");
+        }
+        g_frt_irq = 1;
+        ++checks;
+        if (!frt_pending(&m, 0, &vec, &lvl) || vec != 0x64) {
+            ++failures; printf("FAIL master ICI delivered with switch\n");
+        }
+        g_frt_irq = 0;
+    }
+
+    /* Watchdog timer (SH7604 WDT; Ymir hw/sh2/sh2_wdt.hpp). */
+    {
+        int vec = 0, lvl = 0;
+        static sh2 w;
+        memset(&w, 0, sizeof w);
+        w.onchip[OC(0xFE80u)] = 0x18; w.onchip[OC(0xFE83u)] = 0x1F;
+        w.onchip[OC(0xFEE3u)] = 0xF0;                 /* IPRA WDT level 15 */
+        w.onchip[OC(0xFEE4u)] = 0x68;                 /* VCRWDT ITI vector */
+        wdt_advance(&w, 100000);
+        ++checks;
+        if (w.onchip[OC(0xFE81u)] != 0) { ++failures; printf("FAIL WDT idle without TME\n"); }
+        wdt_write16(&w, 0xFE80u, 0xA522);             /* TME, interval, phi/128 */
+        ++checks;
+        if (w.onchip[OC(0xFE80u)] != 0x3A) { ++failures; printf("FAIL WTCSR write\n"); }
+        wdt_write16(&w, 0xFE80u, 0x5AF0);             /* WTCNT = 0xF0 */
+        wdt_advance(&w, 128u * 15u + 127u);
+        ++checks;
+        if (w.onchip[OC(0xFE81u)] != 0xFF || (w.onchip[OC(0xFE80u)] & 0x80u)) {
+            ++failures; printf("FAIL WDT counts at phi/128\n");
+        }
+        wdt_advance(&w, 1);
+        ++checks;
+        if (w.onchip[OC(0xFE81u)] != 0 || !(w.onchip[OC(0xFE80u)] & 0x80u) || !w.frt_pend) {
+            ++failures; printf("FAIL WDT overflow sets OVF\n");
+        }
+        ++checks;
+        if (!wdt_pending(&w, 0, &vec, &lvl) || vec != 0x68 || lvl != 15) {
+            ++failures; printf("FAIL WDT ITI vector/level\n");
+        }
+        ++checks;
+        if (wdt_pending(&w, 0xF0, &vec, &lvl)) { ++failures; printf("FAIL WDT ITI masked by SR.I\n"); }
+        wdt_write16(&w, 0xFE80u, 0xA522);             /* 0 to OVF before any read */
+        ++checks;
+        if (!(w.onchip[OC(0xFE80u)] & 0x80u)) { ++failures; printf("FAIL OVF clear needs a read first\n"); }
+        wdt_note_read(&w, 0xFE80u);
+        wdt_write16(&w, 0xFE80u, 0xA522);
+        ++checks;
+        if ((w.onchip[OC(0xFE80u)] & 0x80u) || w.frt_pend || wdt_pending(&w, 0, &vec, &lvl)) {
+            ++failures; printf("FAIL OVF cleared after read\n");
+        }
+        w.onchip[OC(0xFE81u)] = 0x10;
+        wdt_write16(&w, 0xFE80u, 0xA500);             /* TME off clears WTCNT */
+        ++checks;
+        if (w.onchip[OC(0xFE81u)] != 0) { ++failures; printf("FAIL TME off clears WTCNT\n"); }
+        wdt_write16(&w, 0xFE80u, 0xA560);             /* watchdog mode, phi/2 */
+        wdt_write16(&w, 0xFE80u, 0x5AFF);
+        wdt_advance(&w, 2);
+        ++checks;
+        if (!(w.onchip[OC(0xFE83u)] & 0x80u) || (w.onchip[OC(0xFE80u)] & 0x80u) ||
+            wdt_pending(&w, 0, &vec, &lvl)) {
+            ++failures; printf("FAIL watchdog-mode overflow sets WOVF only\n");
+        }
+        wdt_write16(&w, 0xFE82u, 0xA500);             /* clear WOVF */
+        ++checks;
+        if (w.onchip[OC(0xFE83u)] != 0x1F) { ++failures; printf("FAIL RSTCSR WOVF clear\n"); }
     }
     printf("FRT advance: %u checks, %u failures (%s)\n",
            checks, failures, disabled ? "disabled" : "enabled");

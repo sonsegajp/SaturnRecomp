@@ -39,6 +39,7 @@ typedef struct {
     int      ready;
     uint16_t cmd_stage[4];   /* CR1..CR4 as written by the host */
     uint32_t dir_first;      /* first file id in the selected directory */
+    char     cwd[256];       /* current directory path, "" = root (ChangeDirectory) */
     uint16_t dir_count;
     int      boot_delay;
     int      auth_delay;     /* fields until AuthenticateDevice completes */
@@ -168,6 +169,8 @@ typedef struct {
     uint8_t  if_cache_way;
     uint16_t frc;             /* free-running counter                        */
     uint32_t frt_pre;         /* prescaler remainder, in machine cycles      */
+    uint32_t wdt_pre;         /* WDT prescaler remainder, machine cycles     */
+    uint8_t  wdt_ovf_read;    /* WTCSR was read with OVF=1 (arms the clear)  */
 
     saturn  *sys;
 } sh2;
@@ -794,6 +797,11 @@ void     frt_capture(sh2 *c);
 int      frt_pending(sh2 *c, uint32_t sr, int *vector, int *level);
 int      dmac_pending(sh2 *c, uint32_t sr, int *vector, int *level);
 void     frt_write8(sh2 *c, uint32_t off, uint8_t v);
+/* Watchdog timer, per core (WTCSR/WTCNT/RSTCSR at on-chip 0xFE80-0xFE83). */
+void     wdt_advance(sh2 *c, uint32_t cycles);
+void     wdt_write16(sh2 *c, uint32_t off, uint16_t v);
+void     wdt_note_read(sh2 *c, uint32_t off);
+int      wdt_pending(sh2 *c, uint32_t sr, int *vector, int *level);
 void     frt_irq_init(void);
 int      frt_irq_on(void);
 extern int g_frt_irq;

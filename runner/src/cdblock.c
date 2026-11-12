@@ -845,12 +845,47 @@ static int read_sector_sub(disc *d, uint32_t lba, uint8_t *out2048, uint8_t sub[
  * TOC::LoadFrom (media/cd_defs.cpp), which stores to_bcd(trackNum). */
 static uint8_t bcd(unsigned v) { return (uint8_t)(((v / 10u) << 4) | (v % 10u)); }
 
-static int entry_in_cwd(const iso_entry *e)
+/* Is `e` a record of the current directory? The CD block numbers the records
+ * of the CURRENT directory only (0 ".", 1 "..", then files and subdirectories
+ * in ISO order from 2), and ChangeDirectory moves that directory. Treating
+ * every lookup as a root lookup handed Saturn Bomberman's loader /0 (the
+ * root's id 2) when it asked for /BOMSS's id 2, 0KRNL.BIN, after its
+ * ChangeDirectory into /BOMSS -- it booted the wrong program into the wrong
+ * address and crashed behind the SEGA licence screen. Ymir:
+ * media/filesystem.cpp FilesystemState::ChangeDirectory / GetFileInfo. */
+static int entry_in_cwd(const cdblock *cd, const iso_entry *e)
 {
-    const char *p = e->path;
-    int slashes = 0;
-    while (*p) { if (*p == '/') slashes++; p++; }
-    return slashes == 1;
+    const char *slash = strrchr(e->path, '/');
+    size_t plen, clen = strlen(cd->cwd);
+    if (!slash) return 0;
+    plen = (size_t)(slash - e->path);
+    return plen == clen && strncmp(e->path, cd->cwd, clen) == 0;
+}
+
+/* ChangeDirectory: 0xFFFFFF selects the root, 0 stays ("."), 1 goes to the
+ * parent (".."; the root's parent is the root), any other id must name a
+ * subdirectory of the current directory. Returns 0 when the id is rejected. */
+static int cd_change_directory(cdblock *cd, const iso_fs *fs, uint32_t id)
+{
+    if (id == 0xFFFFFFu) { cd->cwd[0] = 0; return 1; }
+    if (id == 0) return 1;
+    if (id == 1) {
+        char *slash = strrchr(cd->cwd, '/');
+        if (slash) *slash = 0;
+        return 1;
+    }
+    if (fs) {
+        uint32_t fileno = 2;
+        for (int i = 0; i < fs->nentries; i++) {
+            const iso_entry *e = &fs->entries[i];
+            if (!entry_in_cwd(cd, e)) continue;
+            if (fileno++ != id) continue;
+            if (!e->is_dir || strlen(e->path) >= sizeof(cd->cwd)) return 0;
+            strcpy(cd->cwd, e->path);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void file_record(const iso_entry *e, int fileno, uint8_t *out)
@@ -1676,6 +1711,13 @@ void cdb_execute(saturn *s)
                  * first file id as 2 (Mednafen FileInfoOffs, Ymir
                  * GetFileOffset()+2). We answered 0, and the launcher walked
                  * a different, doomed path. */
+        {
+            uint32_t id = ((uint32_t)(cr3 & 0xFF) << 16) | cr4;
+            int ok = cd_change_directory(cd, fs, id);
+            if (cdlog())
+                printf("[cd:chdir] id=%u %s \"%s\"\n", (unsigned)id,
+                       ok ? "->" : "rejected, still", cd->cwd[0] ? cd->cwd : "/");
+        }
         cd->dir_first = 2;
         respond_status(s);
         hirq_set(s, HIRQ_EFLS);
@@ -1717,7 +1759,7 @@ void cdb_execute(saturn *s)
         if (cd->dir_first < 2) cd->dir_first = 2;
         if (fs) {
             for (int i = 0; i < fs->nentries; i++)
-                if (entry_in_cwd(&fs->entries[i])) n++;
+                if (entry_in_cwd(cd, &fs->entries[i])) n++;
             /* The host sizes its receive buffer from this count and then
              * reads back however many words GetFileInfo claims. If the count
              * exceeds what its buffer holds, the transfer runs off the end
@@ -1843,7 +1885,7 @@ void cdb_execute(saturn *s)
                     /* The CD block enumerates DIRECTORIES as entries too, so
                      * skipping them shifts every subsequent file id and the
                      * host's index lookup lands on the wrong record. */
-                    if (!entry_in_cwd(&fs->entries[i])) continue;
+                    if (!entry_in_cwd(cd, &fs->entries[i])) continue;
                     if (fileno < (int)cd->dir_first) { fileno++; continue; }
                     file_record(&fs->entries[i], fileno, buf + bytes);
                     bytes += 12;
@@ -1858,7 +1900,7 @@ void cdb_execute(saturn *s)
             } else {
                 int fileno = 2, found = -1;
                 for (int i = 0; i < fs->nentries; i++) {
-                    if (!entry_in_cwd(&fs->entries[i])) continue;
+                    if (!entry_in_cwd(cd, &fs->entries[i])) continue;
                     if ((uint32_t)fileno == id) { found = i; break; }
                     fileno++;
                 }
@@ -1959,7 +2001,7 @@ void cdb_execute(saturn *s)
         if (fs) {
             int fileno = 2;
             for (int i = 0; i < fs->nentries; i++) {
-                if (!entry_in_cwd(&fs->entries[i])) continue;
+                if (!entry_in_cwd(cd, &fs->entries[i])) continue;
                 if ((uint32_t)fileno == id) { e = &fs->entries[i]; break; }
                 fileno++;
             }

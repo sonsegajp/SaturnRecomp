@@ -191,6 +191,9 @@ void sh2_reset(sh2 *c, saturn *s, int is_slave, uint32_t pc, uint32_t sp)
     c->onchip[0x1E1] = 0xF0u;
     c->onchip[0x1E4] = 0x00u; c->onchip[0x1E5] = 0xFCu;     /* BCR2 */
     c->onchip[0x1E8] = 0xAAu; c->onchip[0x1E9] = 0xFFu;     /* WCR  */
+    /* Watchdog timer: WTCSR reads 0x18 (bits 4-3 fixed at 1), WTCNT 0,
+     * RSTCSR 0x1F (bits 4-0 fixed at 1). */
+    c->onchip[0x80] = 0x18u; c->onchip[0x81] = 0x00u; c->onchip[0x83] = 0x1Fu;
 }
 
 /* Execute a single non-branch instruction. Branches are handled by the caller
@@ -664,12 +667,14 @@ static int take_interrupt(sh2 *c)
      * never saw the event. */
     if (c->is_slave) {
         if (!frt_pending(c, c->sr, &vector, &level) &&
-            !dmac_pending(c, c->sr, &vector, &level)) return 0;
+            !dmac_pending(c, c->sr, &vector, &level) &&
+            !wdt_pending(c, c->sr, &vector, &level)) return 0;
         bit = -1;
     } else {
         bit = scu_pending(s, c->sr, &vector, &level);
         if (bit < 0 && !frt_pending(c, c->sr, &vector, &level) &&
-            !dmac_pending(c, c->sr, &vector, &level)) return 0;
+            !dmac_pending(c, c->sr, &vector, &level) &&
+            !wdt_pending(c, c->sr, &vector, &level)) return 0;
         if (bit >= 0) s->scu_ipend &= ~(1u << bit);
     }
 

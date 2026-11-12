@@ -673,6 +673,14 @@ static uint16_t shade(vctx *c, uint16_t base, uint32_t grda, int use_g,
     }
 }
 
+/* Length of a quad edge in plotted steps: the larger of its two deltas, as
+ * the rasteriser walks it (13-bit signed coordinates, as in quad()). */
+static int32_t cheb_len(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    int32_t dx = abs(se13(x1 - x0)), dy = abs(se13(y1 - y0));
+    return (dx > dy ? dx : dy) & 0xFFF;
+}
+
 /* Rasterise a quad, optionally textured. A/B/C/D are in draw-space. */
 static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
                  int32_t xc, int32_t yc, int32_t xd, int32_t yd,
@@ -731,11 +739,18 @@ static void quad(vctx *c, int32_t xa, int32_t ya, int32_t xb, int32_t yb,
         op.usr_x0 = c->usr_x0; op.usr_y0 = c->usr_y0;
         op.usr_x1 = c->usr_x1; op.usr_y1 = c->usr_y1;
         if (gpu_emit(c, &op)) {
-            int32_t top = abs(xb - xa), bottom = abs(xc - xd);
-            int32_t side = abs(yb - ya);
-            if (abs(yc - yd) > side) side = abs(yc - yd);
-            if (bottom > top) top = bottom;
-            c->pixels += (uint32_t)((top + 1) * (side + 1));
+            /* The CPU never rasterises this quad, but its pixel count still
+             * paces the command walk and so decides when Sprite Draw End
+             * fires. Measure each edge by its own length: A-B and D-C span
+             * the quad across, A-D and B-C down it. Taking the height from
+             * the A-B/D-C edges made every upright sprite one row tall, so a
+             * 320x160 sprite "finished" in 128 cycles and the interrupt
+             * arrived before the game had armed its wait for it. */
+            int32_t across = cheb_len(xa, ya, xb, yb);
+            int32_t down = cheb_len(xa, ya, xd, yd);
+            if (cheb_len(xd, yd, xc, yc) > across) across = cheb_len(xd, yd, xc, yc);
+            if (cheb_len(xb, yb, xc, yc) > down) down = cheb_len(xb, yb, xc, yc);
+            c->pixels += (uint32_t)((across + 1) * (down + 1));
             return;
         }
     }

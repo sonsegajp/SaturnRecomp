@@ -124,6 +124,47 @@ static void vdp1_fb_bus_write(saturn *s, uint32_t a,
  *
  * Keep this as the ONE predicate used by reads, writes, DMA (which uses the
  * public bus accessors), unmapped accounting, and trace-region reporting. */
+/* ------------------------------------------------------ NetLink probe --
+ * Games with Sega NetLink support (Saturn Bomberman among them) look for the
+ * modem's 16550-style UART in A-Bus CS2 outside the CD register file: they
+ * write the scratch register at 0x0589501D, write 0x0582503D to drive the bus
+ * to another value, then read the scratch register back. Reading 0 every time
+ * (unmapped) left Saturn Bomberman probing forever after the licence screen.
+ * Match the reference emulator Ymir (CDBlock::ReadReg/WriteReg): the scratch
+ * byte reads back what was written, the modem status register at 0x05895019
+ * reports 0x30, and the 0x0582503D write is accepted and discarded. Byte
+ * accesses only, as there. */
+static uint8_t netlink_scr;
+
+/* Off by default: a console without the modem attached. With no modem the
+ * probe fails, Saturn Bomberman times it out on FRT compare-match ticks and
+ * boots normally; with the stub the game believes a modem is present and
+ * waits on its status forever. SATURN_NETLINK=1 turns the stub on. */
+static int netlink_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SATURN_NETLINK");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+static int netlink_read8(uint32_t b, uint8_t *v)
+{
+    if (!netlink_enabled()) return 0;
+    if (b == 0x0589501Du) { *v = netlink_scr; return 1; }
+    if (b == 0x05895019u) { *v = 0x30u;       return 1; }
+    return 0;
+}
+
+static int netlink_write8(uint32_t b, uint8_t v)
+{
+    if (!netlink_enabled()) return 0;
+    if (b == 0x0589501Du) { netlink_scr = v; return 1; }
+    return b == 0x0582503Du;
+}
+
 static int cdb_reg_decode(uint32_t a, uint32_t *off)
 {
     uint32_t rel;
@@ -483,6 +524,11 @@ static void oc_w32(saturn *s, uint32_t off, uint32_t v)
         if (off == 0xFF14u) divu_calc64(cc);
         return;
     }
+    if (off == 0xFE80u) {
+        wdt_write16(cc, 0xFE80u, (uint16_t)(v >> 16));
+        wdt_write16(cc, 0xFE82u, (uint16_t)v);
+        return;
+    }
     frt_write8(cc, off,      (uint8_t)(v >> 24));
     frt_write8(cc, off + 1u, (uint8_t)(v >> 16));
     frt_write8(cc, off + 2u, (uint8_t)(v >> 8));
@@ -838,6 +884,7 @@ uint8_t bus_r8(saturn *s, uint32_t a)
          * quantum boundary, or a delay loop that spins on it never terminates. */
         if (off == 0xFE12u) return (uint8_t)(cc->frc >> 8);
         if (off == 0xFE13u) return (uint8_t)cc->frc;
+        if (off == 0xFE80u) wdt_note_read(cc, off);
         return cc->onchip[OC(off)];
     }
     b = a & 0x07FFFFFFu;
@@ -870,6 +917,10 @@ uint8_t bus_r8(saturn *s, uint32_t a)
             return (uint8_t)(v >> (8 * (3 - (b & 3))));
         }
         return (uint8_t)(s->scu_reg[o] >> (8 * (3 - (b & 3))));
+    }
+    {
+        uint8_t nl;
+        if (netlink_read8(b, &nl)) { trace(s, b, 0, 1); return nl; }
     }
     if (cdb_reg_decode(b, &cdoff)) {
         /* The CD block is a 16-bit peripheral bus. Ymir dispatches byte I/O
@@ -916,6 +967,7 @@ uint16_t bus_r16(saturn *s, uint32_t a)
         sh2 *cc = s->cur ? s->cur : &s->master;
         uint32_t off = a & 0xFFFEu;
         if (off == 0xFE12u) return cc->frc;
+        if (off == 0xFE80u) wdt_note_read(cc, off);
         return (uint16_t)((cc->onchip[OC(off)] << 8) | cc->onchip[OC(off)+1]);
     }
     b = a & 0x07FFFFFEu;
@@ -1126,6 +1178,7 @@ void bus_w8(saturn *s, uint32_t a, uint8_t v)
         if (o == 0x01) smpc_ireg0_write(s, v);
         return;
     }
+    if (netlink_write8(b, v)) { trace(s, b, 1, 1); return; }
     if (cdb_reg_decode(b, &cdoff)) {
         /* Direct byte dispatch is required for side-effectful CD registers.
          * A read/modify/write consumes DATATRNS and acknowledges CR4 merely to
@@ -1163,6 +1216,7 @@ void bus_w16(saturn *s, uint32_t a, uint16_t v)
     if (is_onchip(a)) {
         sh2 *cc = s->cur ? s->cur : &s->master;
         uint32_t off = a & 0xFFFEu;
+        if (off == 0xFE80u || off == 0xFE82u) { wdt_write16(cc, off, v); return; }
         frt_write8(cc, off,      (uint8_t)(v >> 8));
         frt_write8(cc, off + 1u, (uint8_t)v);
         return;
@@ -1556,13 +1610,124 @@ void scu_raise(saturn *s, int bit)
  * instruction boundary. Recomputed wherever either register changes. */
 int g_frt_irq;   /* defined here; frt_irq_init() sets it from the environment */
 
+/* FRT interrupt sources that may be delivered to this core (TIER/FTCSR bit
+ * positions: ICI 0x80, OCIA 0x08, OCIB 0x04, OVI 0x02). The compare-match and
+ * overflow interrupts are timer-paced and always delivered, as on hardware:
+ * Saturn Bomberman counts OCIA interrupts to time out its NetLink modem probe
+ * and hung forever after the licence screen without them. Input capture (ICI)
+ * stays behind SATURN_FRTIRQ on the master -- see frt_irq_init(). */
+static uint8_t frt_deliverable_mask(const sh2 *c)
+{
+    return (g_frt_irq || c->is_slave) ? 0x8Eu : 0x0Eu;
+}
+
+/* ------------------------------------------------------- watchdog timer --
+ * SH7604 WDT, per core. On-chip bank: WTCSR at 0xFE80, WTCNT at 0xFE81,
+ * RSTCSR at 0xFE83 (reads are plain byte/word reads of the bank). Writes are
+ * word-only and keyed: 0xA5xx to 0xFE80 writes WTCSR, 0x5Axx writes WTCNT;
+ * 0xA5xx to 0xFE82 writes WOVF (0 clears), 0x5Axx writes RSTE/RSTS.
+ *
+ * WTCSR: OVF(7) WT/IT(6) TME(5) 1(4-3) CKS(2-0). In interval mode (WT/IT=0)
+ * an overflow sets OVF and requests ITI at IPRA[7:4] through VCRWDT[14:8],
+ * level-triggered until software clears OVF. OVF clears only on a write of 0
+ * after a read that saw it set. Mirrors Ymir (hw/sh2/sh2_wdt.hpp). Games
+ * drive work queues from ITI: Saturn Bomberman services its file-request
+ * queue from it, and without a WDT it waited forever on the SEGA screen.
+ *
+ * Watchdog-mode overflow sets RSTCSR.WOVF; the reset it would request when
+ * RSTE is set is not modelled. */
+#define WTCSR_OVF  0x80u
+#define WTCSR_WTIT 0x40u
+#define WTCSR_TME  0x20u
+
+static int wdt_iti_raised(const sh2 *c)
+{
+    uint8_t csr = c->onchip[OC(0xFE80u)];
+    return (csr & (WTCSR_OVF | WTCSR_WTIT)) == WTCSR_OVF;
+}
+
+static void frt_update_pend(sh2 *c);
+
+void wdt_advance(sh2 *c, uint32_t cycles)
+{
+    static const uint8_t shift[8] = { 1, 6, 7, 8, 9, 10, 12, 13 };
+    uint8_t *csr = &c->onchip[OC(0xFE80u)];
+    uint8_t *cnt = &c->onchip[OC(0xFE81u)];
+    uint32_t sh, ticks, next;
+
+    if (!(*csr & WTCSR_TME)) { c->wdt_pre = 0; return; }
+    sh = shift[*csr & 7u];
+    c->wdt_pre += cycles;
+    ticks = c->wdt_pre >> sh;
+    if (!ticks) return;
+    c->wdt_pre -= ticks << sh;
+
+    next = (uint32_t)*cnt + ticks;
+    if (next >= 0x100u) {
+        if (*csr & WTCSR_WTIT) {
+            c->onchip[OC(0xFE83u)] |= 0x80u;                 /* RSTCSR.WOVF */
+        } else {
+            *csr |= WTCSR_OVF;
+            frt_update_pend(c);
+        }
+    }
+    *cnt = (uint8_t)next;
+}
+
+void wdt_note_read(sh2 *c, uint32_t off)
+{
+    (void)off;
+    c->wdt_ovf_read = (c->onchip[OC(0xFE80u)] & WTCSR_OVF) != 0;
+}
+
+void wdt_write16(sh2 *c, uint32_t off, uint16_t v)
+{
+    uint8_t key = (uint8_t)(v >> 8), val = (uint8_t)v;
+    uint8_t *csr = &c->onchip[OC(0xFE80u)];
+
+    if (off == 0xFE80u) {
+        if (key == 0xA5u) {
+            uint8_t ovf = *csr & WTCSR_OVF;
+            if (!(val & WTCSR_OVF) && c->wdt_ovf_read) ovf = 0;
+            *csr = (uint8_t)(ovf | (val & (WTCSR_WTIT | WTCSR_TME | 7u)) | 0x18u);
+            if (!(val & WTCSR_TME)) {
+                *csr &= (uint8_t)~WTCSR_OVF;
+                c->onchip[OC(0xFE81u)] = 0;
+                c->wdt_pre = 0;
+            }
+            if (!(*csr & WTCSR_OVF)) c->wdt_ovf_read = 0;
+            frt_update_pend(c);
+        } else if (key == 0x5Au) {
+            if (*csr & WTCSR_TME) c->onchip[OC(0xFE81u)] = val;
+        }
+    } else if (off == 0xFE82u) {
+        uint8_t *rst = &c->onchip[OC(0xFE83u)];
+        if (key == 0xA5u) {
+            if (!(val & 0x80u)) *rst &= 0x7Fu;               /* clear WOVF */
+        } else if (key == 0x5Au) {
+            *rst = (uint8_t)((*rst & 0x80u) | (val & 0x60u) | 0x1Fu);
+        }
+    }
+}
+
+int wdt_pending(sh2 *c, uint32_t sr, int *vector, int *level)
+{
+    int lvl = (int)((c->onchip[OC(0xFEE3u)] >> 4) & 0xFu);  /* IPRA[7:4] */
+    if (!wdt_iti_raised(c)) return 0;
+    if (lvl == 0 || lvl <= (int)((sr >> 4) & 0xFu)) return 0;
+    *vector = (int)(c->onchip[OC(0xFEE4u)] & 0x7Fu);        /* VCRWDT[14:8] */
+    *level  = lvl;
+    return 1;
+}
+
 static void frt_update_pend(sh2 *c)
 {
     uint8_t t = c->onchip[OC(0xFE10u)], f = c->onchip[OC(0xFE11u)];
     /* Respect the delivery switch here as well as in frt_pending, so the
      * interpreter's fast path is not woken up for an interrupt that will
      * then be declined. */
-    c->frt_pend = g_frt_irq && (int)(((t & f) & 0x8Eu) != 0);
+    c->frt_pend = (int)((t & f) & frt_deliverable_mask(c)) != 0 ||
+                  wdt_iti_raised(c);
 }
 
 /* TCR bits 1-0 select the count clock: phi/8, phi/32, phi/128, or the external
@@ -1682,6 +1847,10 @@ void frt_write8(sh2 *c, uint32_t off, uint8_t v)
 {
     uint32_t o = OC(off);
     switch (off & 0xFFFFu) {
+    case 0xFE80u: case 0xFE81u: case 0xFE82u: case 0xFE83u:
+        /* The WDT only accepts keyed word writes (wdt_write16); byte and
+         * longword-split byte writes leave it unchanged, as on hardware. */
+        return;
     case 0xFE10u:
         /* SATURN_TIERLOG: who enables an FRT interrupt, and from where. ICIE
          * (bit 7) with no handler installed is an interrupt storm waiting to
@@ -1761,7 +1930,9 @@ void frt_write8(sh2 *c, uint32_t off, uint8_t v)
  * its display stayed switched off after the FMV.
  *
  * Off unless asked for, as documented. SATURN_FRTIRQ turns it back on for the
- * first title that genuinely wants ICI delivery. */
+ * first title that genuinely wants ICI delivery. The switch covers the
+ * master's ICI only: compare-match (OCIA/OCIB) and overflow (OVI) are paced by
+ * the counter and always delivered (frt_deliverable_mask). */
 void frt_irq_init(void) { g_frt_irq = getenv("SATURN_FRTIRQ") != NULL; }
 
 /* Cheap query for the interpreter's interrupt fast path. */
@@ -1833,15 +2004,14 @@ int frt_pending(sh2 *c, uint32_t sr, int *vector, int *level)
      * reset slave asleep forever. Keep the historical opt-in for the master
      * (whose incomplete handlers used to create a storm), but always deliver
      * the slave's only external interrupt source. */
-    if (!g_frt_irq && !c->is_slave) return 0;
-
     if (lvl == 0 || lvl <= (int)((sr >> 4) & 0xFu)) return 0;
 
 
     vcrc = ((uint32_t)c->onchip[OC(0xFE66u)] << 8) | c->onchip[OC(0xFE67u)];
     vcrd = ((uint32_t)c->onchip[OC(0xFE68u)] << 8) | c->onchip[OC(0xFE69u)];
 
-    if ((tier & 0x80u) && (ftcsr & FTCSR_ICF)) {                  /* ICI  */
+    if ((tier & 0x80u) && (ftcsr & FTCSR_ICF) &&                  /* ICI  */
+        (frt_deliverable_mask(c) & 0x80u)) {
         *vector = (int)((vcrc >> 8) & 0x7Fu); *level = lvl;
         c->sys->frt_irqs++; return 1;
     }
@@ -2072,7 +2242,8 @@ uint64_t saturn_run_line(saturn *s)
         s->clk += n;
         smpc_tick(s);
         frt_advance(&s->master, n);
-        if (s->slave_started) frt_advance(&s->slave, n);
+        wdt_advance(&s->master, n);
+        if (s->slave_started) { frt_advance(&s->slave, n); wdt_advance(&s->slave, n); }
         scu_dsp_tick(s, n);
         if (profiling()) {
             uint64_t tv1 = __rdtsc();
