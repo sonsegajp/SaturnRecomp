@@ -39,6 +39,7 @@ typedef struct {
     int      ready;
     uint16_t cmd_stage[4];   /* CR1..CR4 as written by the host */
     uint32_t dir_first;      /* first file id in the selected directory */
+    char     cwd[256];       /* current directory path, "" = root (ChangeDirectory) */
     uint16_t dir_count;
     int      boot_delay;
     int      auth_delay;     /* fields until AuthenticateDevice completes */

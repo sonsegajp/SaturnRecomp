@@ -4,6 +4,7 @@
  * that block repeats every 32 KiB across A-Bus CS2. These checks keep the CPU,
  * SCU DMA, diagnostics, and FIFO side effects on that one hardware mapping. */
 #include "saturn.h"
+#include "disc.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -197,6 +198,55 @@ int main(void)
     S.master.cycles++;
     cdb_periodic_maybe(&S);
     ck("fresh reply expires at exact deadline", (uint32_t)S.cd.periodic_count, 2);
+
+    /* File ids number the records of the CURRENT directory (0 ".", 1 "..",
+     * files and subdirectories from 2) and ChangeDirectory moves it:
+     * 0xFFFFFF = root, 1 = parent, otherwise a subdirectory id. */
+    {
+        static uint8_t xbuf[CD_PART_SECTORS * 2048u];
+        static iso_entry ents[5];
+        static iso_fs fs;
+        static const struct { const char *path; uint32_t lba; int dir; } t[5] = {
+            { "/0", 100, 0 }, { "/SUB", 21, 1 }, { "/SUB/A.BIN", 200, 0 },
+            { "/SUB/B.BIN", 300, 0 }, { "/Z.TXT", 400, 0 },
+        };
+        for (int i = 0; i < 5; i++) {
+            memset(&ents[i], 0, sizeof ents[i]);
+            strcpy(ents[i].path, t[i].path);
+            ents[i].lba = t[i].lba; ents[i].size = 2048; ents[i].is_dir = t[i].dir;
+        }
+        fs.entries = ents; fs.nentries = 5;
+#define FI_FAD() (((uint32_t)xbuf[0] << 24) | ((uint32_t)xbuf[1] << 16) | \
+                  ((uint32_t)xbuf[2] << 8) | xbuf[3])
+#define CD_CMD(a, b, c, d) do { S.cd.cmd_stage[0] = (a); S.cd.cmd_stage[1] = (b); \
+        S.cd.cmd_stage[2] = (c); S.cd.cmd_stage[3] = (d); memset(xbuf, 0, 16); \
+        cdb_execute(&S); } while (0)
+        reset_state();
+        S.cd.iso = &fs; S.cd.xfer = xbuf;
+        CD_CMD(0x7300, 0, 0, 2);
+        ck("root id 2 is /0", FI_FAD(), 100 + 150);
+        CD_CMD(0x7300, 0, 0, 4);
+        ck("subdirectories keep their id slot", FI_FAD(), 400 + 150);
+        CD_CMD(0x7000, 0, 0, 3);                 /* ChangeDirectory /SUB */
+        CD_CMD(0x7300, 0, 0, 2);
+        ck("id 2 after ChangeDirectory is /SUB/A.BIN", FI_FAD(), 200 + 150);
+        CD_CMD(0x7300, 0, 0, 3);
+        ck("id 3 after ChangeDirectory is /SUB/B.BIN", FI_FAD(), 300 + 150);
+        CD_CMD(0x7400, 0, 0, 3);                 /* ReadFile B.BIN */
+        ck("ReadFile uses the current directory", S.cd.play_end_fad, 300 + 150 + 1);
+        CD_CMD(0x7000, 0, 0, 1);                 /* ".." */
+        CD_CMD(0x7300, 0, 0, 2);
+        ck("parent directory restores root ids", FI_FAD(), 100 + 150);
+        CD_CMD(0x7000, 0, 0, 3);
+        CD_CMD(0x7000, 0, 0x17FF, 0xFFFF);       /* root, filter byte ignored */
+        CD_CMD(0x7300, 0, 0, 2);
+        ck("0xFFFFFF selects the root", FI_FAD(), 100 + 150);
+        CD_CMD(0x7000, 0, 0, 2);                 /* a file is not a directory */
+        CD_CMD(0x7300, 0, 0, 2);
+        ck("ChangeDirectory to a file is rejected", FI_FAD(), 100 + 150);
+#undef CD_CMD
+#undef FI_FAD
+    }
 
     if (fails == 0) printf("PASS  CD/CS2 bus decode (%d checks)\n", checks);
     else            printf("FAIL  CD/CS2 bus decode: %d of %d\n", fails, checks);
